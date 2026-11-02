@@ -1,0 +1,18 @@
+packages:
+  - packages/server
+autoInstallPeers: true
+strictPeerDependencies: false
+minimumReleaseAge: 10080
+catalogMode: strict
+cleanupUnusedCatalogs: true
+overrides:
+  "@types/node": "catalog:"
+allowBuilds:
+  "@biomejs/biome": true
+  esbuild: true
+catalog:
+  "@biomejs/biome": ^2.5.13
+  "@types/node": ^24.13.4
+  repojj: ^2026.7.29
+  typescript: ~7.0.2
+  vitest: ^5.0.1

@@ -1,0 +1,24 @@
+{
+  "name": "self-hosted-artifacts-workspace",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.4.1",
+  "engines": {
+    "node": ">=26"
+  },
+  "scripts": {
+    "check": "biome check .",
+    "check:fix": "biome check --write .",
+    "typecheck": "tsc -b",
+    "test": "vitest run",
+    "repojj:check": "repojj check",
+    "repojj:check:fix": "repojj check --fix",
+    "repojj:postfix": "biome check --write ."
+  },
+  "devDependencies": {
+    "@biomejs/biome": "catalog:",
+    "repojj": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

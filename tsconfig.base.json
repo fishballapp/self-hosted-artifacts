@@ -1,0 +1,45 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitReturns": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "erasableSyntaxOnly": true,
+    "jsx": "react-jsx",
+    "noEmit": true,
+    "plugins": [
+      {
+        "name": "@effect/language-service",
+        "namespaceImportPackages": ["effect", "@effect/*"],
+        "diagnosticSeverity": {
+          "anyUnknownInErrorContext": "error",
+          "catchUnfailableEffect": "warning",
+          "effectInVoidSuccess": "error",
+          "globalConsoleInEffect": "error",
+          "globalDateInEffect": "error",
+          "globalErrorInEffectCatch": "error",
+          "globalErrorInEffectFailure": "error",
+          "globalFetchInEffect": "error",
+          "globalTimersInEffect": "error",
+          "layerMergeAllWithDependencies": "error",
+          "lazyPromiseInEffectSync": "error",
+          "leakingRequirements": "error",
+          "multipleEffectProvide": "error",
+          "outdatedApi": "error",
+          "processEnvInEffect": "error",
+          "returnEffectInGen": "error",
+          "runEffectInsideEffect": "error",
+          "schemaSyncInEffect": "warning",
+          "tryCatchInEffectGen": "error",
+          "unknownInEffectCatch": "error"
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,29 @@
+name: Self-hosted artifacts upload
+description: Upload one file from a private repository's workflow to your own artifact server.
+inputs:
+  server-url:
+    description: Base URL of the server, as the runner reaches it.
+    required: true
+  path:
+    description: The file to upload. One file; folders are not supported in version 1.
+    required: true
+  name:
+    description: The name to store it under. Defaults to the path's basename.
+    required: false
+  retention-days:
+    description: Days to keep the file. Defaults to the server's default; the server caps it.
+    required: false
+  audience:
+    description: The OIDC audience to request, matching the server's OIDC_AUDIENCE.
+    required: false
+    default: self-hosted-artifacts
+outputs:
+  artifact-url:
+    description: The first download link.
+  links:
+    description: Every download link, by label, as one-line JSON.
+  expires-at:
+    description: When the server will delete the file, as an ISO instant.
+runs:
+  using: node24
+  main: upload.mjs
