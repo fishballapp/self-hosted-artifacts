@@ -183,11 +183,11 @@ wrong filename, an expired file, and any query string. There is no listing.
   The token must be signed by GitHub with RS256 and carry the right issuer, audience, owner ID and
   `repository_visibility: private`, within its validity. Every upload is checked, including from
   localhost. Any private repository of that owner qualifies; there is no per-repository list.
-- **Who can download:** anyone who has the link and can reach the server. A link holds 256 random
-  bits, so it can't be guessed, but it is the only credential: treat it as a secret, and keep the
-  server on a network you trust. Plain `http` is readable by anyone on the path, so use `https` for
-  a link that crosses anything you don't control. The action doesn't mask its outputs, so a step
-  that uses a link prints it to the run's log, where anyone who can read the log can use it.
+- **Who can download:** anyone who has the link and can reach the server. There is no login: a link
+  holds 256 random bits, so it can't be guessed, and it is meant to be shared. What keeps a file
+  private is who can reach the server, so keep it on a network you trust. Plain `http` is readable by
+  anyone on the path, so use `https` for a link that crosses anything you don't control. The action
+  doesn't mask its outputs, so a step that uses a link prints it to the run's log.
 - **What a file can do:** nothing in a browser. Downloads are `application/octet-stream`, as an
   attachment, with `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox;
   default-src 'none'`.

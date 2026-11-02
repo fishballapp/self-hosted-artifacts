@@ -244,5 +244,5 @@ export const ArtifactRoutes = Layer.unwrap(
   }),
 );
 
-/** Effect's request logger is off: it logs the URL, and a download's URL is its credential. */
+/** Effect's request logger is off: it logs the URL, which holds a full download token. */
 export const ArtifactServer = HttpRouter.serve(ArtifactRoutes, { disableLogger: true });
