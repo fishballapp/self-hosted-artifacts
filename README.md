@@ -90,8 +90,32 @@ The file is streamed, not read into memory. A network error or a 5xx is retried 
 short backoff and a fresh token, since a failure here would otherwise throw away a whole build; any
 other refusal fails the step at once with the server's message.
 
-This is a subset of `actions/upload-artifact`, not a drop-in: one file rather than a pattern, no
-zipping, and different outputs. To fetch a file, use `curl`.
+### Compared with `actions/upload-artifact`
+
+Not a drop-in: it takes one file, never zips it, and needs its own server. Compared with v7:
+
+| | `actions/upload-artifact` | This action |
+| --- | --- | --- |
+| **Inputs** | | |
+| `path` | A file, folder or wildcard pattern | One file; a folder or a missing file fails the step |
+| `name` | The artifact's name, default `artifact` | The file's name, default the path's basename |
+| `retention-days` | 1 to 90, default 90; `0` means the default | 1 or more, capped by the server, default set by the server; `0` is refused |
+| `archive` | Zips by default; `false` uploads one file as it is | No input: never zips |
+| `compression-level` | 0 to 9 | No input: never zips |
+| `if-no-files-found` | `warn` by default, or `error` or `ignore` | No input: always fails |
+| `overwrite` | Replaces an artifact of the same name; otherwise that fails | No input: each upload is a new file with its own link |
+| `include-hidden-files` | Off by default | No input: `path` names the file. A name must start with a letter or digit, so a hidden file needs `name` |
+| `server-url`, `audience` | Not applicable | Where to upload, and the OIDC audience |
+| **Outputs** | | |
+| `artifact-url` | Needs a GitHub login | Needs only the link, and whoever has it can download |
+| `artifact-id`, `artifact-digest` | Yes | No |
+| `links`, `expires-at` | No | Every link by label, and when the file goes |
+| **Behaviour** | | |
+| Where files go | GitHub, against your plan's storage quota | A disk you own; 2 GiB per file by default |
+| Which repositories | Any | Private ones of one owner; public repositories' artifacts are free on GitHub |
+| Job permission | None to add | `id-token: write` |
+| Getting a file | `actions/download-artifact`, the run's page, the API | `curl` or a browser; it isn't listed anywhere |
+| Deleting early | The run's page or the API | No: it stays until it expires |
 
 ## HTTP
 
