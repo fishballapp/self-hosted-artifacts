@@ -30,7 +30,7 @@ const openFile = async path => {
   if (stats === undefined) throw new PermanentFailure(`No file at ${path}`);
   if (stats.isDirectory()) {
     throw new PermanentFailure(
-      `${path} is a folder; folders are not supported in version 1. Upload one file`,
+      `${path} is a folder; folders are not supported yet. Upload one file`,
     );
   }
   return await openAsBlob(path);

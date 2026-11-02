@@ -1,0 +1,48 @@
+name: CD
+
+# Every push to main runs every gate (ci.yml), then publishes self-hosted-artifacts when npm doesn't
+# have its version yet.
+#
+# Keep this filename: npm trusted publishing validates it.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    name: Gates
+    uses: ./.github/workflows/ci.yml
+
+  # No token: npm trusted publishing over the workflow's OIDC identity, configured on npmjs.com.
+  publish:
+    name: Publish to npm
+    needs: gates
+    # GitHub-hosted on purpose: npm trusted publishing does not work on self-hosted runners.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 26
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - run: pnpm install --frozen-lockfile
+      - id: version
+        run: |
+          VERSION=$(node -p "require('./packages/self-hosted-artifacts/package.json').version")
+          TAG=$(echo "$VERSION" | grep -oE 'alpha|beta|rc' || true)
+          echo "tag=${TAG:-latest}" >> "$GITHUB_OUTPUT"
+      # A filtered publish is recursive, so it skips a version npm already has. The package builds
+      # dist/ in `prepack`.
+      - run: pnpm -F self-hosted-artifacts publish --tag ${{ steps.version.outputs.tag }}

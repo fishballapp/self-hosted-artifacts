@@ -1,5 +1,11 @@
+import * as Effect from 'effect/Effect';
+import * as FetchHttpClient from 'effect/http/FetchHttpClient';
+import * as Layer from 'effect/Layer';
+import * as ManagedRuntime from 'effect/ManagedRuntime';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { createTokenVerifier } from './oidc.ts';
+import { ServerConfig } from './config.ts';
+import { TokenVerifier } from './oidc.ts';
+import { clockAt, type Verification } from './test-support.ts';
 
 const ISSUER = 'https://token.actions.githubusercontent.com';
 const RSA = {
@@ -40,7 +46,20 @@ const jwkOf = async (key: CryptoKey, kid: string) => ({
   alg: 'RS256',
 });
 
-describe('createTokenVerifier', () => {
+const CONFIG = {
+  storeDir: '/srv/artifacts',
+  oidcAudience: 'self-hosted-artifacts',
+  oidcRepositoryOwnerId: '42',
+  linkBases: { home: 'http://192.0.2.1:8420' },
+  host: '127.0.0.1',
+  port: 0,
+  defaultRetentionDays: 7,
+  maxRetentionDays: 30,
+  minFreeBytes: 0,
+  maxFileBytes: 1024,
+};
+
+describe('TokenVerifier', () => {
   let keys: CryptoKeyPair;
   let otherKeys: CryptoKeyPair;
 
@@ -55,13 +74,34 @@ describe('createTokenVerifier', () => {
   }: {
     jwks?: () => Promise<unknown>;
     now?: () => Temporal.Instant;
-  } = {}) =>
-    createTokenVerifier({
-      audience: 'self-hosted-artifacts',
-      repositoryOwnerId: '42',
-      fetchJwks: jwks ?? (async () => ({ keys: [await jwkOf(keys.publicKey, 'key-1')] })),
-      now,
-    });
+  } = {}) => {
+    const fetchJwks = jwks ?? (async () => ({ keys: [await jwkOf(keys.publicKey, 'key-1')] }));
+    const runtime = ManagedRuntime.make(
+      TokenVerifier.layer.pipe(
+        Layer.provide(Layer.succeed(ServerConfig, CONFIG)),
+        Layer.provide(FetchHttpClient.layer),
+        Layer.provide(
+          Layer.succeed(FetchHttpClient.Fetch, async () => Response.json(await fetchJwks())),
+        ),
+        Layer.provideMerge(clockAt(now)),
+      ),
+    );
+    return (token: string): Promise<Verification> =>
+      runtime.runPromise(
+        Effect.gen(function* () {
+          const verifier = yield* TokenVerifier;
+          return yield* verifier.verify(token);
+        }).pipe(
+          Effect.map(({ repository }): Verification => ({ kind: 'verified', repository })),
+          Effect.catchTags({
+            TokenRejectedError: ({ reason }) =>
+              Effect.succeed<Verification>({ kind: 'rejected', reason }),
+            SigningKeysUnavailableError: ({ reason }) =>
+              Effect.succeed<Verification>({ kind: 'unavailable', reason }),
+          }),
+        ),
+      );
+  };
 
   const signGood = (claims: object = GOOD_CLAIMS) =>
     signRs256(keys.privateKey, { alg: 'RS256', typ: 'JWT', kid: 'key-1' }, claims);
@@ -250,6 +290,23 @@ describe('createTokenVerifier', () => {
   it('counts a key set of the wrong shape as unavailable', async () => {
     const verify = verifierFor({ jwks: async () => ({ nope: true }) });
     expect((await verify(await signGood())).kind).toBe('unavailable');
+  });
+
+  it('starts the cooldown when a slow fetch ends, not when it starts', async () => {
+    let now = NOW;
+    let fetches = 0;
+    const verify = verifierFor({
+      jwks: async () => {
+        fetches += 1;
+        now = now.add({ seconds: 10 });
+        throw new Error('GitHub timed out');
+      },
+      now: () => now,
+    });
+    const unknown = await signRs256(keys.privateKey, { alg: 'RS256', kid: 'mystery' }, GOOD_CLAIMS);
+
+    await Promise.all([verify(unknown), verify(unknown), verify(unknown)]);
+    expect(fetches).toBe(1);
   });
 
   it('keeps verifying known keys while the key set cannot be fetched', async () => {

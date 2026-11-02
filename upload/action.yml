@@ -5,7 +5,7 @@ inputs:
     description: Base URL of the server, as the runner reaches it.
     required: true
   path:
-    description: The file to upload. One file; folders are not supported in version 1.
+    description: The file to upload. One file; folders are not supported yet.
     required: true
   name:
     description: The name to store it under. Defaults to the path's basename.
@@ -14,7 +14,7 @@ inputs:
     description: Days to keep the file. Defaults to the server's default; the server caps it.
     required: false
   audience:
-    description: The OIDC audience to request, matching the server's OIDC_AUDIENCE.
+    description: The OIDC audience to request, matching the server's oidcAudience.
     required: false
     default: self-hosted-artifacts
 outputs:

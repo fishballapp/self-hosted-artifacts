@@ -1,4 +1,4 @@
 {
   "files": [],
-  "references": [{ "path": "./packages/server" }]
+  "references": [{ "path": "./packages/self-hosted-artifacts" }]
 }

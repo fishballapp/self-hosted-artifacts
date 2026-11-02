@@ -4,11 +4,12 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import * as FetchHttpClient from 'effect/http/FetchHttpClient';
+import * as Layer from 'effect/Layer';
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import type { Config } from './config.ts';
-import { createTokenVerifier, type TokenVerifier } from './oidc.ts';
-import { createArtifactServer } from './server.ts';
-import { createStore } from './store.ts';
+import { type Config, ServerConfig } from './config.ts';
+import { TokenVerifier } from './oidc.ts';
+import { startTestServer, verifierAnswering } from './test-support.ts';
 
 const ACTION = new URL('../../../upload/upload.mjs', import.meta.url).pathname;
 const RSA = {
@@ -40,6 +41,7 @@ describe('the upload action', () => {
   let keys: CryptoKeyPair;
   let rootDir: string;
   let artifactServer: Server;
+  let stopArtifactServer = () => closeServer(artifactServer);
   let tokenServer: Server;
   let serverUrl: string;
   let tokenRequestUrl: string;
@@ -75,46 +77,47 @@ describe('the upload action', () => {
 
   const startArtifactServer = async ({
     configOverrides = {},
-    verifyToken,
+    verifier,
   }: {
     configOverrides?: Partial<Config>;
-    verifyToken?: TokenVerifier;
+    verifier?: Layer.Layer<TokenVerifier>;
   } = {}) => {
     const storeDir = join(rootDir, 'store');
     await mkdir(storeDir, { recursive: true });
-    const now = () => Temporal.Now.instant();
     const jwk = {
       ...(await crypto.subtle.exportKey('jwk', keys.publicKey)),
       kid: 'key-1',
       use: 'sig',
       alg: 'RS256',
     };
-    artifactServer = createArtifactServer({
-      config: {
-        storeDir,
-        oidcAudience: AUDIENCE,
-        oidcRepositoryOwnerId: '42',
-        linkBases: { home: 'http://127.0.0.1:1', tailscale: 'https://files.example' },
-        host: '127.0.0.1',
-        port: 0,
-        defaultRetentionDays: 7,
-        maxRetentionDays: 30,
-        minFreeBytes: 0,
-        maxFileBytes: 1024 ** 3,
-        ...configOverrides,
-      },
-      store: createStore({ dir: storeDir, now }),
-      verifyToken:
-        verifyToken ??
-        createTokenVerifier({
-          audience: AUDIENCE,
-          repositoryOwnerId: '42',
-          fetchJwks: async () => ({ keys: [jwk] }),
-          now,
-        }),
-      log: () => undefined,
+    const config = {
+      storeDir,
+      oidcAudience: AUDIENCE,
+      oidcRepositoryOwnerId: '42',
+      linkBases: { home: 'http://127.0.0.1:1', tailscale: 'https://files.example' },
+      host: '127.0.0.1',
+      port: 0,
+      defaultRetentionDays: 7,
+      maxRetentionDays: 30,
+      minFreeBytes: 0,
+      maxFileBytes: 1024 ** 3,
+      ...configOverrides,
+    };
+    const testServer = await startTestServer({
+      config,
+      verifier:
+        verifier ??
+        TokenVerifier.layer.pipe(
+          Layer.provide(Layer.succeed(ServerConfig, config)),
+          Layer.provide(FetchHttpClient.layer),
+          Layer.provide(
+            Layer.succeed(FetchHttpClient.Fetch, async () => Response.json({ keys: [jwk] })),
+          ),
+        ),
     });
-    serverUrl = await listenOnLoopback(artifactServer);
+    artifactServer = testServer.server;
+    stopArtifactServer = testServer.stop;
+    serverUrl = `http://127.0.0.1:${testServer.port}`;
   };
 
   beforeEach(async () => {
@@ -137,7 +140,7 @@ describe('the upload action', () => {
   });
 
   afterEach(async () => {
-    await closeServer(artifactServer);
+    await stopArtifactServer();
     await closeServer(tokenServer);
     await rm(rootDir, { recursive: true, force: true });
   });
@@ -259,7 +262,7 @@ describe('the upload action', () => {
     await mkdir(path);
     const { exitCode, stdout } = await runAction({ INPUT_PATH: path });
     expect(exitCode).toBe(1);
-    expect(stdout).toMatch(/^::error::.*folders are not supported in version 1/m);
+    expect(stdout).toMatch(/^::error::.*folders are not supported yet/m);
     expect(tokenRequests).toEqual([]);
   });
 
@@ -306,12 +309,12 @@ describe('the upload action', () => {
   it('retries a 5xx, minting a fresh token per attempt', async () => {
     let attempts = 0;
     await startArtifactServer({
-      verifyToken: async () => {
+      verifier: verifierAnswering(async () => {
         attempts += 1;
         return attempts === 1
           ? { kind: 'unavailable', reason: 'could not fetch the JWKS' }
           : { kind: 'verified', repository: 'fishballapp/private-thing' };
-      },
+      }),
     });
     const path = join(rootDir, 'a.bin');
     await writeFile(path, 'x');
@@ -324,12 +327,15 @@ describe('the upload action', () => {
   const startFakeServer = async (answers: { status: number; body: unknown }[]) => {
     const remaining = [...answers];
     artifactServer = createServer((req, res) => {
+      // As on the token server: a loopback probe mustn't use up an answer.
+      if (req.method !== 'POST') return void res.writeHead(404).end();
       req.resume();
       req.on('end', () => {
         const { status, body } = remaining.shift() ?? { status: 500, body: {} };
         res.writeHead(status, { 'Content-Type': 'application/json' }).end(JSON.stringify(body));
       });
     });
+    stopArtifactServer = () => closeServer(artifactServer);
     serverUrl = await listenOnLoopback(artifactServer);
   };
 
@@ -369,7 +375,8 @@ describe('the upload action', () => {
     timeout: 20_000,
   }, async () => {
     await startArtifactServer();
-    await closeServer(artifactServer);
+    await stopArtifactServer();
+    stopArtifactServer = async () => undefined;
     const path = join(rootDir, 'a.bin');
     await writeFile(path, 'x');
     const { exitCode, stdout } = await runAction({ INPUT_PATH: path });

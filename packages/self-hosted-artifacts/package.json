@@ -1,0 +1,43 @@
+{
+  "name": "self-hosted-artifacts",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "A small file server for GitHub Actions builds from private repositories.",
+  "license": "MIT",
+  "homepage": "https://github.com/fishballapp/self-hosted-artifacts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fishballapp/self-hosted-artifacts.git",
+    "directory": "packages/self-hosted-artifacts"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "bin": {
+    "self-hosted-artifacts": "./src/bin.ts"
+  },
+  "engines": {
+    "node": ">=26"
+  },
+  "publishConfig": {
+    "access": "public",
+    "bin": {
+      "self-hosted-artifacts": "./dist/bin.js"
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "prepack": "pnpm build",
+    "test": "vitest run",
+    "check:effect": "effect-tsgo diagnostics --project tsconfig.json --format text"
+  },
+  "devDependencies": {
+    "@effect/platform-node": "catalog:",
+    "@effect/vitest": "catalog:",
+    "@types/node": "catalog:",
+    "effect": "catalog:",
+    "tsdown": "catalog:",
+    "vitest": "catalog:"
+  }
+}

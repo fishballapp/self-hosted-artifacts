@@ -1,21 +1,24 @@
 name: CI
 
 # Every gate, on every branch. The private monorepo this tree is ejected from pushes each of its
-# pull requests to the branch pr/<number> here, so these run before the private merge.
+# pull requests to the branch pr/<number> here, so these run before the private merge; cd.yml calls
+# this workflow again on main before it publishes.
 on:
   push:
+    branches-ignore: [main]
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
-  # A newer snapshot of a branch supersedes the one under test.
-  cancel-in-progress: true
+  # A newer snapshot of a branch supersedes the one under test; main queues behind cd.yml's publish.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   check:
-    name: Check · typecheck · test
+    name: Check · typecheck · test · build
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -30,3 +33,5 @@ jobs:
       - run: pnpm repojj:check
       - run: pnpm typecheck
       - run: pnpm test
+      - run: pnpm build
+      - run: node packages/self-hosted-artifacts/dist/bin.js --version

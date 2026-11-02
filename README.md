@@ -1,55 +1,70 @@
 # self-hosted-artifacts
 
-A small file server and a GitHub Action that uploads to it, so builds from private repositories
-can go to a disk you own.
+**Keep the builds from your private GitHub repositories on a disk you own.** A small file server,
+and a GitHub Action that uploads to it and gives you a download link.
 
-GitHub's artifacts cap private storage at 500 MB on the free plan, and `actions/upload-artifact`
-can't target your own server. A self-hosted runner that builds apps fills that quickly. Public
-repositories' artifacts are free, so this is for private repositories only: the server refuses
-uploads from anything else.
+GitHub's artifacts cap private storage at 500 MB on the free plan, which a few app builds fill, and
+`actions/upload-artifact` can't target your own server. Public repositories' artifacts are free, so
+this is for private repositories only: the server refuses uploads from anything else.
 
-The server is a few files of TypeScript with no runtime dependencies. There is no install step and
-no secret to manage: the action proves who it is with the workflow's OIDC token, and each upload
-answers with an unguessable link.
+- **No secrets to manage.** The action proves who it is with the workflow's OIDC token.
+- **No dependencies.** The server installs from npm as one package.
+- **No account to download.** Each upload answers with an unguessable link that works with `curl`
+  or a browser, and expires by itself.
+
+It's a young project, below 1.0: see [Versions](#versions) and [Not supported](#not-supported).
 
 ## Run the server
 
-Needs Node 26 and an existing directory to store files in.
+Needs Node 26 and an existing directory to store files in. Write a config file:
 
-```bash
-STORE_DIR=/srv/artifacts \
-OIDC_AUDIENCE=self-hosted-artifacts \
-OIDC_REPOSITORY_OWNER_ID=123456 \
-LINK_BASES='{"home":"http://192.0.2.10:8420"}' \
-node packages/server/src/main.ts
+```json
+{
+  "storeDir": "/srv/artifacts",
+  "oidcAudience": "self-hosted-artifacts",
+  "oidcRepositoryOwnerId": 123456,
+  "linkBases": { "home": "http://192.0.2.10:8420" }
+}
 ```
 
-Find your owner ID with `gh api users/<owner> --jq .id`, which works for an organisation too.
+`oidcRepositoryOwnerId` is the user or organisation whose repositories may upload. Find it with
+`gh api users/<owner> --jq .id`, which works for an organisation too.
 
-| Variable | Default | Meaning |
+Then start the server:
+
+```bash
+npx self-hosted-artifacts --config ./config.json
+```
+
+For a long-running service, install a pinned version rather than downloading at each start:
+`npm install self-hosted-artifacts@<version>`.
+
+| Setting | Default | Meaning |
 | --- | --- | --- |
-| `STORE_DIR` | required | Where files live, as an absolute path. Must already exist: see below. |
-| `OIDC_AUDIENCE` | required | The token audience to accept. The action's `audience` must match. |
-| `OIDC_REPOSITORY_OWNER_ID` | required | The numeric ID of the user or organisation whose repositories may upload. |
-| `LINK_BASES` | required | JSON object of label to base URL. Each upload answers with one link per label. |
-| `HOST` | `0.0.0.0` | Address to listen on. |
-| `PORT` | `8420` | Port to listen on. |
-| `DEFAULT_RETENTION_DAYS` | `7` | Days to keep a file when the upload doesn't say. |
-| `MAX_RETENTION_DAYS` | `30` | The cap. A larger request is clamped, and the real expiry comes back. |
-| `MIN_FREE_BYTES` | 20 GiB | Refuse an upload that would leave less free space than this. |
-| `MAX_FILE_BYTES` | 2 GiB | The largest file accepted. |
+| `storeDir` | required | Where files live, as an absolute path. Must already exist: see below. |
+| `oidcAudience` | required | The token audience to accept. The action's `audience` must match. |
+| `oidcRepositoryOwnerId` | required | The numeric ID of the user or organisation whose repositories may upload. |
+| `linkBases` | required | Object of label to base URL, `http` or `https`, with no query or fragment. Each upload answers with one link per label. |
+| `host` | `"0.0.0.0"` | Address to listen on. |
+| `port` | `8420` | Port to listen on. |
+| `defaultRetentionDays` | `7` | Days to keep a file when the upload doesn't say. |
+| `maxRetentionDays` | `30` | The cap. A larger request is clamped, and the real expiry comes back. |
+| `minFreeGiB` | `20` | Refuse an upload that would leave less free space than this. |
+| `maxFileGiB` | `2` | The largest file accepted. |
 
-A missing or malformed setting stops the server at startup with a message naming it.
+A missing, malformed or unknown setting stops the server at startup with a message naming it. Nothing
+in the file is secret.
 
-**The server never creates `STORE_DIR`.** On macOS, creating a directory at a volume's mount path
-makes the real disk mount somewhere else, so a store that isn't there stays that way: uploads get
-`503`, downloads `404`, `/healthz` `503`, and everything recovers by itself when it returns, with
-no restart. The server only creates its own `tmp/` and `artifacts/` inside it.
+**The server never creates `storeDir`**, so files can't land on the wrong disk while a volume is
+unmounted. On macOS, a directory at a volume's mount path would also send the real disk elsewhere
+when it mounts. While the store is missing, uploads get `503`, downloads `404` and `/healthz` `503`,
+and everything recovers by itself when it returns, with no restart. The server only creates its own
+`tmp/` and `artifacts/` inside it.
 
-Links come only from `LINK_BASES`, never from `Host` or `X-Forwarded-*`, so the links in a response
+Links come only from `linkBases`, never from `Host` or `X-Forwarded-*`, so the links in a response
 can't be steered by the request.
 
-Logs go to stdout. Expired files and abandoned uploads are swept at startup and hourly.
+Logs go to stdout in logfmt. Expired files and abandoned uploads are swept at startup and hourly.
 
 ## Use the action
 
@@ -64,7 +79,7 @@ jobs:
       - uses: actions/checkout@v6
       - run: ./build.sh
       - id: upload
-        uses: fishballapp/self-hosted-artifacts/upload@main
+        uses: fishballapp/self-hosted-artifacts/upload@v0.1.0
         with:
           server-url: http://192.0.2.10:8420
           path: dist/app.apk
@@ -84,7 +99,7 @@ jobs:
 | --- | --- |
 | `artifact-url` | The first link. |
 | `links` | Every link, by label, as one-line JSON. |
-| `expires-at` | When the file goes, as an ISO instant. |
+| `expires-at` | When the file expires, as an ISO instant. |
 
 The file is streamed, not read into memory. A network error or a 5xx is retried a few times with a
 short backoff and a fresh token, since a failure here would otherwise throw away a whole build; any
@@ -109,7 +124,7 @@ Not a drop-in: it takes one file, never zips it, and needs its own server. Compa
 | **Outputs** | | |
 | `artifact-url` | Needs a GitHub login | Needs only the link, and whoever has it can download |
 | `artifact-id`, `artifact-digest` | Yes | No |
-| `links`, `expires-at` | No | Every link by label, and when the file goes |
+| `links`, `expires-at` | No | Every link by label, and when the file expires |
 | **Behaviour** | | |
 | Where files go | GitHub, against your plan's storage quota | A disk you own; 2 GiB per file by default |
 | Which repositories | Any | Private ones of one owner; public repositories' artifacts are free on GitHub |
@@ -117,7 +132,19 @@ Not a drop-in: it takes one file, never zips it, and needs its own server. Compa
 | Getting a file | `actions/download-artifact`, the run's page, the API | `curl` or a browser; it isn't listed anywhere |
 | Deleting early | The run's page or the API | No: it stays until it expires |
 
-## HTTP
+## Versions
+
+The server and the action are released together under one version, which follows
+[semantic versioning](https://semver.org). Pin the action to a version tag, as above.
+
+- **Below 1.0:** use the same minor version of both, so action `v0.1.x` with server `0.1.x`. A new
+  minor version may change what they expect of each other.
+- **From 1.0:** any minor versions of the same major version work together.
+
+1.0 is planned for when the action matches `actions/upload-artifact` and the server can store files
+on S3.
+
+## HTTP API
 
 `POST /artifacts?name=<filename>&retention-days=<n>` with `Authorization: Bearer <OIDC token>`,
 `Content-Length` and the raw bytes as the body. `retention-days` is optional. Auth is checked before
@@ -138,9 +165,10 @@ any of the body is read.
 | `400` | Bad name or retention. A name matches `^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$`; nothing is sanitised. |
 | `401` | Token rejected. The server's log says why. |
 | `411` | No `Content-Length`. |
-| `413` | Over `MAX_FILE_BYTES`. |
+| `413` | Over `maxFileGiB`. |
+| `500` | The upload failed, and nothing was stored. |
 | `503` | The store is missing, or GitHub's signing keys can't be fetched. |
-| `507` | The upload would cross `MIN_FREE_BYTES`. |
+| `507` | The upload would cross `minFreeGiB`. |
 
 Failures answer `{ "error": "<message>" }`.
 
@@ -174,9 +202,13 @@ wrong filename, an expired file, and any query string. There is no listing.
 - 30 days' retention at most by default.
 - One hour for a request, enough for 2 GiB at about 5 Mbit/s. A slower upload is cut off.
 - Five minutes idle: a client that stops reading or sending is cut off, downloads included. A stalled
-  download goes at 10 to 15 minutes, as Node restarts the timer while a write is pending.
+  download is cut off after 10 to 15 minutes, as Node restarts the timer while a write is pending.
 
-## Not in version 1
+## Not supported
 
-A web UI, S3 or other storage, a download action (`curl` covers it), folders, `Range` requests,
+Folders, S3 or other storage, a web UI, a download action (`curl` covers it), `Range` requests, and
 deleting a file before it expires.
+
+## License
+
+[MIT](LICENSE)

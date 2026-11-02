@@ -1,21 +1,16 @@
 import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
-import {
-  request as httpRequest,
-  type IncomingMessage,
-  type OutgoingHttpHeaders,
-  type Server,
-} from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { request as httpRequest, type IncomingMessage, type OutgoingHttpHeaders } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Readable } from 'node:stream';
+import * as Duration from 'effect/Duration';
+import * as Effect from 'effect/Effect';
+import * as Stream from 'effect/Stream';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Config } from './config.ts';
-import type { Verification } from './oidc.ts';
-import { createArtifactServer } from './server.ts';
-import { createStore, type Store, UPLOAD_TIMEOUT_MS } from './store.ts';
+import { UPLOAD_TIMEOUT } from './store.ts';
+import { clockAt, startTestServer, type Verification, verifierAnswering } from './test-support.ts';
 
 const OIDC_TOKEN = 'oidc-token-that-must-never-be-logged';
 const NOW = Temporal.Instant.from('2026-06-01T12:00:00Z');
@@ -28,24 +23,21 @@ let storeDir: string;
 let now: Temporal.Instant;
 let verification: Verification;
 let logLines: string[];
-let store: Store;
-let server: Server;
+let testServer: Awaited<ReturnType<typeof startTestServer>>;
 let baseConfig: Config;
 
 const startServer = async (overrides: Partial<Config> = {}) => {
-  const config = { ...baseConfig, ...overrides };
-  store = createStore({ dir: config.storeDir, now: () => now });
-  server = createArtifactServer({
-    config,
-    store,
-    verifyToken: async token =>
+  testServer = await startTestServer({
+    config: { ...baseConfig, ...overrides },
+    verifier: verifierAnswering(async token =>
       token === OIDC_TOKEN ? verification : { kind: 'rejected', reason: 'bad' },
-    log: line => logLines.push(line),
+    ),
+    clock: clockAt(() => now),
+    onLog: line => logLines.push(line),
   });
-  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
 };
 
-const port = () => (server.address() as AddressInfo).port;
+const sweep = () => testServer.run(testServer.store.sweep);
 
 const answerOf = (res: IncomingMessage) =>
   new Promise<Answer>(resolve => {
@@ -63,7 +55,7 @@ const answerOf = (res: IncomingMessage) =>
   });
 
 const openRequest = (method: string, path: string, headers: OutgoingHttpHeaders = {}) =>
-  httpRequest({ host: '127.0.0.1', port: port(), method, path, headers });
+  httpRequest({ host: '127.0.0.1', port: testServer.port, method, path, headers });
 
 /** node:http, because fetch normalises paths and refuses to spoof Host. */
 const send = (
@@ -120,8 +112,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  server.closeAllConnections();
-  await new Promise(resolve => server.close(resolve));
+  await testServer.stop();
   await rm(rootDir, { recursive: true, force: true });
 });
 
@@ -175,6 +166,26 @@ describe('upload and download', () => {
       expiresAt: '2026-06-08T12:00:00Z',
     });
     expect(await tempsOnDisk()).toEqual([]);
+  });
+
+  it('cuts the connection when the file cannot be read, so a client sees a broken download', async () => {
+    await startServer();
+    const { pathname, token } = await uploaded('a.apk', new Uint8Array([1, 2, 3]));
+    await rm(join(storeDir, 'artifacts', token, 'data'));
+
+    const req = openRequest('GET', pathname);
+    const outcome = await new Promise<string>(resolve => {
+      req.on('error', () => resolve('cut off'));
+      req.on('response', res => {
+        res.on('error', () => resolve('cut off'));
+        res.on('end', () => resolve('ended'));
+        res.resume();
+      });
+      req.end();
+    });
+
+    expect(outcome).toBe('cut off');
+    expect(logLines.join('\n')).toContain('download stopped');
   });
 
   it('accepts an empty file', async () => {
@@ -327,7 +338,7 @@ describe('upload refusals', () => {
 
   it('counts the file against the free-space floor', async () => {
     await startServer({ minFreeBytes: 900 });
-    vi.spyOn(store, 'freeBytes').mockResolvedValue(1000);
+    Object.assign(testServer.store, { freeBytes: Effect.succeed(1000) });
     expect((await upload('a.apk', randomBytes(100))).status).toBe(201);
     expect((await upload('b.apk', randomBytes(101))).status).toBe(507);
   });
@@ -385,7 +396,7 @@ describe('a store that goes away', () => {
     expect(refused.status).toBe(503);
     expect(JSON.parse(refused.body)).toEqual({ error: 'The store is missing' });
     expect((await send('GET', `/${'a'.repeat(43)}/a.apk`)).status).toBe(404);
-    expect(await store.sweep()).toEqual({ removedArtifacts: 0, removedTemps: 0 });
+    expect(await sweep()).toEqual({ removedArtifacts: 0, removedTemps: 0 });
     expect(existsSync(missing)).toBe(false);
 
     await mkdir(missing);
@@ -428,8 +439,8 @@ describe('a stalled download', () => {
   it('gets cut off', async () => {
     await startServer({ maxFileBytes: 64 * 1024 * 1024 });
     const { pathname } = await uploaded('big.apk', randomBytes(32 * 1024 * 1024));
-    expect(server.timeout).toBe(5 * 60 * 1000);
-    server.timeout = 100;
+    expect(testServer.server.timeout).toBe(5 * 60 * 1000);
+    testServer.server.timeout = 100;
 
     const req = openRequest('GET', pathname);
     req.on('error', () => undefined);
@@ -444,22 +455,25 @@ describe('a stalled download', () => {
 });
 
 describe('store.put', () => {
-  const put = (chunks: Uint8Array[], size: number) =>
-    createStore({ dir: storeDir, now: () => now }).put({
-      name: 'a.apk',
-      size,
-      retentionDays: 1,
-      body: Readable.from(chunks),
-    });
+  const putFailure = async (chunks: Uint8Array[], size: number) => {
+    await startServer();
+    return testServer.run(
+      testServer.store
+        .put({ name: 'a.apk', size, retentionDays: 1, body: Stream.fromIterable(chunks) })
+        .pipe(Effect.flip),
+    );
+  };
 
   it('refuses a body longer than declared, while streaming', async () => {
-    await expect(put([new Uint8Array(4), new Uint8Array(4)], 5)).rejects.toThrow(/longer/);
+    const { reason } = await putFailure([new Uint8Array(4), new Uint8Array(4)], 5);
+    expect(reason).toMatch(/longer/);
     expect(await tempsOnDisk()).toEqual([]);
     expect(await artifactsOnDisk()).toEqual([]);
   });
 
   it('refuses a body shorter than declared', async () => {
-    await expect(put([new Uint8Array(4)], 5)).rejects.toThrow(/shorter/);
+    const { reason } = await putFailure([new Uint8Array(4)], 5);
+    expect(reason).toMatch(/shorter/);
     expect(await tempsOnDisk()).toEqual([]);
     expect(await artifactsOnDisk()).toEqual([]);
   });
@@ -473,14 +487,14 @@ describe('expiry', () => {
 
     now = NOW.add({ hours: 23 });
     expect((await send('GET', pathname)).status).toBe(200);
-    expect(await store.sweep()).toMatchObject({ removedArtifacts: 0 });
+    expect(await sweep()).toMatchObject({ removedArtifacts: 0 });
 
     now = NOW.add({ hours: 24 });
     expect((await send('GET', pathname)).status).toBe(404);
     expect((await send('HEAD', pathname)).status).toBe(404);
     expect(await artifactsOnDisk()).toContain(token);
 
-    expect(await store.sweep()).toMatchObject({ removedArtifacts: 1 });
+    expect(await sweep()).toMatchObject({ removedArtifacts: 1 });
     expect(await artifactsOnDisk()).toEqual([kept.token]);
     expect((await send('GET', kept.pathname)).status).toBe(200);
   });
@@ -493,7 +507,7 @@ describe('expiry', () => {
     await writeFile(join(storeDir, 'artifacts', 'bad-meta', 'meta.json'), '{"name":3}');
     await writeFile(join(storeDir, 'artifacts', '.DS_Store'), 'junk');
 
-    expect(await store.sweep()).toMatchObject({ removedArtifacts: 3 });
+    expect(await sweep()).toMatchObject({ removedArtifacts: 3 });
     expect(await artifactsOnDisk()).toEqual([]);
   });
 });
@@ -510,12 +524,12 @@ describe('the temp sweep', () => {
   it('removes a temp older than the request timeout, leaving a fresh one', async () => {
     await startServer();
     now = Temporal.Now.instant();
-    const timeoutMinutes = UPLOAD_TIMEOUT_MS / 60_000;
+    const timeoutMinutes = Duration.toMinutes(UPLOAD_TIMEOUT);
     await makeTemp('stale', { minutes: timeoutMinutes + 2 });
     await makeTemp('in-flight', { minutes: timeoutMinutes - 1 });
     await makeTemp('fresh', { minutes: 0 });
 
-    expect(await store.sweep()).toMatchObject({ removedTemps: 1 });
+    expect(await sweep()).toMatchObject({ removedTemps: 1 });
     expect((await tempsOnDisk()).toSorted()).toEqual(['fresh', 'in-flight']);
   });
 
@@ -530,7 +544,7 @@ describe('the temp sweep', () => {
     req.write(randomBytes(8));
     await vi.waitFor(async () => expect(await tempsOnDisk()).toHaveLength(1));
 
-    expect(await store.sweep()).toMatchObject({ removedTemps: 0 });
+    expect(await sweep()).toMatchObject({ removedTemps: 0 });
     expect(await tempsOnDisk()).toHaveLength(1);
     req.destroy();
     await vi.waitFor(async () => expect(await tempsOnDisk()).toEqual([]));
@@ -543,7 +557,7 @@ describe('/healthz', () => {
     expect((await send('GET', '/healthz')).status).toBe(200);
   });
 
-  it('answers 503 when STORE_DIR is a file', async () => {
+  it('answers 503 when storeDir is a file', async () => {
     const file = join(rootDir, 'file');
     await writeFile(file, 'not a directory');
     await startServer({ storeDir: file });
@@ -571,7 +585,7 @@ describe('logs', () => {
     expect(logged).not.toContain(token);
     expect(logged).not.toContain(OIDC_TOKEN);
     expect(logged).not.toContain(storeDir);
-    expect(logged).toContain(`token=${token.slice(0, 8)}…`);
+    expect(logged).toContain(`${token.slice(0, 8)}…`);
     expect(logged).toContain('repository=fishballapp/private-thing name=a.apk size=8');
   });
 
