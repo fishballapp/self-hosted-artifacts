@@ -2,7 +2,13 @@ import { type ExecFileException, execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { openAsBlob } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { createServer, request as httpRequest, type IncomingMessage, type Server } from 'node:http';
+import {
+  createServer,
+  request as httpRequest,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import * as NodeFileSystem from '@effect/platform-node/NodeFileSystem';
@@ -108,7 +114,8 @@ export type Interception = { status: number; message: string } | 'lose-answer' |
 
 /**
  * Set these to run the suites against a real store, such as a throwaway MinIO: each test gets a new
- * bucket, with the README's own policy on it.
+ * bucket, with the README's own policy on it, and removes it after. A store with no bucket policies,
+ * such as R2, sets `S3_TEST_BUCKET_POLICIES=off`: its links then go through a proxy that signs them.
  */
 const REAL_S3 =
   process.env.S3_TEST_ENDPOINT === undefined
@@ -117,6 +124,7 @@ const REAL_S3 =
         endpoint: process.env.S3_TEST_ENDPOINT,
         accessKeyId: process.env.S3_TEST_ACCESS_KEY_ID ?? '',
         secretAccessKey: process.env.S3_TEST_SECRET_ACCESS_KEY ?? '',
+        hasBucketPolicies: process.env.S3_TEST_BUCKET_POLICIES !== 'off',
       };
 const S3_REGION = 'us-east-1';
 
@@ -348,6 +356,23 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
     };
   };
 
+  /** The store's own answer to a link, for a bucket no anonymous read can reach here. */
+  const startSigningProxy = async (raw: ReturnType<typeof rawS3Client>) => {
+    const proxy = createServer((req, res) => {
+      const key = decodeURIComponent(new URL(req.url ?? '/', 'http://localhost').pathname.slice(1));
+      void raw.send(req.method ?? 'GET', key).then(async answer => {
+        const {
+          'content-encoding': _encoding,
+          'content-length': _length,
+          ...headers
+        } = Object.fromEntries(answer.headers);
+        res.writeHead(answer.status, headers).end(Buffer.from(await answer.arrayBuffer()));
+      });
+    });
+    stops.push(() => closeServer(proxy));
+    return listenOnLoopback(proxy);
+  };
+
   const startS3Target = async () => {
     const fake = REAL_S3 === undefined ? await startFakeS3() : undefined;
     if (fake !== undefined) stops.push(fake.stop);
@@ -355,21 +380,30 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
     const accessKeyId = REAL_S3?.accessKeyId ?? FAKE_ACCESS_KEY_ID;
     const secretAccessKey = REAL_S3?.secretAccessKey ?? FAKE_SECRET_ACCESS_KEY;
     const bucket = `test-${crypto.randomUUID()}`;
-    const linkBase = `${realEndpoint}/${bucket}`;
     const raw = rawS3Client({
       endpoint: realEndpoint,
       bucket,
       credentials: { accessKeyId, secretAccessKey: Redacted.make(secretAccessKey) },
       region: S3_REGION,
     });
+    const linkBase =
+      REAL_S3?.hasBucketPolicies === false
+        ? await startSigningProxy(raw)
+        : `${realEndpoint}/${bucket}`;
     if (REAL_S3 !== undefined) {
       const created = await raw.send('PUT', '');
       if (!created.ok) throw new Error(`Creating ${bucket}: ${await created.text()}`);
-      const policy = await raw.send('PUT', '', {
-        query: { policy: '' },
-        body: await readmeBucketPolicy(bucket),
+      stops.push(async () => {
+        await Promise.all((await raw.keys()).map(key => raw.send('DELETE', key)));
+        await raw.send('DELETE', '');
       });
-      if (!policy.ok) throw new Error(`The README's policy: ${await policy.text()}`);
+      if (REAL_S3.hasBucketPolicies) {
+        const policy = await raw.send('PUT', '', {
+          query: { policy: '' },
+          body: await readmeBucketPolicy(bucket),
+        });
+        if (!policy.ok) throw new Error(`The README's policy: ${await policy.text()}`);
+      }
     }
     let endpoint = realEndpoint;
     const env = () => ({
@@ -524,6 +558,15 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
     /** A server the test wrote takes the place of the real one. */
     useFakeServer: (server: Server) => {
       stopArtifactServer = () => closeServer(server);
+      // Anything on the machine probing loopback ports asks for `/`, which no client does, and a
+      // test counting requests must not count it.
+      const handlers = server.listeners('request');
+      server.removeAllListeners('request');
+      server.on('request', (req: IncomingMessage, res: ServerResponse) => {
+        if (req.url === '/') return void res.writeHead(404).end();
+        for (const handler of handlers) handler.call(server, req, res);
+        return undefined;
+      });
       return listenOnLoopback(server);
     },
     /** Spawned as the runner does, so the in-process servers keep answering while it runs. */

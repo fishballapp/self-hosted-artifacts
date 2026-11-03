@@ -235,10 +235,17 @@ the artifact rather than let it expire.
 
 ### What's been tried
 
-The tests run against MinIO in a container, as well as a small fake. AWS and R2 are from their docs, not
-yet from a run: conditional writes on both, and on R2 whether `x-amz-checksum-sha256` refuses a body
-that doesn't match. If it doesn't, a body damaged on its way up is only found at download, by the digest
-check.
+The tests run against MinIO in a container, as well as a small fake, and have been run once against real
+R2, with [the setup above](#on-r2) on a custom domain:
+
+- **Races:** of 8 clients uploading other content under one name, one succeeded and 7 failed with the
+  usual message. Of 6 uploading the same content, all succeeded with one ID.
+- **A damaged body:** R2 refused it with `BadDigest`, and stored nothing.
+- **The WAF rule:** it blocked `runs/`, the root and path tricks such as `/artifacts/../runs/...`, and links
+  still worked. An encoded `..%2f` passes the rule, and R2 reads it as a literal key: `404`.
+- **The cache rule:** without it, a deleted `.zip` link kept answering `200` from the cache. With it, `404`.
+
+The lifecycle rule hasn't been seen to remove anything, and AWS is still from its docs, not from a run.
 
 ## Upload
 
@@ -764,8 +771,8 @@ The two targets draw the line in different places. Read the one you use.
   Making that work means turning off this bucket's public-access block for a policy, so don't keep
   anything else in this bucket.
 - **What's public:** on AWS, exactly `artifacts/*`, by [the policy above](#on-aws): anonymous `GetObject`,
-  no listing, and neither `runs/` nor `repositories/`. A link's answer shows its repository's ID, run and
-  attempt, in `x-amz-meta-run-scope`. On R2 the whole bucket is public unless
+  no listing, and neither `runs/` nor `repositories/`. A link's answer on AWS shows its repository's ID, run
+  and attempt, in `x-amz-meta-run-scope`. On R2 the whole bucket is public unless
   [the WAF rule above](#on-r2) stops it. Without that rule, anyone who knows or guesses a repository's ID,
   a run's ID and an artifact's name can read its metadata, and with it its link. So guard that rule as
   you would the credentials.
