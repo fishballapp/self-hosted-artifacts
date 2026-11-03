@@ -4,8 +4,10 @@
 and a GitHub Action that uploads to it and gives you a download link.
 
 GitHub's artifacts cap private storage at 500 MB on the free plan, which a few app builds fill, and
-`actions/upload-artifact` can't target your own server. Public repositories' artifacts are free, so
-this is for private repositories only: the server refuses uploads from anything else.
+`actions/upload-artifact` can't target your own server. This action takes the same files by the same
+rules, so moving to it means changing the `uses:` line and adding `server-url` and `id-token: write`.
+Public repositories' artifacts are free, so this is for private repositories only: the server refuses
+uploads from anything else.
 
 - **No secrets to manage.** The action proves who it is with the workflow's OIDC token.
 - **No dependencies.** The server installs from npm as one package.
@@ -47,8 +49,8 @@ For a long-running service, install a pinned version rather than downloading at 
 | `linkBases` | required | Object of label to base URL, `http` or `https`, with no query or fragment. Each upload answers with one link per label. |
 | `host` | `"0.0.0.0"` | Address to listen on. |
 | `port` | `8420` | Port to listen on. |
-| `defaultRetentionDays` | `7` | Days to keep a file when the upload doesn't say. |
-| `maxRetentionDays` | `30` | The cap. A larger request is clamped, and the real expiry comes back. |
+| `defaultRetentionDays` | `90` | Days to keep a file when the upload doesn't say. |
+| `maxRetentionDays` | `90` | The cap. A larger request is clamped, and the real expiry comes back. |
 | `minFreeGiB` | `20` | Refuse an upload that would leave less free space than this. |
 | `maxFileGiB` | `2` | The largest file accepted. |
 
@@ -82,17 +84,32 @@ jobs:
         uses: fishballapp/self-hosted-artifacts/upload@v0.1.0
         with:
           server-url: http://192.0.2.10:8420
-          path: dist/app.apk
-          retention-days: 3
+          path: dist/
       - run: curl -fO "${{ steps.upload.outputs.artifact-url }}"
+```
+
+That uploads what's in `dist/` as one zip, `artifact.zip`. To upload one file as it is, so that its
+link ends in its own name, set `archive: false`:
+
+```yaml
+      - uses: fishballapp/self-hosted-artifacts/upload@v0.1.0
+        with:
+          server-url: http://192.0.2.10:8420
+          path: dist/app.apk
+          archive: false
+          retention-days: 3
 ```
 
 | Input | Default | Meaning |
 | --- | --- | --- |
 | `server-url` | required | The server's base URL, as the runner reaches it. Redirects are not followed. |
-| `path` | required | The one file to upload. |
-| `name` | the path's basename | The name to store it under. |
-| `retention-days` | the server's default | Days to keep the file. |
+| `path` | required | What to upload: see [Choosing the files](#choosing-the-files). |
+| `name` | `artifact` | The name, stored as `<name>.zip`. It must pass the server's [name rule](#http-api) with `.zip` added, or the step fails with the server's message. With `archive: false` it is ignored, and the file's own name is used. |
+| `if-no-files-found` | `warn` | With nothing to upload: `warn` writes a warning and the step succeeds, `error` fails the step, `ignore` only says so in the log. The step's outputs stay empty unless it uploaded. |
+| `retention-days` | `0` | Days to keep the file. `0` means the server's default. The server caps it, and `expires-at` says what it really did. |
+| `compression-level` | `6` | Zlib's level for the zip, from `0` (none) to `9` (best). For a large file that doesn't compress, `0` is much faster. |
+| `include-hidden-files` | `false` | Whether to include files and folders whose names start with a `.`. |
+| `archive` | `true` | Zip everything into one file. `false` uploads one file as it is, and more than one fails the step. |
 | `audience` | `self-hosted-artifacts` | The OIDC audience to request. |
 
 | Output | Meaning |
@@ -101,44 +118,80 @@ jobs:
 | `links` | Every link, by label, as one-line JSON. |
 | `expires-at` | When the file expires, as an ISO instant. |
 
-The file is streamed, not read into memory. A network error or a 5xx is retried a few times with a
-short backoff and a fresh token, since a failure here would otherwise throw away a whole build; any
-other refusal fails the step at once with the server's message.
+Nothing is held in memory: a zip is written to a temp file in `RUNNER_TEMP`, which needs room for it,
+and removed however the step ends. A network error or a 5xx is retried a few times with a short
+backoff and a fresh token, since a failure here would otherwise throw away a whole build; any other
+refusal fails the step at once with the server's message.
+
+### Choosing the files
+
+`path` follows the rules of `actions/upload-artifact`, which come from `@actions/glob`:
+
+```yaml
+path: dist/app.apk        # a file
+path: dist/               # a folder, with what's inside it
+path: dist/**/*.apk       # a wildcard: *, ?, [...] and **
+path: |                   # several lines add up, and the last line matching a file decides
+  dist/
+  logs/*.txt
+  !dist/**/*.map
+  # a comment, ignored
+```
+
+- **Paths** are absolute, relative to the working directory, or start with `~/`. `.` and `..` can't
+  appear inside one, though `./` can start it. Brace and extended globs (`{a,b}`, `+(a)`) aren't
+  wildcards here.
+- **What's left off the front of the paths in a zip** depends on the patterns, and `!` lines don't
+  count. With one pattern, it's the path before the first wildcard, so `dist/**/*.apk` keeps what
+  follows `dist/`. A lone file sits at the top. With several, it's their nearest common ancestor, so
+  `build/a` and `build/b/c.txt` give `a/...` and `b/c.txt`.
+- **Hidden files** are any starting with a `.`, or inside a folder starting with one. They are left
+  out unless `include-hidden-files` is `true`, even when named: `path: .env` finds nothing. A path that
+  starts inside a hidden folder, like `.cache/out/`, is searched as usual.
+- **Symlinks** are followed, and the zip holds what they point to. A broken one is left out.
+- **A file's permissions and modified time** go into the zip, and `unzip` restores them.
+- **A path in a zip** can't hold `"`, `:`, `<`, `>`, `|`, `*`, `?` or a line break, since NTFS can't
+  unpack such a name. One fails the step.
 
 ### From the command line
 
-The action wraps a command that takes the same inputs as flags and prints the result as JSON. The
-server only accepts a GitHub OIDC token, so this works only inside a workflow's job, with
-`id-token: write`:
+The action wraps a command that takes the same inputs as flags, values included, and prints the
+result as JSON. Repeat `--path` for several lines. The server only accepts a GitHub OIDC token, so
+this works only inside a workflow's job, with `id-token: write`:
 
 ```bash
-npx self-hosted-artifacts upload --server-url http://192.0.2.10:8420 --path dist/app.apk
+npx self-hosted-artifacts upload \
+  --server-url http://192.0.2.10:8420 \
+  --path dist/ --path '!dist/**/*.map' \
+  --name build
 ```
+
+With nothing to upload, it writes the message to stderr and prints nothing to stdout, and exits `0`
+unless `--if-no-files-found` is `error`.
 
 ### Compared with `actions/upload-artifact`
 
-Not a drop-in: it takes one file, never zips it, and needs its own server. Compared with v7:
+File handling and retention match v7. What's left differs because the files go to your server:
 
 | | `actions/upload-artifact` | This action |
 | --- | --- | --- |
 | **Inputs** | | |
-| `path` | A file, folder or wildcard pattern | One file; a folder or a missing file fails the step |
-| `name` | The artifact's name, default `artifact` | The file's name, default the path's basename |
-| `retention-days` | 1 to 90, default 90; `0` means the default | 1 or more, capped by the server, default set by the server; `0` is refused |
-| `archive` | Zips by default; `false` uploads one file as it is | No input: never zips |
-| `compression-level` | 0 to 9 | No input: never zips |
-| `if-no-files-found` | `warn` by default, or `error` or `ignore` | No input: always fails |
+| `path`, `if-no-files-found`, `include-hidden-files`, `compression-level` | | The same names, defaults and rules |
+| `name` | The artifact's name, default `artifact`, without `"`, `:`, `<`, `>`, `\|`, `*`, `?`, `\`, `/` | The same default, stored as `<name>.zip`. Stricter: it must start with a letter or digit, then letters, digits, `.`, `_` or `-`, so no spaces |
+| `retention-days` | 1 to 90, default 90; `0` means the default | The same by default; the server sets the default and the cap |
+| `archive` | Zips by default; `false` uploads one file as it is, under its own name | The same, and that file's name must pass the rule above too |
 | `overwrite` | Replaces an artifact of the same name; otherwise that fails | No input: each upload is a new file with its own link |
-| `include-hidden-files` | Off by default | No input: `path` names the file. A name must start with a letter or digit, so a hidden file needs `name` |
 | `server-url`, `audience` | Not applicable | Where to upload, and the OIDC audience |
 | **Outputs** | | |
 | `artifact-url` | Needs a GitHub login | Needs only the link, and whoever has it can download |
 | `artifact-id`, `artifact-digest` | Yes | No |
 | `links`, `expires-at` | No | Every link by label, and when the file expires |
 | **Behaviour** | | |
-| Where files go | GitHub, against your plan's storage quota | A disk you own; 2 GiB per file by default |
+| Where files go | GitHub, against your plan's storage quota | A disk you own; 2 GiB per upload by default |
 | Which repositories | Any | Private ones of one owner; public repositories' artifacts are free on GitHub |
+| Runners | Any | Linux and macOS. `path` isn't read the Windows way |
 | Job permission | None to add | `id-token: write` |
+| Zipping | Streams to GitHub | Writes a temp file first, so `RUNNER_TEMP` needs room for the zip |
 | Getting a file | `actions/download-artifact`, the run's page, the API | `curl` or a browser; it isn't listed anywhere |
 | Deleting early | The run's page or the API | No: it stays until it expires |
 
@@ -204,16 +257,19 @@ wrong filename, an expired file, and any query string. There is no listing.
 
 ## Limits
 
-- 2 GiB per file by default, checked from `Content-Length` and counted while streaming.
-- 30 days' retention at most by default.
+- 2 GiB per file by default, checked from `Content-Length` and counted while streaming. A zip counts
+  as one file.
+- Under 4 GiB per upload from the action or the command, whatever `maxFileGiB` says: Node's `fetch`
+  can't send more with the right length. Files in a zip can be larger, as long as the zip isn't.
+- 90 days' retention at most by default.
 - One hour for a request, enough for 2 GiB at about 5 Mbit/s. A slower upload is cut off.
 - Five minutes idle: a client that stops reading or sending is cut off, downloads included. A stalled
   download is cut off after 10 to 15 minutes, as Node restarts the timer while a write is pending.
 
 ## Not supported
 
-Folders, S3 or other storage, a web UI, a download action (`curl` covers it), `Range` requests, and
-deleting a file before it expires.
+S3 or other storage, a web UI, a download action (`curl` covers it), `Range` requests, and deleting a
+file before it expires.
 
 ## License
 

@@ -15,8 +15,12 @@ catalog:
   "@effect/platform-node": 4.0.0
   "@effect/vitest": 4.0.0
   "@types/node": ^24.13.4
+  "@types/yazl": ^3.3.1
   effect: 4.0.0
+  fflate: ^0.8.3
+  minimatch: ^10.2.6
   repojj: ^2026.7.29
   tsdown: ^0.23.0
   typescript: ~7.0.2
   vitest: ^5.0.1
+  yazl: ^3.3.1

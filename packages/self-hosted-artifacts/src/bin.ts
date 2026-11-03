@@ -14,13 +14,12 @@ import * as FetchHttpClient from 'effect/http/FetchHttpClient';
 import * as HttpClient from 'effect/http/HttpClient';
 import * as Layer from 'effect/Layer';
 import * as Logger from 'effect/Logger';
-import * as Option from 'effect/Option';
 import packageJson from '../package.json' with { type: 'json' };
 import { ServerConfig } from './config.ts';
 import { TokenVerifier } from './oidc.ts';
 import { ArtifactServer, makeNodeServer } from './server.ts';
 import { Store, StoreSweeps } from './store.ts';
-import { type UploadError, upload } from './upload.ts';
+import { UPLOAD_DEFAULTS, type UploadError, upload } from './upload.ts';
 
 // launchd kills a daemon 20 seconds after SIGTERM, and a request stopped sooner can clean up.
 const SHUTDOWN_GRACE = Duration.seconds(5);
@@ -72,30 +71,56 @@ const uploadCommand = Command.make(
   'upload',
   {
     serverUrl: Flag.String('server-url').pipe(Flag.withDescription("The server's base URL")),
-    path: Flag.String('path').pipe(Flag.withDescription('The one file to upload')),
+    path: Flag.String('path').pipe(
+      Flag.withDescription(
+        'A file, folder or wildcard pattern to upload, or to exclude with a leading `!`. Repeat for several',
+      ),
+      Flag.atLeast(1),
+    ),
     name: Flag.String('name').pipe(
-      Flag.withDescription("The name to store it under. Defaults to the path's basename"),
-      Flag.optional,
+      Flag.withDescription(
+        `The name to store it under, plus \`.zip\`. With \`--archive false\`, the file's own name is used instead`,
+      ),
+      Flag.withDefault(UPLOAD_DEFAULTS.name),
+    ),
+    ifNoFilesFound: Flag.String('if-no-files-found').pipe(
+      Flag.withDescription('With nothing to upload: warn, error or ignore'),
+      Flag.withDefault(UPLOAD_DEFAULTS.ifNoFilesFound),
     ),
     retentionDays: Flag.String('retention-days').pipe(
-      Flag.withDescription("Days to keep the file. Defaults to the server's default"),
-      Flag.optional,
+      Flag.withDescription("Days to keep it. 0 means the server's default"),
+      Flag.withDefault(UPLOAD_DEFAULTS.retentionDays),
+    ),
+    compressionLevel: Flag.String('compression-level').pipe(
+      Flag.withDescription('Zlib compression level for the zip, 0 to 9'),
+      Flag.withDefault(UPLOAD_DEFAULTS.compressionLevel),
+    ),
+    includeHiddenFiles: Flag.String('include-hidden-files').pipe(
+      Flag.withDescription('true to include files and folders starting with a dot'),
+      Flag.withDefault(UPLOAD_DEFAULTS.includeHiddenFiles),
+    ),
+    archive: Flag.String('archive').pipe(
+      Flag.withDescription('false to upload one file as it is rather than zipped'),
+      Flag.withDefault(UPLOAD_DEFAULTS.archive),
     ),
     audience: Flag.String('audience').pipe(
       Flag.withDescription('The OIDC audience to request'),
-      Flag.withDefault('self-hosted-artifacts'),
+      Flag.withDefault(UPLOAD_DEFAULTS.audience),
     ),
   },
-  ({ serverUrl, path, name, retentionDays, audience }) =>
-    upload({
-      serverUrl,
-      path,
-      name: Option.getOrUndefined(name),
-      retentionDays: Option.getOrUndefined(retentionDays),
-      audience,
-    }).pipe(
-      Effect.flatMap(({ name: storedName, size, links, expiresAt }) =>
-        Console.log(JSON.stringify({ name: storedName, size, links, expiresAt })),
+  ({ path, ...inputs }) =>
+    upload({ ...inputs, path: path.join('\n') }).pipe(
+      Effect.flatMap(result =>
+        result._tag === 'NoFilesFound'
+          ? Console.error(result.isWarning ? `Warning: ${result.message}` : result.message)
+          : Console.log(
+              JSON.stringify({
+                name: result.name,
+                size: result.size,
+                links: result.links,
+                expiresAt: result.expiresAt,
+              }),
+            ),
       ),
       Effect.catchTag('UploadError', (error: UploadError) =>
         Effect.fail(new CliError.UserError({ cause: error, userMessage: error.message })),
@@ -107,7 +132,7 @@ const uploadCommand = Command.make(
         ),
       ),
     ),
-).pipe(Command.withDescription('Upload one file from a GitHub Actions job'));
+).pipe(Command.withDescription('Upload files from a GitHub Actions job'));
 
 const command = Command.make('self-hosted-artifacts').pipe(
   Command.withDescription('A small file server for builds from private repositories'),

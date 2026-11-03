@@ -1,5 +1,4 @@
 import * as NodeFileSystem from '@effect/platform-node/NodeFileSystem';
-import * as NodePath from '@effect/platform-node/NodePath';
 import * as NodeRuntime from '@effect/platform-node/NodeRuntime';
 import * as Cause from 'effect/Cause';
 import * as Config from 'effect/Config';
@@ -10,7 +9,7 @@ import * as FetchHttpClient from 'effect/http/FetchHttpClient';
 import * as HttpClient from 'effect/http/HttpClient';
 import * as Layer from 'effect/Layer';
 import * as Predicate from 'effect/Predicate';
-import { UploadError, upload } from './upload.ts';
+import { UPLOAD_DEFAULTS, UploadError, upload } from './upload.ts';
 
 // The runner passes every input as a variable, an unset one as empty.
 const input = (name: string) =>
@@ -19,13 +18,16 @@ const input = (name: string) =>
     Config.map(value => value.trim()),
   );
 
+const inputOr = (name: string, fallback: string) =>
+  input(name).pipe(Config.map(value => (value === '' ? fallback : value)));
+
 const requiredInput = Effect.fnUntraced(function* (name: string) {
   const value = yield* input(name);
-  if (value === '') return yield* new UploadError({ message: `The ${name} input is required` });
+  if (value === '') {
+    return yield* new UploadError({ message: `Input required and not supplied: ${name}` });
+  }
   return value;
 });
-
-const emptyAsUndefined = (value: string) => (value === '' ? undefined : value);
 
 // A workflow command ends at its line break, so one in the message has to be encoded.
 const escapeCommand = (message: string) =>
@@ -33,13 +35,23 @@ const escapeCommand = (message: string) =>
 
 const main = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
-  const { name, size, artifactUrl, links, expiresAt } = yield* upload({
+  const result = yield* upload({
     serverUrl: yield* requiredInput('server-url'),
     path: yield* requiredInput('path'),
-    name: emptyAsUndefined(yield* input('name')),
-    retentionDays: emptyAsUndefined(yield* input('retention-days')),
-    audience: emptyAsUndefined(yield* input('audience')) ?? 'self-hosted-artifacts',
+    name: yield* inputOr('name', UPLOAD_DEFAULTS.name),
+    ifNoFilesFound: yield* inputOr('if-no-files-found', UPLOAD_DEFAULTS.ifNoFilesFound),
+    retentionDays: yield* inputOr('retention-days', UPLOAD_DEFAULTS.retentionDays),
+    compressionLevel: yield* inputOr('compression-level', UPLOAD_DEFAULTS.compressionLevel),
+    includeHiddenFiles: yield* inputOr('include-hidden-files', UPLOAD_DEFAULTS.includeHiddenFiles),
+    archive: yield* inputOr('archive', UPLOAD_DEFAULTS.archive),
+    audience: yield* inputOr('audience', UPLOAD_DEFAULTS.audience),
   });
+  if (result._tag === 'NoFilesFound') {
+    return yield* Console.log(
+      result.isWarning ? `::warning::${escapeCommand(result.message)}` : result.message,
+    );
+  }
+  const { name, size, artifactUrl, links, expiresAt } = result;
   yield* fs.writeFileString(
     yield* Config.String('GITHUB_OUTPUT'),
     [
@@ -49,7 +61,7 @@ const main = Effect.gen(function* () {
     ].join('\n'),
     { flag: 'a' },
   );
-  yield* Console.log(`Uploaded ${name} (${size} bytes), expires at ${expiresAt}`);
+  return yield* Console.log(`Uploaded ${name} (${size} bytes), expires at ${expiresAt}`);
 });
 
 main.pipe(
@@ -66,7 +78,6 @@ main.pipe(
       // No trace headers on requests to the runner or the server: neither has a use for them.
       Layer.succeed(HttpClient.TracerPropagationEnabled, false),
       NodeFileSystem.layer,
-      NodePath.layer,
     ),
   ),
   NodeRuntime.runMain({ disableErrorReporting: true }),

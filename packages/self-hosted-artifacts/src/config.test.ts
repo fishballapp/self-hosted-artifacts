@@ -25,8 +25,8 @@ describe('parseConfig', () => {
         linkBases: { home: 'http://192.0.2.1:8420', public: 'https://files.example' },
         host: '0.0.0.0',
         port: 8420,
-        defaultRetentionDays: 7,
-        maxRetentionDays: 30,
+        defaultRetentionDays: 90,
+        maxRetentionDays: 90,
         minFreeBytes: 20 * 1024 ** 3,
         maxFileBytes: 2 * 1024 ** 3,
       });

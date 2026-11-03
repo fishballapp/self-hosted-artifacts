@@ -26,8 +26,8 @@ const ConfigFileSchema = Schema.Struct({
   port: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 65535 })).pipe(
     Schema.withDecodingDefaultKey(Effect.succeed(8420)),
   ),
-  defaultRetentionDays: positiveInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(7))),
-  maxRetentionDays: positiveInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(30))),
+  defaultRetentionDays: positiveInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(90))),
+  maxRetentionDays: positiveInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(90))),
   minFreeGiB: Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: MAX_GIB })).pipe(
     Schema.withDecodingDefaultKey(Effect.succeed(20)),
   ),

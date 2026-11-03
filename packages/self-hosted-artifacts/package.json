@@ -36,8 +36,12 @@
     "@effect/platform-node": "catalog:",
     "@effect/vitest": "catalog:",
     "@types/node": "catalog:",
+    "@types/yazl": "catalog:",
     "effect": "catalog:",
+    "fflate": "catalog:",
+    "minimatch": "catalog:",
     "tsdown": "catalog:",
-    "vitest": "catalog:"
+    "vitest": "catalog:",
+    "yazl": "catalog:"
   }
 }
