@@ -1,4 +1,5 @@
 import { execFile, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import {
   mkdir,
@@ -10,7 +11,7 @@ import {
   truncate,
   writeFile,
 } from 'node:fs/promises';
-import { createServer, type Server } from 'node:http';
+import { createServer, request as httpRequest, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -64,6 +65,7 @@ describe('the upload action', () => {
   let runnerTemp: string;
   let tokenRequests: URL[];
   let tokenRequestAuth: (string | undefined)[];
+  let runClaims: Record<string, string>;
 
   beforeAll(async () => {
     await promisify(execFile)('pnpm', ['exec', 'tsdown'], {
@@ -82,6 +84,7 @@ describe('the upload action', () => {
       repository: 'fishballapp/private-thing',
       repository_owner_id: '42',
       repository_visibility: 'private',
+      ...runClaims,
     })}`;
     const signature = await crypto.subtle.sign(
       RSA,
@@ -148,6 +151,7 @@ describe('the upload action', () => {
     await mkdir(runnerTemp);
     tokenRequests = [];
     tokenRequestAuth = [];
+    runClaims = { repository_id: '7', run_id: '100', run_attempt: '1' };
     tokenServer = createServer((req, res) => {
       const url = new URL(req.url ?? '', 'http://localhost');
       // Anything on the machine probing loopback ports lands here too, so count only the endpoint.
@@ -264,6 +268,9 @@ describe('the upload action', () => {
     expect(Object.keys(links)).toEqual(['home', 'tailscale']);
     expect(outputs['artifact-url']).toBe(links.home);
     expect(links.home).toMatch(/\/liuk-preview\.apk$/);
+    expect(outputs['artifact-id']).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(links.home).toContain(`/${outputs['artifact-id']}/`);
+    expect(outputs['artifact-digest']).toBe(createHash('sha256').update(content).digest('hex'));
     const expiresAt = Temporal.Instant.from(outputs['expires-at'] ?? '');
     const untilExpiry = expiresAt.since(Temporal.Now.instant()).total('hours');
     expect(untilExpiry).toBeGreaterThan(47);
@@ -343,8 +350,10 @@ describe('the upload action', () => {
       'from-cli',
     ]);
     expect(exitCode).toBe(0);
-    const { name, links } = JSON.parse(stdout);
+    const { id, name, digest, links } = JSON.parse(stdout);
     expect(name).toBe('from-cli.zip');
+    expect(links.home).toContain(`/${id}/`);
+    expect(digest).toMatch(/^[0-9a-f]{64}$/);
     await writeFile(outputPath, `artifact-url=${links.home}\n`);
     expect(await downloadUnzipped()).toEqual({ 'a.txt': base64('a'), 'b.txt': base64('b') });
   });
@@ -386,6 +395,23 @@ describe('the upload action', () => {
       expect(stderr).toContain(message);
     },
   );
+
+  it('overwrites through the CLI too', async () => {
+    await startArtifactServer();
+    await writeFiles({ 'one.bin': 'first' });
+    const flags = ['--path', 'one.bin', '--archive', 'false'];
+    const first = JSON.parse((await runCli(flags)).stdout);
+    await writeFiles({ 'one.bin': 'second' });
+
+    const refused = await runCli(flags);
+    expect(refused.exitCode).toBe(1);
+    expect(refused.stderr).toContain('already exists on the workflow run');
+
+    const second = JSON.parse((await runCli([...flags, '--overwrite', 'true'])).stdout);
+    expect(second.id).not.toBe(first.id);
+    expect(second.digest).toBe(createHash('sha256').update('second').digest('hex'));
+    expect((await fetch(`${serverUrl}${new URL(first.links.home).pathname}`)).status).toBe(404);
+  });
 
   it('zips a folder by default, and it unpacks back byte for byte', async () => {
     await startArtifactServer();
@@ -486,7 +512,13 @@ describe('the upload action', () => {
 
     await rm(outputPath);
     expect(
-      (await runAction({ INPUT_PATH: 'site', 'INPUT_INCLUDE-HIDDEN-FILES': 'true' })).exitCode,
+      (
+        await runAction({
+          INPUT_PATH: 'site',
+          'INPUT_INCLUDE-HIDDEN-FILES': 'true',
+          INPUT_OVERWRITE: 'true',
+        })
+      ).exitCode,
     ).toBe(0);
     expect(await downloadUnzipped()).toEqual({
       'index.html': base64('i'),
@@ -583,6 +615,7 @@ describe('the upload action', () => {
       await rm(outputPath, { force: true });
       const { exitCode } = await runAction({
         INPUT_PATH: 'text.txt',
+        INPUT_NAME: `level-${level}`,
         'INPUT_COMPRESSION-LEVEL': level,
       });
       expect(exitCode).toBe(0);
@@ -627,6 +660,11 @@ describe('the upload action', () => {
       'an include-hidden-files that is no boolean',
       { 'INPUT_INCLUDE-HIDDEN-FILES': '1' },
       'Input does not meet YAML 1.2 "Core Schema" specification: include-hidden-files',
+    ],
+    [
+      'an overwrite that is no boolean',
+      { INPUT_OVERWRITE: 'yes' },
+      'Input does not meet YAML 1.2 "Core Schema" specification: overwrite',
     ],
     [
       'a path going up',
@@ -726,7 +764,9 @@ describe('the upload action', () => {
         .writeHead(isFirst ? 500 : 201, { 'Content-Type': 'application/json' })
         .end(
           JSON.stringify(
-            isFirst ? { error: 'try again' } : { links: { home: 'http://x/a' }, expiresAt: 'x' },
+            isFirst
+              ? { error: 'try again' }
+              : { id: 'an-id', links: { home: 'http://x/a' }, expiresAt: 'x' },
           ),
         );
       return undefined;
@@ -742,6 +782,208 @@ describe('the upload action', () => {
     expect(bodies).toHaveLength(2);
     expect(bodies[1]).toEqual(bodies[0]);
     expect(await readdir(runnerTemp)).toEqual([]);
+  });
+
+  describe('one name in one run attempt', () => {
+    const uploadFile = async (content: string, inputs: Record<string, string> = {}) => {
+      await writeFiles({ 'app.bin': content });
+      await rm(outputPath, { force: true });
+      const result = await runAction({ INPUT_PATH: 'app.bin', INPUT_ARCHIVE: 'false', ...inputs });
+      return {
+        ...result,
+        outputs: result.exitCode === 0 ? await readOutputs() : {},
+      };
+    };
+
+    const statusOfLink = async (url: string | undefined) =>
+      (await fetch(`${serverUrl}${new URL(url ?? '').pathname}`)).status;
+
+    it('gives a zip the digest of the zip, as it gives a file the file', async () => {
+      await startArtifactServer();
+      await writeFiles({ 'dist/a.txt': 'a' });
+      expect((await runAction({ INPUT_PATH: 'dist' })).exitCode).toBe(0);
+      const outputs = await readOutputs();
+      const zip = await downloadOutput(outputs['artifact-url']);
+      expect(outputs['artifact-digest']).toBe(createHash('sha256').update(zip).digest('hex'));
+    });
+
+    it('fails on other content, leaving the first upload working', async () => {
+      await startArtifactServer();
+      const first = await uploadFile('first');
+
+      const second = await uploadFile('second');
+
+      expect(second.exitCode).toBe(1);
+      expect(second.stdout).toMatch(/^::error::An artifact with this name already exists/m);
+      // A refusal the server means is not retried.
+      expect(tokenRequests).toHaveLength(2);
+      await expect(readFile(outputPath, 'utf8')).rejects.toThrow(/ENOENT/);
+      expect(await statusOfLink(first.outputs['artifact-url'])).toBe(200);
+    });
+
+    it('with overwrite, replaces it, and the old link stops working', async () => {
+      await startArtifactServer();
+      const first = await uploadFile('first');
+
+      const second = await uploadFile('second', { INPUT_OVERWRITE: 'true' });
+
+      expect(second.exitCode).toBe(0);
+      expect(second.outputs['artifact-id']).not.toBe(first.outputs['artifact-id']);
+      expect(await statusOfLink(first.outputs['artifact-url'])).toBe(404);
+      expect(Buffer.from(await downloadOutput(second.outputs['artifact-url'])).toString()).toBe(
+        'second',
+      );
+    });
+
+    it('answers the same content with the artifact already there', async () => {
+      await startArtifactServer();
+      const first = await uploadFile('same');
+      const second = await uploadFile('same');
+      expect(second.exitCode).toBe(0);
+      expect(second.outputs).toEqual(first.outputs);
+    });
+
+    it('needs none of a large body to answer the same content', { timeout: 30_000 }, async () => {
+      await startArtifactServer();
+      const path = join(rootDir, 'big.bin');
+      await writeFile(path, '');
+      await truncate(path, 256 * 1024 ** 2);
+      const inputs = { INPUT_PATH: path, INPUT_ARCHIVE: 'false' };
+      expect((await runAction(inputs)).exitCode).toBe(0);
+      const first = await readOutputs();
+
+      await rm(outputPath);
+      expect((await runAction(inputs)).exitCode).toBe(0);
+      expect(await readOutputs()).toEqual(first);
+    });
+
+    it('keeps a re-run apart: a new attempt holds the name afresh', async () => {
+      await startArtifactServer();
+      const first = await uploadFile('first');
+
+      runClaims = { ...runClaims, run_attempt: '2' };
+      const rerun = await uploadFile('from the re-run');
+
+      expect(rerun.exitCode).toBe(0);
+      expect(rerun.outputs['artifact-id']).not.toBe(first.outputs['artifact-id']);
+      expect(await statusOfLink(first.outputs['artifact-url'])).toBe(200);
+      expect(await statusOfLink(rerun.outputs['artifact-url'])).toBe(200);
+    });
+
+    it.each([
+      ['repository', { repository_id: '8' }],
+      ['run', { run_id: '101' }],
+    ])('keeps another %s apart', async (_, claims) => {
+      await startArtifactServer();
+      const first = await uploadFile('first');
+
+      runClaims = { ...runClaims, ...claims };
+      const other = await uploadFile('other', { INPUT_OVERWRITE: 'true' });
+
+      expect(other.exitCode).toBe(0);
+      expect(await statusOfLink(first.outputs['artifact-url'])).toBe(200);
+    });
+
+    it('lets one of two jobs racing for the name win', async () => {
+      await startArtifactServer();
+      await writeFiles({ 'one.bin': 'one', 'two.bin': 'two' });
+      const race = (file: string) =>
+        runAction(
+          { INPUT_PATH: file, INPUT_NAME: 'shared' },
+          // Each job its own output file, as each job has on a runner.
+          { GITHUB_OUTPUT: join(rootDir, `${file}.output`) },
+        );
+
+      const results = await Promise.all([race('one.bin'), race('two.bin')]);
+
+      expect(results.map(({ exitCode }) => exitCode).toSorted()).toEqual([0, 1]);
+      const loser = results.find(({ exitCode }) => exitCode === 1);
+      expect(loser?.stdout).toContain('already exists on the workflow run');
+      expect(await readdir(join(rootDir, 'store', 'artifacts'))).toHaveLength(1);
+      expect(await readdir(join(rootDir, 'store', 'tmp'))).toEqual([]);
+    });
+
+    it('survives losing the answer to an upload that was stored', async () => {
+      await startArtifactServer();
+      const backend = new URL(serverUrl);
+      let posts = 0;
+      // Forwards each upload, then for the first, hangs up in place of the server's answer.
+      const lossy = createServer((req, res) => {
+        const forward = httpRequest(
+          {
+            host: backend.hostname,
+            port: backend.port,
+            method: req.method,
+            path: req.url,
+            headers: req.headers,
+          },
+          answer => {
+            posts += 1;
+            if (posts === 1) {
+              answer.resume();
+              answer.on('end', () => res.destroy());
+              return;
+            }
+            res.writeHead(answer.statusCode ?? 500, answer.headers);
+            answer.pipe(res);
+          },
+        );
+        req.pipe(forward);
+      });
+      serverUrl = await listenOnLoopback(lossy);
+      await writeFiles({ 'app.bin': 'the build' });
+
+      const { exitCode, stderr } = await runAction({
+        INPUT_PATH: 'app.bin',
+        INPUT_ARCHIVE: 'false',
+      });
+      await closeServer(lossy);
+      serverUrl = backend.origin;
+
+      expect(stderr).toContain('Attempt 1 failed');
+      expect(exitCode).toBe(0);
+      expect(posts).toBe(2);
+      const outputs = await readOutputs();
+      expect(await readdir(join(rootDir, 'store', 'artifacts'))).toEqual([outputs['artifact-id']]);
+      expect(Buffer.from(await downloadOutput(outputs['artifact-url'])).toString()).toBe(
+        'the build',
+      );
+    });
+
+    it('fails when the file changes between its digest and its upload', async () => {
+      await startFakeServer([{ status: 422, body: { error: "The body's SHA-256 is not that" } }]);
+      await writeFiles({ 'app.bin': 'x' });
+      const { exitCode, stdout } = await runAction({ INPUT_PATH: 'app.bin' });
+      expect(exitCode).toBe(1);
+      expect(stdout).toContain("::error::The body's SHA-256 is not that");
+      expect(tokenRequests).toHaveLength(1);
+    });
+
+    it('sends the digest and, only when set, overwrite', async () => {
+      const requested: URL[] = [];
+      artifactServer = createServer((req, res) => {
+        if (req.method !== 'POST') return void res.writeHead(404).end();
+        requested.push(new URL(req.url ?? '', 'http://localhost'));
+        req.resume();
+        req.on('end', () => {
+          res
+            .writeHead(201, { 'Content-Type': 'application/json' })
+            .end(JSON.stringify({ id: 'an-id', links: { home: 'http://x/a' }, expiresAt: 'x' }));
+        });
+        return undefined;
+      });
+      stopArtifactServer = () => closeServer(artifactServer);
+      serverUrl = await listenOnLoopback(artifactServer);
+      await writeFiles({ 'app.bin': 'x' });
+      const digest = createHash('sha256').update('x').digest('hex');
+
+      expect((await uploadFile('x')).exitCode).toBe(0);
+      expect((await uploadFile('x', { INPUT_OVERWRITE: 'true' })).exitCode).toBe(0);
+
+      expect(requested[0]?.searchParams.get('digest')).toBe(digest);
+      expect(requested[0]?.searchParams.has('overwrite')).toBe(false);
+      expect(requested[1]?.searchParams.get('overwrite')).toBe('true');
+    });
   });
 
   it('removes the zip when the runner stops the step', async () => {
@@ -826,7 +1068,11 @@ describe('the upload action', () => {
         attempts += 1;
         return attempts === 1
           ? { kind: 'unavailable', reason: 'could not fetch the JWKS' }
-          : { kind: 'verified', repository: 'fishballapp/private-thing' };
+          : {
+              kind: 'verified',
+              repository: 'fishballapp/private-thing',
+              scope: { repositoryId: '7', runId: '100', runAttempt: '1' },
+            };
       }),
     });
     const path = join(rootDir, 'a.bin');
@@ -853,15 +1099,23 @@ describe('the upload action', () => {
   };
 
   it.each([
-    ['no links', { links: {}, expiresAt: '2030-01-01T00:00:00Z' }],
-    ['no links object', { expiresAt: '2030-01-01T00:00:00Z' }],
-    ['no expiry', { links: { home: 'http://x/a' } }],
-    ['a line break in a link', { links: { home: 'http://x/a\nowned=1' }, expiresAt: 'x' }],
+    ['no links', { id: 'an-id', links: {}, expiresAt: '2030-01-01T00:00:00Z' }],
+    ['no links object', { id: 'an-id', expiresAt: '2030-01-01T00:00:00Z' }],
+    ['no expiry', { id: 'an-id', links: { home: 'http://x/a' } }],
+    ['no ID', { links: { home: 'http://x/a' }, expiresAt: 'x' }],
+    ['a line break in the ID', { id: 'a\nowned=1', links: { home: 'http://x/a' }, expiresAt: 'x' }],
+    [
+      'a line break in a link',
+      { id: 'an-id', links: { home: 'http://x/a\nowned=1' }, expiresAt: 'x' },
+    ],
     [
       'a line break in another link',
-      { links: { a: 'http://x/a', b: 'b\nowned=1' }, expiresAt: 'x' },
+      { id: 'an-id', links: { a: 'http://x/a', b: 'b\nowned=1' }, expiresAt: 'x' },
     ],
-    ['a line break in the expiry', { links: { home: 'http://x/a' }, expiresAt: 'x\nowned=1' }],
+    [
+      'a line break in the expiry',
+      { id: 'an-id', links: { home: 'http://x/a' }, expiresAt: 'x\nowned=1' },
+    ],
   ])('refuses an answer with %s, writing no outputs', async (_, body) => {
     await startFakeServer([{ status: 201, body }]);
     const path = join(rootDir, 'a.bin');
@@ -872,10 +1126,40 @@ describe('the upload action', () => {
     await expect(readFile(outputPath, 'utf8')).rejects.toThrow(/ENOENT/);
   });
 
+  it('retries an answer cut short, which a stored upload may have been', async () => {
+    let posts = 0;
+    const stored = JSON.stringify({
+      id: 'an-id',
+      links: { home: 'http://x/a' },
+      expiresAt: '2030-01-01T00:00:00Z',
+    });
+    artifactServer = createServer((req, res) => {
+      if (req.method !== 'POST') return void res.writeHead(404).end();
+      req.resume();
+      req.on('end', () => {
+        posts += 1;
+        const headers = { 'Content-Type': 'application/json', 'Content-Length': stored.length };
+        if (posts > 1) return void res.writeHead(200, headers).end(stored);
+        res.writeHead(201, headers).write(stored.slice(0, 5), () => res.destroy());
+        return undefined;
+      });
+      return undefined;
+    });
+    stopArtifactServer = () => closeServer(artifactServer);
+    serverUrl = await listenOnLoopback(artifactServer);
+    const path = join(rootDir, 'a.bin');
+    await writeFile(path, 'x');
+    const { exitCode, stderr } = await runAction({ INPUT_PATH: path });
+    expect(stderr).toContain('Attempt 1 failed');
+    expect(exitCode).toBe(0);
+    expect(posts).toBe(2);
+    expect((await readOutputs())['artifact-id']).toBe('an-id');
+  });
+
   it("keeps a server's message from starting a workflow command", async () => {
     await startFakeServer([
       { status: 500, body: { error: 'boom\n::warning::injected' } },
-      { status: 201, body: { links: { home: 'http://x/a' }, expiresAt: 'x' } },
+      { status: 201, body: { id: 'an-id', links: { home: 'http://x/a' }, expiresAt: 'x' } },
     ]);
     const path = join(rootDir, 'a.bin');
     await writeFile(path, 'x');

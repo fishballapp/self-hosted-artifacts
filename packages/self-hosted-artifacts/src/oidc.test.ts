@@ -27,6 +27,9 @@ const GOOD_CLAIMS = {
   nbf: NOW_SECONDS - 10,
   exp: NOW_SECONDS + 300,
   repository: 'fishballapp/private-thing',
+  repository_id: '7',
+  run_id: '100',
+  run_attempt: '2',
   repository_owner_id: '42',
   repository_visibility: 'private',
 };
@@ -92,7 +95,9 @@ describe('TokenVerifier', () => {
           const verifier = yield* TokenVerifier;
           return yield* verifier.verify(token);
         }).pipe(
-          Effect.map(({ repository }): Verification => ({ kind: 'verified', repository })),
+          Effect.map(
+            ({ repository, scope }): Verification => ({ kind: 'verified', repository, scope }),
+          ),
           Effect.catchTags({
             TokenRejectedError: ({ reason }) =>
               Effect.succeed<Verification>({ kind: 'rejected', reason }),
@@ -106,10 +111,11 @@ describe('TokenVerifier', () => {
   const signGood = (claims: object = GOOD_CLAIMS) =>
     signRs256(keys.privateKey, { alg: 'RS256', typ: 'JWT', kid: 'key-1' }, claims);
 
-  it('accepts a good token and names its repository', async () => {
+  it('accepts a good token and names its repository, run and attempt', async () => {
     expect(await verifierFor()(await signGood())).toEqual({
       kind: 'verified',
       repository: 'fishballapp/private-thing',
+      scope: { repositoryId: '7', runId: '100', runAttempt: '2' },
     });
   });
 
@@ -178,6 +184,8 @@ describe('TokenVerifier', () => {
     ['wrong org', { repository_owner_id: '43' }, 'wrong repository owner'],
     ['numeric org', { repository_owner_id: 42 }, 'wrong repository owner'],
     ['public repo', { repository_visibility: 'public' }, 'repository is not private'],
+    ['a path as a run', { run_id: '../../etc' }, 'no repository or run claims'],
+    ['a numeric attempt', { run_attempt: 2 }, 'no repository or run claims'],
     ['internal repo', { repository_visibility: 'internal' }, 'repository is not private'],
     ['string expiry', { exp: String(NOW_SECONDS + 300) }, 'no expiry'],
   ])('rejects %s', async (_, override, reason) => {
@@ -190,7 +198,10 @@ describe('TokenVerifier', () => {
     ['aud', 'wrong audience'],
     ['exp', 'no expiry'],
     ['nbf', 'no not-before'],
-    ['repository', 'no repository claim'],
+    ['repository', 'no repository or run claims'],
+    ['repository_id', 'no repository or run claims'],
+    ['run_id', 'no repository or run claims'],
+    ['run_attempt', 'no repository or run claims'],
     ['repository_owner_id', 'wrong repository owner'],
     ['repository_visibility', 'repository is not private'],
   ])('rejects a token missing its %s claim', async (claim, reason) => {

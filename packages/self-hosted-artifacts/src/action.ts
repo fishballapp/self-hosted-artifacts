@@ -44,6 +44,7 @@ const main = Effect.gen(function* () {
     compressionLevel: yield* inputOr('compression-level', UPLOAD_DEFAULTS.compressionLevel),
     includeHiddenFiles: yield* inputOr('include-hidden-files', UPLOAD_DEFAULTS.includeHiddenFiles),
     archive: yield* inputOr('archive', UPLOAD_DEFAULTS.archive),
+    overwrite: yield* inputOr('overwrite', UPLOAD_DEFAULTS.overwrite),
     audience: yield* inputOr('audience', UPLOAD_DEFAULTS.audience),
   });
   if (result._tag === 'NoFilesFound') {
@@ -51,11 +52,13 @@ const main = Effect.gen(function* () {
       result.isWarning ? `::warning::${escapeCommand(result.message)}` : result.message,
     );
   }
-  const { name, size, artifactUrl, links, expiresAt } = result;
+  const { id, name, size, digest, artifactUrl, links, expiresAt } = result;
   yield* fs.writeFileString(
     yield* Config.String('GITHUB_OUTPUT'),
     [
+      `artifact-id=${id}`,
       `artifact-url=${artifactUrl}`,
+      `artifact-digest=${digest}`,
       `links=${JSON.stringify(links)}`,
       `expires-at=${expiresAt}\n`,
     ].join('\n'),

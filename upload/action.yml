@@ -35,12 +35,22 @@ inputs:
       If true, the files are zipped before uploading. If false, one file is uploaded as it is, under
       its own name, ignoring the `name` input.
     default: 'true'
+  overwrite:
+    description: >
+      If true, an artifact of this name in the same run attempt is replaced, and its link stops
+      working. If false, uploading a name that attempt already holds fails, unless the content is
+      the same.
+    default: 'false'
   audience:
     description: The OIDC audience to request, matching the server's oidcAudience.
     default: self-hosted-artifacts
 outputs:
+  artifact-id:
+    description: The artifact's ID, which is also its download token. Empty if nothing was uploaded.
   artifact-url:
     description: The first download link. Empty if nothing was uploaded.
+  artifact-digest:
+    description: The SHA-256 of what was uploaded, in hex. Empty if nothing was uploaded.
   links:
     description: Every download link, by label, as one-line JSON. Empty if nothing was uploaded.
   expires-at:

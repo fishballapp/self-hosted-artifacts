@@ -12,6 +12,7 @@ import * as Ref from 'effect/Ref';
 import * as Schema from 'effect/Schema';
 import * as Semaphore from 'effect/Semaphore';
 import { ServerConfig } from './config.ts';
+import { RunNumberSchema, type RunScope } from './store.ts';
 
 const ISSUER = 'https://token.actions.githubusercontent.com';
 const RSA = { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' } as const;
@@ -42,6 +43,14 @@ const RsaJwkSchema = Schema.Struct({
   e: Schema.String,
 });
 
+const RunClaimsSchema = Schema.Struct({
+  repository: Schema.String,
+  repository_id: RunNumberSchema,
+  run_id: RunNumberSchema,
+  run_attempt: RunNumberSchema,
+});
+
+const decodeRunClaims = Schema.decodeUnknownOption(RunClaimsSchema);
 const decodeRsaJwk = (jwk: unknown) => Schema.decodeUnknownOption(RsaJwkSchema)(jwk);
 const decodeJsonObject = Schema.decodeUnknownOption(
   Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown)),
@@ -111,7 +120,7 @@ export class TokenVerifier extends Context.Service<
     readonly verify: (
       token: string,
     ) => Effect.Effect<
-      { readonly repository: string },
+      { readonly repository: string; readonly scope: RunScope },
       TokenRejectedError | SigningKeysUnavailableError
     >;
   }
@@ -184,9 +193,13 @@ export class TokenVerifier extends Context.Service<
             nowSeconds: nowMs / 1000,
           });
           if (problem !== undefined) return yield* reject(problem);
-          const { repository } = claims;
-          if (!Predicate.isString(repository)) return yield* reject('no repository claim');
-          return { repository };
+          const run = decodeRunClaims(claims);
+          if (Option.isNone(run)) return yield* reject('no repository or run claims');
+          const { repository, repository_id, run_id, run_attempt } = run.value;
+          return {
+            repository,
+            scope: { repositoryId: repository_id, runId: run_id, runAttempt: run_attempt },
+          };
         }),
       });
     }),

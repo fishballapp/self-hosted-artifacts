@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { openAsBlob } from 'node:fs';
 import { basename } from 'node:path';
 import * as Config from 'effect/Config';
@@ -16,6 +17,7 @@ import * as Predicate from 'effect/Predicate';
 import * as Redacted from 'effect/Redacted';
 import * as Schedule from 'effect/Schedule';
 import * as Schema from 'effect/Schema';
+import * as Stream from 'effect/Stream';
 import { findFilesToUpload } from './search.ts';
 import { zipFiles } from './zip.ts';
 
@@ -39,6 +41,7 @@ class UploadUnavailableError extends Schema.TaggedError<UploadUnavailableError>(
 const SingleLineSchema = Schema.String.check(Schema.isPattern(/^[^\r\n]*$/u));
 
 const StoredSchema = Schema.Struct({
+  id: SingleLineSchema,
   expiresAt: SingleLineSchema,
   links: Schema.Record(Schema.String, SingleLineSchema),
 });
@@ -121,6 +124,8 @@ const sendToServer = Effect.fnUntraced(function* ({
   tokenRequest,
   file,
   name,
+  digest,
+  overwrite,
   retentionDays,
 }: {
   serverUrl: string;
@@ -128,6 +133,8 @@ const sendToServer = Effect.fnUntraced(function* ({
   tokenRequest: { url: URL; token: Redacted.Redacted };
   file: Blob;
   name: string;
+  digest: string;
+  overwrite: boolean;
   retentionDays: number;
 }) {
   const client = yield* HttpClient.HttpClient;
@@ -142,6 +149,8 @@ const sendToServer = Effect.fnUntraced(function* ({
         HttpClientRequest.post(`${base}/artifacts`).pipe(
           HttpClientRequest.setUrlParams({
             name,
+            digest,
+            ...(overwrite ? { overwrite: 'true' } : {}),
             // The server takes no `0`: leaving it out asks for its default.
             ...(retentionDays === 0 ? {} : { 'retention-days': String(retentionDays) }),
           }),
@@ -156,13 +165,14 @@ const sendToServer = Effect.fnUntraced(function* ({
         Effect.mapError(unavailableFrom),
       );
     if (!isOk(response)) return yield* yield* readFailure(response);
-    return yield* response.json.pipe(
-      Effect.flatMap(Schema.decodeUnknownEffect(StoredSchema)),
+    // An answer cut short may follow a stored upload, which a retry recovers by its digest.
+    const answer = yield* response.json.pipe(Effect.mapError(unavailableFrom));
+    return yield* Schema.decodeUnknownEffect(StoredSchema)(answer).pipe(
       Effect.mapError(() => new UploadError({ message: `${base} answered without a usable link` })),
     );
   });
 
-  const { expiresAt, links } = yield* attempt.pipe(
+  const { id, expiresAt, links } = yield* attempt.pipe(
     Effect.retry({
       while: Predicate.isTagged('UploadUnavailableError'),
       schedule: Schedule.exponential(Duration.seconds(1)).pipe(
@@ -188,7 +198,7 @@ const sendToServer = Effect.fnUntraced(function* ({
   if (artifactUrl === undefined) {
     return yield* new UploadError({ message: `${base} answered without a usable link` });
   }
-  return { artifactUrl, links, expiresAt };
+  return { id, artifactUrl, links, expiresAt };
 });
 
 const openFile = Effect.fnUntraced(function* ({ path, name }: { path: string; name: string }) {
@@ -205,6 +215,17 @@ const openFile = Effect.fnUntraced(function* ({ path, name }: { path: string; na
   return file;
 });
 
+/** The SHA-256 of what is sent, streamed. In the client, so a target with no server gets it too. */
+const digestFile = Effect.fnUntraced(function* (path: string) {
+  const fs = yield* FileSystem.FileSystem;
+  const hash = createHash('sha256');
+  yield* fs.stream(path).pipe(
+    Stream.runForEach(chunk => Effect.sync(() => hash.update(chunk))),
+    Effect.mapError(() => new UploadError({ message: `Can't read ${path}` })),
+  );
+  return hash.digest('hex');
+});
+
 /** The same in the action's inputs and the command's flags, as actions/upload-artifact has them. */
 export const UPLOAD_DEFAULTS = {
   name: 'artifact',
@@ -213,6 +234,7 @@ export const UPLOAD_DEFAULTS = {
   compressionLevel: '6',
   includeHiddenFiles: 'false',
   archive: 'true',
+  overwrite: 'false',
   audience: 'self-hosted-artifacts',
 } as const;
 
@@ -295,6 +317,7 @@ export const upload = Effect.fn('upload.upload')(
     compressionLevel: string;
     includeHiddenFiles: string;
     archive: string;
+    overwrite: string;
     audience: string;
   }) {
     const includeHiddenFiles = yield* parseBooleanInput(
@@ -302,6 +325,7 @@ export const upload = Effect.fn('upload.upload')(
       inputs.includeHiddenFiles,
     );
     const archive = yield* parseBooleanInput('archive', inputs.archive);
+    const overwrite = yield* parseBooleanInput('overwrite', inputs.overwrite);
     const ifNoFilesFound = yield* parseIfNoFilesFound(inputs.ifNoFilesFound);
     const retentionDays = yield* parseRetentionDays(inputs.retentionDays);
     const compressionLevel = yield* parseCompressionLevel(inputs.compressionLevel);
@@ -333,15 +357,18 @@ export const upload = Effect.fn('upload.upload')(
       : firstFile;
     const name = archive ? `${inputs.name}.zip` : basename(firstFile);
     const file = yield* openFile({ path: filePath, name });
+    const digest = yield* digestFile(filePath);
     const stored = yield* sendToServer({
       serverUrl: inputs.serverUrl,
       audience: inputs.audience,
       tokenRequest,
       file,
       name,
+      digest,
+      overwrite,
       retentionDays,
     });
-    return { _tag: 'Uploaded', name, size: file.size, ...stored } as const;
+    return { _tag: 'Uploaded', name, size: file.size, digest, ...stored } as const;
   },
   // Holds the zip until the last retry is over, and removes it however the upload ends.
   Effect.scoped,

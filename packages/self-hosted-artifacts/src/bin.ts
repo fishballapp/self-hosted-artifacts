@@ -103,6 +103,10 @@ const uploadCommand = Command.make(
       Flag.withDescription('false to upload one file as it is rather than zipped'),
       Flag.withDefault(UPLOAD_DEFAULTS.archive),
     ),
+    overwrite: Flag.String('overwrite').pipe(
+      Flag.withDescription('true to replace an artifact of this name in the same run attempt'),
+      Flag.withDefault(UPLOAD_DEFAULTS.overwrite),
+    ),
     audience: Flag.String('audience').pipe(
       Flag.withDescription('The OIDC audience to request'),
       Flag.withDefault(UPLOAD_DEFAULTS.audience),
@@ -115,8 +119,10 @@ const uploadCommand = Command.make(
           ? Console.error(result.isWarning ? `Warning: ${result.message}` : result.message)
           : Console.log(
               JSON.stringify({
+                id: result.id,
                 name: result.name,
                 size: result.size,
+                digest: result.digest,
                 links: result.links,
                 expiresAt: result.expiresAt,
               }),

@@ -4,16 +4,18 @@ import * as NodeHttpServer from '@effect/platform-node/NodeHttpServer';
 import * as NodeServices from '@effect/platform-node/NodeServices';
 import * as Clock from 'effect/Clock';
 import * as Effect from 'effect/Effect';
+import type * as FileSystem from 'effect/FileSystem';
 import * as Layer from 'effect/Layer';
 import * as Logger from 'effect/Logger';
 import * as ManagedRuntime from 'effect/ManagedRuntime';
+import type * as Path from 'effect/Path';
 import { type Config, ServerConfig } from './config.ts';
 import { SigningKeysUnavailableError, TokenRejectedError, TokenVerifier } from './oidc.ts';
 import { ArtifactServer, makeNodeServer } from './server.ts';
-import { Store } from './store.ts';
+import { type RunScope, Store } from './store.ts';
 
 export type Verification =
-  | { kind: 'verified'; repository: string }
+  | { kind: 'verified'; repository: string; scope: RunScope }
   | { kind: 'rejected'; reason: string }
   | { kind: 'unavailable'; reason: string };
 
@@ -22,11 +24,12 @@ export const verifierAnswering = (answer: (token: string) => Promise<Verificatio
   const toOutcome = (
     verification: Verification,
   ): Effect.Effect<
-    { readonly repository: string },
+    { readonly repository: string; readonly scope: RunScope },
     TokenRejectedError | SigningKeysUnavailableError
   > => {
     if (verification.kind === 'verified') {
-      return Effect.succeed({ repository: verification.repository });
+      const { repository, scope } = verification;
+      return Effect.succeed({ repository, scope });
     }
     return verification.kind === 'rejected'
       ? Effect.fail(new TokenRejectedError({ reason: verification.reason }))
@@ -62,11 +65,13 @@ export const startTestServer = async ({
   verifier,
   clock = Layer.empty,
   onLog = () => undefined,
+  storeServices = NodeServices.layer,
 }: {
   config: Config;
   verifier: Layer.Layer<TokenVerifier>;
   clock?: Layer.Layer<never>;
   onLog?: (line: string) => void;
+  storeServices?: Layer.Layer<FileSystem.FileSystem | Path.Path>;
 }) => {
   let nodeServer: Server | undefined;
   const makeServer = () => {
@@ -82,7 +87,7 @@ export const startTestServer = async ({
         Layer.mergeAll(
           configLayer,
           verifier,
-          Store.layer.pipe(Layer.provide(configLayer), Layer.provide(NodeServices.layer)),
+          Store.layer.pipe(Layer.provide(configLayer), Layer.provide(storeServices)),
         ),
       ),
       Layer.provideMerge(clock),

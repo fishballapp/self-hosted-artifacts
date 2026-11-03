@@ -1,6 +1,6 @@
 {
   "name": "self-hosted-artifacts",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "description": "A small file server for GitHub Actions builds from private repositories.",
   "license": "MIT",

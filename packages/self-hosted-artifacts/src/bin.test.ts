@@ -1,6 +1,7 @@
 import { type ChildProcess, execFile, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, readFile, rm, truncate, writeFile } from 'node:fs/promises';
+import { link, mkdir, mkdtemp, readFile, rm, truncate, writeFile } from 'node:fs/promises';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -144,8 +145,21 @@ describe('self-hosted-artifacts', () => {
           const expiresAt = Temporal.Now.instant().add({ hours: 1 }).toString();
           await writeFile(
             join(artifact, 'meta.json'),
-            JSON.stringify({ name: 'a', size, expiresAt }),
+            JSON.stringify({
+              id: token,
+              repositoryId: '7',
+              runId: '100',
+              runAttempt: '1',
+              name: 'a',
+              size,
+              digest: 'unchecked',
+              expiresAt,
+            }),
           );
+          const names = join(dir, 'runs', '7', '100', '1');
+          await mkdir(names, { recursive: true });
+          const nameHash = createHash('sha256').update('a').digest('hex');
+          await link(join(artifact, 'meta.json'), join(names, `${nameHash}.json`));
         },
       },
     );

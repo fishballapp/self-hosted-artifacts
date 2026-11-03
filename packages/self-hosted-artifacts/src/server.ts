@@ -13,12 +13,15 @@ import * as Stream from 'effect/Stream';
 import { type Config, ServerConfig } from './config.ts';
 import { describeError, shortToken } from './log.ts';
 import { TokenVerifier } from './oidc.ts';
-import { Store, UPLOAD_TIMEOUT, UploadFailedError } from './store.ts';
+import { type ArtifactMeta, Store, UPLOAD_TIMEOUT, UploadFailedError } from './store.ts';
 
 const FILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/;
+const SHA_256 = /^[0-9a-f]{64}$/;
 const UPLOAD_URL = /^\/artifacts(?:\?(.*))?$/;
 const DOWNLOAD_URL = /^\/([A-Za-z0-9_-]{43})\/([^/?#]+)$/;
-const REFUSED_BODY_GRACE = Duration.seconds(5);
+const UNREAD_BODY_GRACE = Duration.seconds(5);
+const NAME_TAKEN =
+  'An artifact with this name already exists on the workflow run. Set overwrite to replace it';
 // A client that stops reading or sending gets cut off, so a stalled download can't keep an expired
 // file's blocks on disk after its sweep. Long enough for a phone to return from the background. With
 // a write pending, Node restarts this timer, so a stalled download goes at two or three times this.
@@ -59,17 +62,17 @@ export const ArtifactRoutes = Layer.unwrap(
      * can reset the connection and lose it. A client still sending after the grace period gets cut
      * off.
      */
-    const refuse = Effect.fnUntraced(function* (
+    const answerUnread = Effect.fnUntraced(function* (
       request: HttpServerRequest.HttpServerRequest,
       status: number,
-      message: string,
+      body: unknown,
     ) {
       const source = NodeHttpServerRequest.toIncomingMessage(request);
-      yield* Effect.sleep(REFUSED_BODY_GRACE).pipe(
+      yield* Effect.sleep(UNREAD_BODY_GRACE).pipe(
         Effect.andThen(Effect.sync(() => source.destroy())),
         Effect.forkIn(scope),
       );
-      return respondJson(status, { error: message });
+      return respondJson(status, body);
     });
 
     const refuseAndLog = (
@@ -80,8 +83,19 @@ export const ArtifactRoutes = Layer.unwrap(
     ) =>
       Effect.logInfo('upload refused').pipe(
         Effect.annotateLogs({ status, reason }),
-        Effect.andThen(refuse(request, status, message)),
+        Effect.andThen(answerUnread(request, status, { error: message })),
       );
+
+    const describeArtifact = ({ id, name, size, digest, expiresAt }: ArtifactMeta) => ({
+      id,
+      name,
+      size,
+      digest,
+      expiresAt: expiresAt.toString(),
+      links: Object.fromEntries(
+        Object.entries(config.linkBases).map(([label, base]) => [label, `${base}/${id}/${name}`]),
+      ),
+    });
 
     const upload = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
       const uploadMatch = UPLOAD_URL.exec(request.url);
@@ -112,6 +126,19 @@ export const ArtifactRoutes = Layer.unwrap(
       if (retentionDays === undefined) {
         return yield* refuseAndLog(request, 400, 'retention-days must be a positive integer');
       }
+      const digest = params.get('digest') ?? undefined;
+      if (digest !== undefined && !SHA_256.test(digest)) {
+        return yield* refuseAndLog(
+          request,
+          400,
+          'digest must be a SHA-256 in 64 lowercase hex characters',
+        );
+      }
+      const overwriteParam = params.get('overwrite') ?? 'false';
+      if (overwriteParam !== 'true' && overwriteParam !== 'false') {
+        return yield* refuseAndLog(request, 400, 'overwrite must be true or false');
+      }
+      const overwrite = overwriteParam === 'true';
       const contentLength = request.headers['content-length'];
       if (contentLength === undefined) {
         return yield* refuseAndLog(request, 411, 'Content-Length is required');
@@ -127,54 +154,88 @@ export const ArtifactRoutes = Layer.unwrap(
       if (!(yield* store.isPresent)) {
         return yield* refuseAndLog(request, 503, 'The store is missing');
       }
+      const { repository, scope: runScope } = verification.success;
+      const uploadLog = { repository, name, size, ...runScope };
+      // With the digest, a retried upload or a refusal needs none of the body.
+      const held = yield* store.findByName({ scope: runScope, name });
+      if (digest !== undefined && Option.isSome(held)) {
+        if (held.value.digest === digest) {
+          yield* Effect.logInfo('upload already stored').pipe(
+            Effect.annotateLogs({
+              ...uploadLog,
+              token: shortToken(held.value.id),
+              digest: held.value.digest,
+              expiresAt: held.value.expiresAt.toString(),
+            }),
+          );
+          return yield* answerUnread(request, 200, describeArtifact(held.value));
+        }
+        if (!overwrite) {
+          return yield* refuseAndLog(request, 409, NAME_TAKEN, 'name taken').pipe(
+            Effect.annotateLogs(uploadLog),
+          );
+        }
+      }
       if ((yield* store.freeBytes) - size < config.minFreeBytes) {
         return yield* refuseAndLog(request, 507, 'Not enough free space on the server');
       }
 
-      const uploadLog = { repository: verification.success.repository, name, size };
       return yield* store
         .put({
+          scope: runScope,
           name,
           size,
+          digest,
+          overwrite,
           retentionDays,
           body: request.stream.pipe(
             Stream.mapError(error => new UploadFailedError({ reason: describeError(error) })),
           ),
         })
         .pipe(
-          Effect.tap(stored =>
-            Effect.logInfo('upload').pipe(
+          Effect.tap(({ artifact, isNew }) =>
+            Effect.logInfo(isNew ? 'upload' : 'upload already stored').pipe(
               Effect.annotateLogs({
                 ...uploadLog,
-                token: shortToken(stored.token),
-                expiresAt: stored.expiresAt.toString(),
+                token: shortToken(artifact.id),
+                digest: artifact.digest,
+                expiresAt: artifact.expiresAt.toString(),
               }),
             ),
           ),
-          Effect.map(stored =>
-            respondJson(201, {
-              name,
-              size,
-              expiresAt: stored.expiresAt.toString(),
-              links: Object.fromEntries(
-                Object.entries(config.linkBases).map(([label, base]) => [
-                  label,
-                  `${base}/${stored.token}/${name}`,
-                ]),
-              ),
-            }),
+          Effect.map(({ artifact, isNew }) =>
+            respondJson(isNew ? 201 : 200, describeArtifact(artifact)),
           ),
-          Effect.onInterrupt(() =>
-            Effect.logInfo('upload stopped').pipe(
-              Effect.annotateLogs({ ...uploadLog, reason: 'connection closed' }),
-            ),
-          ),
-          Effect.catchTag('UploadFailedError', ({ reason }) =>
-            Effect.logInfo('upload stopped').pipe(
+          // In a finalizer, as a failed write breaks the connection, which interrupts this fiber
+          // too, and nothing after that would run.
+          Effect.onError(cause => {
+            const failure = Cause.squash(cause);
+            const reason = (() => {
+              if (failure instanceof UploadFailedError) return failure.reason;
+              return Cause.hasInterruptsOnly(cause) ? 'connection closed' : undefined;
+            })();
+            if (reason === undefined) return Effect.void;
+            return Effect.logInfo('upload stopped').pipe(
               Effect.annotateLogs({ ...uploadLog, reason }),
-              Effect.andThen(refuse(request, 500, 'Upload failed')),
-            ),
-          ),
+            );
+          }),
+          Effect.catchTags({
+            UploadFailedError: () => answerUnread(request, 500, { error: 'Upload failed' }),
+            ArtifactExistsError: () =>
+              Effect.logInfo('upload refused').pipe(
+                Effect.annotateLogs({ ...uploadLog, status: 409, reason: 'name taken' }),
+                Effect.as(respondJson(409, { error: NAME_TAKEN })),
+              ),
+            DigestMismatchError: ({ expected, actual }) =>
+              Effect.logInfo('upload refused').pipe(
+                Effect.annotateLogs({ ...uploadLog, status: 422, expected, actual }),
+                Effect.as(
+                  respondJson(422, {
+                    error: `The body's SHA-256 is ${actual}, not the digest sent, ${expected}. Did the file change while it was uploading?`,
+                  }),
+                ),
+              ),
+          }),
         );
     });
 
