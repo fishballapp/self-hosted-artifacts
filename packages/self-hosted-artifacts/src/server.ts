@@ -1,5 +1,6 @@
 import { createServer, type Server } from 'node:http';
 import * as NodeHttpServerRequest from '@effect/platform-node/NodeHttpServerRequest';
+import * as Arr from 'effect/Array';
 import * as Cause from 'effect/Cause';
 import * as Duration from 'effect/Duration';
 import * as Effect from 'effect/Effect';
@@ -9,15 +10,16 @@ import type * as HttpServerRequest from 'effect/http/HttpServerRequest';
 import * as HttpServerResponse from 'effect/http/HttpServerResponse';
 import * as Layer from 'effect/Layer';
 import * as Option from 'effect/Option';
+import * as Schema from 'effect/Schema';
 import * as Stream from 'effect/Stream';
 import { type Config, ServerConfig } from './config.ts';
 import { describeError, shortToken } from './log.ts';
 import { TokenVerifier } from './oidc.ts';
+import { ARTIFACT_ID, FILE_NAME, REPOSITORY, RUN_ID, SHA_256 } from './protocol.ts';
 import { type ArtifactMeta, Store, UPLOAD_TIMEOUT, UploadFailedError } from './store.ts';
 
-const FILE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/;
-const SHA_256 = /^[0-9a-f]{64}$/;
-const UPLOAD_URL = /^\/artifacts(?:\?(.*))?$/;
+const ARTIFACTS_URL = /^\/artifacts(?:\?(.*))?$/;
+const ARTIFACT_URL = /^\/artifacts\/([A-Za-z0-9_-]{43})$/;
 const DOWNLOAD_URL = /^\/([A-Za-z0-9_-]{43})\/([^/?#]+)$/;
 const UNREAD_BODY_GRACE = Duration.seconds(5);
 const NAME_TAKEN =
@@ -31,6 +33,16 @@ const respondJson = (status: number, body: unknown) =>
   HttpServerResponse.jsonUnsafe(body, { status });
 
 const notFound = respondJson(404, { error: 'Not found' });
+
+/** A request turned away. `message` is the client's, `reason` the log's, and may say more. */
+class RequestRefusedError extends Schema.TaggedError<RequestRefusedError>()('RequestRefusedError', {
+  status: Schema.Finite,
+  message: Schema.String,
+  reason: Schema.String,
+}) {}
+
+const refusal = (status: number, message: string, reason = message) =>
+  new RequestRefusedError({ status, message, reason });
 
 const parseRetentionDays = (
   value: string | null,
@@ -86,6 +98,37 @@ export const ArtifactRoutes = Layer.unwrap(
         Effect.andThen(answerUnread(request, status, { error: message })),
       );
 
+    /** Every route but a download starts here, and only the claims it answers with decide scope. */
+    const authenticate = Effect.fnUntraced(function* (
+      request: HttpServerRequest.HttpServerRequest,
+    ) {
+      const token = /^Bearer (\S+)$/.exec(request.headers.authorization ?? '')?.[1];
+      if (token === undefined) {
+        return yield* refusal(401, 'Token rejected', 'no bearer token');
+      }
+      return yield* verifier
+        .verify(token)
+        .pipe(
+          Effect.mapError(failure =>
+            failure._tag === 'SigningKeysUnavailableError'
+              ? refusal(503, 'GitHub signing keys are unavailable', failure.reason)
+              : refusal(401, 'Token rejected', failure.reason),
+          ),
+        );
+    });
+
+    const answeringRefusals =
+      (action: string) =>
+      <A, R>(self: Effect.Effect<A, RequestRefusedError, R>) =>
+        self.pipe(
+          Effect.catchTag('RequestRefusedError', ({ status, message, reason }) =>
+            Effect.logInfo(`${action} refused`).pipe(
+              Effect.annotateLogs({ status, reason }),
+              Effect.as(respondJson(status, { error: message })),
+            ),
+          ),
+        );
+
     const describeArtifact = ({ id, name, size, digest, expiresAt }: ArtifactMeta) => ({
       id,
       name,
@@ -98,19 +141,13 @@ export const ArtifactRoutes = Layer.unwrap(
     });
 
     const upload = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
-      const uploadMatch = UPLOAD_URL.exec(request.url);
+      const uploadMatch = ARTIFACTS_URL.exec(request.url);
       if (uploadMatch === null) return notFound;
 
-      const token = /^Bearer (\S+)$/.exec(request.headers.authorization ?? '')?.[1];
-      if (token === undefined) {
-        return yield* refuseAndLog(request, 401, 'Token rejected', 'no bearer token');
-      }
-      const verification = yield* verifier.verify(token).pipe(Effect.result);
+      const verification = yield* authenticate(request).pipe(Effect.result);
       if (verification._tag === 'Failure') {
-        const { failure } = verification;
-        return yield* failure._tag === 'SigningKeysUnavailableError'
-          ? refuseAndLog(request, 503, 'GitHub signing keys are unavailable', failure.reason)
-          : refuseAndLog(request, 401, 'Token rejected', failure.reason);
+        const { status, message, reason } = verification.failure;
+        return yield* refuseAndLog(request, status, message, reason);
       }
 
       const params = new URLSearchParams(uploadMatch[1] ?? '');
@@ -182,6 +219,7 @@ export const ArtifactRoutes = Layer.unwrap(
 
       return yield* store
         .put({
+          repository,
           scope: runScope,
           name,
           size,
@@ -238,6 +276,87 @@ export const ArtifactRoutes = Layer.unwrap(
           }),
         );
     });
+
+    const describeListed = (artifact: ArtifactMeta) => ({
+      ...describeArtifact(artifact),
+      repositoryId: artifact.repositoryId,
+      runId: artifact.runId,
+      runAttempt: artifact.runAttempt,
+    });
+
+    const list = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
+      const listMatch = ARTIFACTS_URL.exec(request.url);
+      if (listMatch === null) return notFound;
+
+      const { repository: ownRepository, scope: ownScope } = yield* authenticate(request);
+      const params = new URLSearchParams(listMatch[1] ?? '');
+      const repository = params.get('repository') ?? ownRepository;
+      if (!REPOSITORY.test(repository)) {
+        return yield* refusal(400, 'repository must be in the format owner/name');
+      }
+      const runId = params.get('run-id') ?? ownScope.runId;
+      if (!RUN_ID.test(runId)) return yield* refusal(400, 'run-id must be a number');
+      const names = Arr.dedupe(params.getAll('name')).toSorted();
+      const ids = params.getAll('id');
+      if (names.length > 0 && ids.length > 0) {
+        return yield* refusal(400, 'name and id can not be used together');
+      }
+      if (!ids.every(id => ARTIFACT_ID.test(id))) {
+        return yield* refusal(400, "id must be an artifact's ID");
+      }
+      if (!(yield* store.isPresent)) return yield* refusal(503, 'The store is missing');
+
+      // The token's own repository needs no lookup: it may not have uploaded yet, or been renamed.
+      const repositoryId =
+        repository.toLowerCase() === ownRepository.toLowerCase()
+          ? Option.some(ownScope.repositoryId)
+          : yield* store.findRepository(repository);
+      if (Option.isNone(repositoryId)) return respondJson(200, { artifacts: [] });
+      const run = { repositoryId: repositoryId.value, runId };
+
+      const artifacts = yield* (() => {
+        if (names.length === 0) {
+          return Effect.map(store.listLatest(run), found =>
+            ids.length === 0 ? found : found.filter(({ id }) => ids.includes(id)),
+          );
+        }
+        return Effect.map(
+          Effect.forEach(names, name => store.findLatest({ ...run, name }), { concurrency: 1 }),
+          Arr.getSomes,
+        );
+      })();
+      yield* Effect.logInfo('list').pipe(
+        Effect.annotateLogs({ repository: ownRepository, ...run, count: artifacts.length }),
+      );
+      return respondJson(200, { artifacts: artifacts.map(describeListed) });
+    }, answeringRefusals('list'));
+
+    /** Any repository may read another of the owner's, but only a repository removes its own. */
+    const remove = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
+      const [, id] = ARTIFACT_URL.exec(request.url) ?? [];
+      if (id === undefined) return notFound;
+
+      const { repository, scope } = yield* authenticate(request);
+      if (!(yield* store.isPresent)) return yield* refusal(503, 'The store is missing');
+      const removed = yield* store.remove({ id, repositoryId: scope.repositoryId }).pipe(
+        Effect.catchTags({
+          ArtifactNotFoundError: () => Effect.fail(refusal(404, 'Not found')),
+          OtherRepositoryError: () =>
+            Effect.fail(refusal(403, 'A job can only delete artifacts of its own repository')),
+        }),
+      );
+      yield* Effect.logInfo('delete').pipe(
+        Effect.annotateLogs({
+          repository,
+          token: shortToken(id),
+          name: removed.name,
+          repositoryId: removed.repositoryId,
+          runId: removed.runId,
+          runAttempt: removed.runAttempt,
+        }),
+      );
+      return respondJson(200, { id, name: removed.name });
+    }, answeringRefusals('delete'));
 
     /**
      * The headers promised the whole file, so the connection has to break: an ended response would
@@ -300,6 +419,8 @@ export const ArtifactRoutes = Layer.unwrap(
     return HttpRouter.addAll([
       HttpRouter.route('GET', '/healthz', answeringFaults(healthz)),
       HttpRouter.route('POST', '/artifacts', request => answeringFaults(upload(request))),
+      HttpRouter.route('GET', '/artifacts', request => answeringFaults(list(request))),
+      HttpRouter.route('DELETE', '/artifacts/*', request => answeringFaults(remove(request))),
       HttpRouter.route('*', '*', request => answeringFaults(download(request))),
     ]);
   }),

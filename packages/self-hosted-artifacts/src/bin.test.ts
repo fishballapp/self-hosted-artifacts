@@ -18,6 +18,9 @@ describe('self-hosted-artifacts', () => {
     [['serve', '--nope'], 'Unrecognized flag: --nope'],
     [['serve', '--config'], '--config'],
     [['upload', '--path', 'a'], 'Missing required flag: --server-url'],
+    [['download'], 'Missing required flag: --server-url'],
+    [['list'], 'Missing required flag: --server-url'],
+    [['delete'], 'Missing required flag: --server-url'],
   ])('prints the error and fails for arguments %j', async (args, message) => {
     await expect(run(args)).rejects.toMatchObject({
       code: 1,
@@ -28,7 +31,9 @@ describe('self-hosted-artifacts', () => {
   it('prints the usage for --help', async () => {
     const { stdout } = await run(['--help']);
     expect(stdout).toContain('serve');
-    expect(stdout).toContain('upload');
+    for (const command of ['upload', 'download', 'list', 'delete']) {
+      expect(stdout).toContain(command);
+    }
     expect((await run(['serve', '--help'])).stdout).toContain('--config string');
   });
 

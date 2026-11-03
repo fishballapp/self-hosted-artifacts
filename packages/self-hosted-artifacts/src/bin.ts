@@ -15,11 +15,14 @@ import * as HttpClient from 'effect/http/HttpClient';
 import * as Layer from 'effect/Layer';
 import * as Logger from 'effect/Logger';
 import packageJson from '../package.json' with { type: 'json' };
+import { deleteArtifact, list } from './artifacts.ts';
+import type { ClientError } from './client-support.ts';
 import { ServerConfig } from './config.ts';
+import { DOWNLOAD_DEFAULTS, download } from './download.ts';
 import { TokenVerifier } from './oidc.ts';
 import { ArtifactServer, makeNodeServer } from './server.ts';
 import { Store, StoreSweeps } from './store.ts';
-import { UPLOAD_DEFAULTS, type UploadError, upload } from './upload.ts';
+import { UPLOAD_DEFAULTS, upload } from './upload.ts';
 
 // launchd kills a daemon 20 seconds after SIGTERM, and a request stopped sooner can clean up.
 const SHUTDOWN_GRACE = Duration.seconds(5);
@@ -66,6 +69,19 @@ const serve = Command.make(
       }),
     ),
 ).pipe(Command.withDescription('Run the file server'));
+
+const asClientCommand = <A, R>(self: Effect.Effect<A, ClientError, R>) =>
+  self.pipe(
+    Effect.catchTag('ClientError', (error: ClientError) =>
+      Effect.fail(new CliError.UserError({ cause: error, userMessage: error.message })),
+    ),
+    Effect.provide(
+      Layer.mergeAll(
+        FetchHttpClient.layer,
+        Layer.succeed(HttpClient.TracerPropagationEnabled, false),
+      ),
+    ),
+  );
 
 const uploadCommand = Command.make(
   'upload',
@@ -128,21 +144,128 @@ const uploadCommand = Command.make(
               }),
             ),
       ),
-      Effect.catchTag('UploadError', (error: UploadError) =>
-        Effect.fail(new CliError.UserError({ cause: error, userMessage: error.message })),
-      ),
-      Effect.provide(
-        Layer.mergeAll(
-          FetchHttpClient.layer,
-          Layer.succeed(HttpClient.TracerPropagationEnabled, false),
-        ),
-      ),
+      asClientCommand,
     ),
 ).pipe(Command.withDescription('Upload files from a GitHub Actions job'));
 
+const serverUrlFlag = Flag.String('server-url').pipe(
+  Flag.withDescription("The server's base URL, as this machine reaches it"),
+);
+const audienceFlag = Flag.String('audience').pipe(
+  Flag.withDescription('The OIDC audience to request'),
+  Flag.withDefault(DOWNLOAD_DEFAULTS.audience),
+);
+const repositoryFlag = Flag.String('repository').pipe(
+  Flag.withDescription("Read from this owner/name. Defaults to the job's repository"),
+  Flag.withDefault(''),
+);
+const runIdFlag = Flag.String('run-id').pipe(
+  Flag.withDescription("Read from this run. Defaults to the job's run"),
+  Flag.withDefault(''),
+);
+const artifactIdsFlag = Flag.String('artifact-ids').pipe(
+  Flag.withDescription("The IDs to take, comma-separated. Can't go with --name"),
+  Flag.withDefault(''),
+);
+const patternFlag = Flag.String('pattern').pipe(
+  Flag.withDescription(
+    'A glob the artifact names must match. Ignored with --name or --artifact-ids',
+  ),
+  Flag.withDefault(''),
+);
+const githubTokenFlag = Flag.String('github-token').pipe(
+  Flag.withDescription('Accepted as actions/download-artifact has it, and ignored'),
+  Flag.withDefault(''),
+);
+
+const warnOnStderr = (message: string) => Console.error(`Warning: ${message}`);
+
+const downloadCommand = Command.make(
+  'download',
+  {
+    serverUrl: serverUrlFlag,
+    name: Flag.String('name').pipe(
+      Flag.withDescription('The artifact to download. Without it, every artifact in the run'),
+      Flag.withDefault(''),
+    ),
+    artifactIds: artifactIdsFlag,
+    path: Flag.String('path').pipe(
+      Flag.withDescription('Where to put it. Defaults to $GITHUB_WORKSPACE, then this directory'),
+      Flag.withDefault(''),
+    ),
+    pattern: patternFlag,
+    mergeMultiple: Flag.String('merge-multiple').pipe(
+      Flag.withDescription('true to put several artifacts in one folder rather than one each'),
+      Flag.withDefault(DOWNLOAD_DEFAULTS.mergeMultiple),
+    ),
+    githubToken: githubTokenFlag,
+    repository: repositoryFlag,
+    runId: runIdFlag,
+    skipDecompress: Flag.String('skip-decompress').pipe(
+      Flag.withDescription('true to keep a zip as it is'),
+      Flag.withDefault(DOWNLOAD_DEFAULTS.skipDecompress),
+    ),
+    digestMismatch: Flag.String('digest-mismatch').pipe(
+      Flag.withDescription('With the wrong digest: ignore, info, warn or error'),
+      Flag.withDefault(DOWNLOAD_DEFAULTS.digestMismatch),
+    ),
+    audience: audienceFlag,
+  },
+  ({ githubToken, ...inputs }) =>
+    download({ ...inputs, isGithubTokenGiven: githubToken !== '', warn: warnOnStderr }).pipe(
+      Effect.flatMap(result => Console.log(JSON.stringify(result))),
+      asClientCommand,
+    ),
+).pipe(Command.withDescription('Download artifacts from a GitHub Actions job'));
+
+const listCommand = Command.make(
+  'list',
+  {
+    serverUrl: serverUrlFlag,
+    name: Flag.String('name').pipe(
+      Flag.withDescription('Only the artifact of this name'),
+      Flag.withDefault(''),
+    ),
+    artifactIds: artifactIdsFlag,
+    pattern: patternFlag,
+    githubToken: githubTokenFlag,
+    repository: repositoryFlag,
+    runId: runIdFlag,
+    audience: audienceFlag,
+  },
+  ({ githubToken, ...inputs }) =>
+    list({ ...inputs, isGithubTokenGiven: githubToken !== '', warn: warnOnStderr }).pipe(
+      Effect.flatMap(artifacts => Console.log(JSON.stringify({ artifacts }))),
+      asClientCommand,
+    ),
+).pipe(Command.withDescription("List a run's artifacts as JSON, from a GitHub Actions job"));
+
+const deleteCommand = Command.make(
+  'delete',
+  {
+    serverUrl: serverUrlFlag,
+    name: Flag.String('name').pipe(
+      Flag.withDescription('The artifact to delete, in the current run'),
+      Flag.withDefault(''),
+    ),
+    artifactId: Flag.String('artifact-id').pipe(
+      Flag.withDescription("The artifact to delete, in any of this job's repository's runs"),
+      Flag.withDefault(''),
+    ),
+    audience: audienceFlag,
+  },
+  inputs =>
+    deleteArtifact(inputs).pipe(
+      Effect.flatMap(deleted => Console.log(JSON.stringify(deleted))),
+      asClientCommand,
+    ),
+).pipe(
+  Command.withDescription("Delete one of a repository's artifacts, from a GitHub Actions job"),
+);
+
 const command = Command.make('self-hosted-artifacts').pipe(
   Command.withDescription('A small file server for builds from private repositories'),
-  Command.withSubcommands([serve, uploadCommand]),
+  Command.withSubcommands([serve, uploadCommand, downloadCommand, listCommand, deleteCommand]),
 );
 
 Command.run(command, { version: packageJson.version }).pipe(

@@ -1,0 +1,42 @@
+name: Self-hosted artifacts download
+description: Download artifacts from your own artifact server to a private repository's workflow, as actions/download-artifact does from GitHub.
+inputs:
+  server-url:
+    description: Base URL of the server, as the runner reaches it.
+    required: true
+  name:
+    description: Name of the artifact to download. If unspecified, all artifacts for the run are downloaded.
+  artifact-ids:
+    description: IDs of the artifacts to download, comma-separated, from an upload's `artifact-id` output. Either `artifact-ids` or `name` can be used, but not both.
+  path:
+    description: Destination path. Supports basic tilde expansion. Defaults to $GITHUB_WORKSPACE.
+  pattern:
+    description: A glob pattern matching the artifacts that should be downloaded. Ignored if name or artifact-ids is specified.
+  merge-multiple:
+    description: >
+      When several artifacts are matched, this changes the destination. If true, they all go in
+      `path`. If false, each is extracted into a directory of its name within `path`.
+    default: 'false'
+  github-token:
+    description: Accepted so a workflow moving over needn't change, and ignored. The job's OIDC token proves who it is.
+  repository:
+    description: The owner/name to download from. Defaults to the job's repository. Reading works across the private repositories of the server's owner.
+  run-id:
+    description: The run to download from. Defaults to the job's run.
+  skip-decompress:
+    description: If true, a zip is kept as it is rather than extracted.
+    default: 'false'
+  digest-mismatch:
+    description: >
+      What to do when a downloaded file's SHA-256 isn't the one the server stored. Options: ignore,
+      info, warn, error. With error, the action fails and that artifact isn't extracted.
+    default: error
+  audience:
+    description: The OIDC audience to request, matching the server's oidcAudience.
+    default: self-hosted-artifacts
+outputs:
+  download-path:
+    description: Absolute path of where the artifacts were downloaded.
+runs:
+  using: node24
+  main: dist/action.mjs

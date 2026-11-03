@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { statfs } from 'node:fs/promises';
+import * as Arr from 'effect/Array';
 import * as Cause from 'effect/Cause';
 import * as Clock from 'effect/Clock';
 import * as Context from 'effect/Context';
@@ -9,6 +10,7 @@ import * as FileSystem from 'effect/FileSystem';
 import * as Layer from 'effect/Layer';
 import * as Num from 'effect/Number';
 import * as Option from 'effect/Option';
+import * as Order from 'effect/Order';
 import * as Path from 'effect/Path';
 import type * as PlatformError from 'effect/PlatformError';
 import * as Schedule from 'effect/Schedule';
@@ -72,6 +74,15 @@ const MetaFileSchema = Schema.fromJsonString(ArtifactMetaSchema);
 const decodeMeta = Schema.decodeUnknownOption(MetaFileSchema);
 const encodeMeta = Schema.encodeEffect(MetaFileSchema);
 
+/** What a repository's name means now. A rename leaves the old name's file until nothing uses it. */
+const RepositoryFileSchema = Schema.fromJsonString(
+  Schema.Struct({ name: Schema.String, repositoryId: RunNumberSchema }),
+);
+const decodeRepository = Schema.decodeUnknownOption(RepositoryFileSchema);
+const encodeRepository = Schema.encodeEffect(RepositoryFileSchema);
+
+const sha256Hex = (text: string) => createHash('sha256').update(text).digest('hex');
+
 /** An upload that didn't become an artifact. `reason` is safe to log: it holds no path. */
 export class UploadFailedError extends Schema.TaggedError<UploadFailedError>()(
   'UploadFailedError',
@@ -93,6 +104,18 @@ const orNoneIfMissing = <A>(
 /** The scope already holds this name, with other content, and the upload didn't ask to replace it. */
 export class ArtifactExistsError extends Schema.TaggedError<ArtifactExistsError>()(
   'ArtifactExistsError',
+  {},
+) {}
+
+/** There is no such artifact, or its name no longer refers to it, so nothing can be removed. */
+export class ArtifactNotFoundError extends Schema.TaggedError<ArtifactNotFoundError>()(
+  'ArtifactNotFoundError',
+  {},
+) {}
+
+/** The artifact exists, in a repository other than the one asking to remove it. */
+export class OtherRepositoryError extends Schema.TaggedError<OtherRepositoryError>()(
+  'OtherRepositoryError',
   {},
 ) {}
 
@@ -140,6 +163,7 @@ export class Store extends Context.Service<
      * when the scope already held the same content: the answer is then that artifact, unchanged.
      */
     readonly put: (upload: {
+      readonly repository: string;
       readonly scope: RunScope;
       readonly name: string;
       readonly size: number;
@@ -156,6 +180,24 @@ export class Store extends Context.Service<
       readonly scope: RunScope;
       readonly name: string;
     }) => Effect.Effect<Option.Option<ArtifactMeta>>;
+    /** A repository's ID from its `owner/name`, once it has uploaded, whatever the case. */
+    readonly findRepository: (name: string) => Effect.Effect<Option.Option<string>>;
+    /** What a name in a run refers to, in the latest attempt that holds it. */
+    readonly findLatest: (named: {
+      readonly repositoryId: string;
+      readonly runId: string;
+      readonly name: string;
+    }) => Effect.Effect<Option.Option<ArtifactMeta>>;
+    /** Each name in a run, from the latest attempt that holds it, in name order. */
+    readonly listLatest: (run: {
+      readonly repositoryId: string;
+      readonly runId: string;
+    }) => Effect.Effect<readonly ArtifactMeta[]>;
+    /** Takes an artifact's name away, which is the commit, then removes its files. */
+    readonly remove: (artifact: {
+      readonly id: string;
+      readonly repositoryId: string;
+    }) => Effect.Effect<ArtifactMeta, ArtifactNotFoundError | OtherRepositoryError>;
     /**
      * The artifact only under its exact ID and name, while its name still refers to it, and never
      * once it has expired.
@@ -175,6 +217,7 @@ export class Store extends Context.Service<
       readonly removedNames: number;
       readonly removedArtifacts: number;
       readonly removedTemps: number;
+      readonly removedRepositories: number;
     }>;
   }
 >()('self-hosted-artifacts/Store') {
@@ -187,6 +230,7 @@ export class Store extends Context.Service<
       const tempDir = path.join(dir, 'tmp');
       const artifactsDir = path.join(dir, 'artifacts');
       const runsDir = path.join(dir, 'runs');
+      const repositoriesDir = path.join(dir, 'repositories');
       // One server per store. Changing what a name refers to reads it first, and a sweep decides
       // from what it reads, so none of these may interleave.
       const publishing = yield* Semaphore.make(1);
@@ -205,12 +249,15 @@ export class Store extends Context.Service<
 
       /** A hash, so a name never reaches a path, and a case-insensitive disk keeps names apart. */
       const nameFileOf = ({ repositoryId, runId, runAttempt }: RunScope, name: string) =>
-        path.join(
-          runsDir,
-          repositoryId,
-          runId,
-          runAttempt,
-          `${createHash('sha256').update(name).digest('hex')}.json`,
+        path.join(runsDir, repositoryId, runId, runAttempt, `${sha256Hex(name)}.json`);
+
+      /** Lower case, as GitHub's names are one repository whatever their case. */
+      const repositoryFileOf = (name: string) =>
+        path.join(repositoriesDir, `${sha256Hex(name.toLowerCase())}.json`);
+
+      const readRepositoryFile = (file: string) =>
+        orNoneIfMissing(fs.readFileString(file)).pipe(
+          Effect.map(Option.flatMap(text => decodeRepository(text))),
         );
 
       const isExpired = ({ expiresAt }: ArtifactMeta) =>
@@ -244,16 +291,32 @@ export class Store extends Context.Service<
           Effect.map((found): readonly string[] => Option.getOrElse(found, () => [])),
         );
 
+      /** Written before the name, so an artifact can always be found through its repository. */
+      const recordRepository = Effect.fnUntraced(function* (
+        name: string,
+        { id, repositoryId }: ArtifactMeta,
+      ) {
+        const file = repositoryFileOf(name);
+        const current = yield* readRepositoryFile(file);
+        if (Option.exists(current, known => known.repositoryId === repositoryId)) return;
+        const replacement = path.join(tempDir, `${id}.repository`);
+        const encoded = yield* encodeRepository({ name, repositoryId }).pipe(Effect.orDie);
+        yield* fs.writeFileString(replacement, encoded);
+        yield* fs.rename(replacement, file);
+      });
+
       /**
        * Publishes a finished temp under its name, unless the scope holds that name already.
        * The directory moves first, so a name never refers to something that isn't there, and a
        * crash before the name is written leaves an artifact no name refers to, for the sweep.
        */
       const publish = Effect.fnUntraced(function* ({
+        repository,
         artifact,
         temp,
         overwrite,
       }: {
+        repository: string;
         artifact: ArtifactMeta;
         temp: string;
         overwrite: boolean;
@@ -271,6 +334,7 @@ export class Store extends Context.Service<
             }
             yield* fs.rename(temp, published);
             yield* ensureScopeDirectory(artifact);
+            yield* recordRepository(repository, artifact);
             const metaFile = path.join(published, META_FILE);
             if (Option.isNone(current)) {
               // A link can't overwrite, and arrives whole, so a name can't be taken twice or torn.
@@ -341,6 +405,25 @@ export class Store extends Context.Service<
         return !Option.exists(named, current => current.id === id);
       });
 
+      /** Dead once no run of it is left, which the same permit keeps a publish from changing. */
+      const isDeadRepository = Effect.fnUntraced(function* (file: string) {
+        const repository = yield* readRepositoryFile(file);
+        if (Option.isNone(repository)) return true;
+        const runs = path.join(runsDir, repository.value.repositoryId);
+        return Option.isNone(yield* orNoneIfMissing(fs.stat(runs)));
+      });
+
+      /** Newest first, compared as numbers: attempt 10 follows attempt 9. */
+      const attemptsOf = ({ repositoryId, runId }: { repositoryId: string; runId: string }) =>
+        Effect.map(listEntries(path.join(runsDir, repositoryId, runId)), attempts =>
+          attempts.toSorted((a, b) => Number(b) - Number(a)),
+        );
+
+      const whereLive = (artifacts: readonly ArtifactMeta[]) =>
+        Effect.filter(artifacts, artifact => Effect.map(isExpired(artifact), isDead => !isDead), {
+          concurrency: 1,
+        });
+
       /** Sweeps the names `levels` below `directory`, then each directory that leaves empty. */
       const sweepNames = Effect.fnUntraced(function* (
         directory: string,
@@ -381,6 +464,7 @@ export class Store extends Context.Service<
         ),
 
         put: Effect.fn('Store.put')(function* ({
+          repository,
           scope,
           name,
           size,
@@ -391,6 +475,7 @@ export class Store extends Context.Service<
         }) {
           yield* ensureSubdirectory(tempDir).pipe(Effect.mapError(uploadFailed));
           yield* ensureSubdirectory(artifactsDir).pipe(Effect.mapError(uploadFailed));
+          yield* ensureSubdirectory(repositoriesDir).pipe(Effect.mapError(uploadFailed));
           const id = crypto
             .getRandomValues(new Uint8Array(32))
             .toBase64({ alphabet: 'base64url', omitPadding: true });
@@ -418,7 +503,9 @@ export class Store extends Context.Service<
                 const meta = yield* encodeMeta(artifact).pipe(Effect.orDie);
                 yield* fs.writeFileString(path.join(temp, META_FILE), meta);
                 // A client gone by now is what a retry is for, so this finishes regardless.
-                return yield* publish({ artifact, temp, overwrite }).pipe(Effect.uninterruptible);
+                return yield* publish({ repository, artifact, temp, overwrite }).pipe(
+                  Effect.uninterruptible,
+                );
               }).pipe(Effect.catchTag('PlatformError', error => Effect.fail(uploadFailed(error)))),
             // A published upload has already moved, so this finds nothing.
             () => removeDirectory(temp),
@@ -430,6 +517,69 @@ export class Store extends Context.Service<
           if (Option.isNone(artifact) || (yield* isExpired(artifact.value))) return Option.none();
           return artifact;
         }),
+
+        findRepository: Effect.fn('Store.findRepository')(function* (name) {
+          const repository = yield* readRepositoryFile(repositoryFileOf(name));
+          return Option.map(repository, ({ repositoryId }) => repositoryId);
+        }),
+
+        findLatest: Effect.fn('Store.findLatest')(function* ({ repositoryId, runId, name }) {
+          const held = yield* Effect.forEach(
+            yield* attemptsOf({ repositoryId, runId }),
+            runAttempt => readMetaFile(nameFileOf({ repositoryId, runId, runAttempt }, name)),
+            { concurrency: SCANNING_CONCURRENCY },
+          );
+          return Arr.head(yield* whereLive(Arr.getSomes(held)));
+        }),
+
+        listLatest: Effect.fn('Store.listLatest')(function* ({ repositoryId, runId }) {
+          const perAttempt = yield* Effect.forEach(
+            yield* attemptsOf({ repositoryId, runId }),
+            Effect.fnUntraced(function* (runAttempt) {
+              const directory = path.join(runsDir, repositoryId, runId, runAttempt);
+              const held = yield* Effect.forEach(
+                yield* listEntries(directory),
+                entry => readMetaFile(path.join(directory, entry)),
+                { concurrency: SCANNING_CONCURRENCY },
+              );
+              return yield* whereLive(Arr.getSomes(held));
+            }),
+            { concurrency: 1 },
+          );
+          // Oldest first, so the latest attempt's entry for a name is the one a Map keeps.
+          const byName = new Map(
+            perAttempt.toReversed().flatMap(held => held.map(meta => [meta.name, meta] as const)),
+          );
+          return Arr.sort(
+            byName.values(),
+            Order.mapInput(Order.String, ({ name }: ArtifactMeta) => name),
+          );
+        }),
+
+        remove: Effect.fn('Store.remove')(function* ({ id, repositoryId }) {
+          const artifact = yield* publishing.withPermit(
+            Effect.gen(function* () {
+              const meta = yield* readMetaFile(metaFileOf(id));
+              if (Option.isNone(meta) || (yield* isExpired(meta.value))) {
+                return yield* new ArtifactNotFoundError();
+              }
+              const nameFile = nameFileOf(meta.value, meta.value.name);
+              const named = yield* readMetaFile(nameFile);
+              if (!Option.exists(named, current => current.id === id)) {
+                return yield* new ArtifactNotFoundError();
+              }
+              if (meta.value.repositoryId !== repositoryId) {
+                return yield* new OtherRepositoryError();
+              }
+              yield* fs.remove(nameFile).pipe(Effect.orDie);
+              return meta.value;
+            }),
+          );
+          // With its name gone, nothing can read this or reuse its ID, so it needs no permit.
+          yield* removeDirectory(path.join(artifactsDir, id));
+          return artifact;
+          // A client gone by now shouldn't leave the files to a sweep. A crash here does, safely.
+        }, Effect.uninterruptible),
 
         find: Effect.fn('Store.find')(function* (id, name) {
           const meta = yield* readMetaFile(metaFileOf(id));
@@ -460,6 +610,11 @@ export class Store extends Context.Service<
             removedTemps: removeEntries(tempDir, temp =>
               removeIfDead(path.join(tempDir, temp), isStaleTemp(temp)),
             ),
+            // After the names, as a repository whose last run just went is what this looks for.
+            removedRepositories: removeEntries(repositoriesDir, entry => {
+              const file = path.join(repositoriesDir, entry);
+              return removeIfDead(file, isDeadRepository(file));
+            }),
           },
           { concurrency: 1 },
         ),

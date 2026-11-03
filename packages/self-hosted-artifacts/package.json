@@ -1,6 +1,6 @@
 {
   "name": "self-hosted-artifacts",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "description": "A small file server for GitHub Actions builds from private repositories.",
   "license": "MIT",
@@ -36,12 +36,14 @@
     "@effect/platform-node": "catalog:",
     "@effect/vitest": "catalog:",
     "@types/node": "catalog:",
+    "@types/yauzl": "catalog:",
     "@types/yazl": "catalog:",
     "effect": "catalog:",
     "fflate": "catalog:",
     "minimatch": "catalog:",
     "tsdown": "catalog:",
     "vitest": "catalog:",
+    "yauzl": "catalog:",
     "yazl": "catalog:"
   }
 }

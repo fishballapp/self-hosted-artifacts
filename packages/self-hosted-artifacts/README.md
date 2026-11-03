@@ -7,4 +7,4 @@ npx self-hosted-artifacts serve --config ./config.json
 ```
 
 See the [self-hosted-artifacts README](https://github.com/fishballapp/self-hosted-artifacts#readme)
-for the config file, the upload action, the HTTP contract and the security model.
+for the config file, the upload and download actions, the HTTP contract and the security model.

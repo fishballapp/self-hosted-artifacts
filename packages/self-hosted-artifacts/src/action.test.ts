@@ -15,11 +15,12 @@ import { createServer, request as httpRequest, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { promisify } from 'node:util';
 import * as FetchHttpClient from 'effect/http/FetchHttpClient';
 import * as Layer from 'effect/Layer';
 import { unzipSync } from 'fflate';
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { UPLOAD_ACTION } from '../tsdown.config.ts';
+import { buildBundle, PEAK_REPORTER } from './action-harness.ts';
 import { type Config, ServerConfig } from './config.ts';
 import { TokenVerifier } from './oidc.ts';
 import { startTestServer, verifierAnswering } from './test-support.ts';
@@ -68,9 +69,7 @@ describe('the upload action', () => {
   let runClaims: Record<string, string>;
 
   beforeAll(async () => {
-    await promisify(execFile)('pnpm', ['exec', 'tsdown'], {
-      cwd: new URL('..', import.meta.url).pathname,
-    });
+    await buildBundle(UPLOAD_ACTION);
     keys = await crypto.subtle.generateKey(RSA, true, ['sign', 'verify']);
   }, 60_000);
 
@@ -294,10 +293,7 @@ describe('the upload action', () => {
     await writeFile(path, '');
     await truncate(path, fileBytes);
     const reporter = join(rootDir, 'report-peak-memory.mjs');
-    await writeFile(
-      reporter,
-      "process.on('exit', () => process.stderr.write('peak-kib=' + process.resourceUsage().maxRSS + '\\n'));",
-    );
+    await writeFile(reporter, PEAK_REPORTER);
 
     const { exitCode, stderr } = await runAction(
       { INPUT_PATH: path, ...inputs },

@@ -7,6 +7,7 @@ import {
   readdir,
   readFile,
   rm,
+  stat,
   truncate,
   utimes,
   writeFile,
@@ -259,7 +260,6 @@ describe('download routing', () => {
     ['a traversal as a token', '/..%2f..%2f..%2f..%2f..%2f..%2f..%2f..%2f..%2f../name.apk'],
     ['the store layout', '/artifacts/name.apk'],
     ['a listing', '/artifacts/'],
-    ['the upload route', '/artifacts'],
     ['a dotfile token', '/...........................................//name.apk'],
     ['an unknown token', `/${'a'.repeat(43)}/name.apk`],
   ])('answers 404 for %s', async (_, path) => {
@@ -285,7 +285,7 @@ describe('download routing', () => {
     expect((await send('DELETE', pathname)).status).toBe(404);
     expect((await send('PUT', pathname)).status).toBe(404);
     expect((await send('POST', '/healthz')).status).toBe(404);
-    expect((await send('GET', '/artifacts?name=x')).status).toBe(404);
+    expect((await send('PATCH', '/artifacts?name=x')).status).toBe(404);
   });
 });
 
@@ -417,6 +417,454 @@ describe('upload refusals', () => {
   });
 });
 
+describe('listing a run', () => {
+  const HOSTILE = { repository: 'fishballapp/other', repositoryId: '8' };
+  const verifiedAs = (scope: Partial<typeof SCOPE>, repository: string = VERIFIED.repository) => {
+    verification = { kind: 'verified', repository, scope: { ...SCOPE, ...scope } };
+  };
+  const list = async (query = '') => {
+    const answer = await send('GET', `/artifacts${query}`, { headers: AUTH });
+    expect(answer.status).toBe(200);
+    return (
+      JSON.parse(answer.body) as { artifacts: { id: string; name: string; runAttempt: string }[] }
+    ).artifacts;
+  };
+  const namesOf = (artifacts: { name: string }[]) => artifacts.map(({ name }) => name);
+
+  it('answers with each artifact of the token’s run, in name order, with its scope and links', async () => {
+    await startServer();
+    const content = randomBytes(8);
+    const b = await uploaded('b.apk', content);
+    await uploaded('a.apk', randomBytes(8));
+    verifiedAs({ runId: '200' });
+    await uploaded('elsewhere.apk', randomBytes(8));
+    verifiedAs({});
+
+    const artifacts = await list();
+
+    expect(namesOf(artifacts)).toEqual(['a.apk', 'b.apk']);
+    expect(artifacts[1]).toEqual({
+      id: b.id,
+      name: 'b.apk',
+      size: content.length,
+      digest: sha256(content),
+      expiresAt: '2026-06-08T12:00:00Z',
+      links: {
+        home: `http://192.0.2.1:8420/${b.id}/b.apk`,
+        tailscale: `https://files.example/${b.id}/b.apk`,
+      },
+      repositoryId: '7',
+      runId: '100',
+      runAttempt: '1',
+    });
+  });
+
+  it('takes the latest attempt that holds a name, comparing attempts as numbers', async () => {
+    await startServer();
+    verifiedAs({ runAttempt: '9' });
+    await uploaded('both.apk', randomBytes(8));
+    await uploaded('old-only.apk', randomBytes(8));
+    verifiedAs({ runAttempt: '10' });
+    const latest = await uploaded('both.apk', randomBytes(8));
+
+    const artifacts = await list();
+
+    expect(namesOf(artifacts)).toEqual(['both.apk', 'old-only.apk']);
+    expect(artifacts[0]).toMatchObject({ id: latest.id, runAttempt: '10' });
+    expect(artifacts[1]).toMatchObject({ runAttempt: '9' });
+    expect(await list('?name=both.apk')).toMatchObject([{ id: latest.id, runAttempt: '10' }]);
+    expect(await list('?name=old-only.apk')).toMatchObject([{ runAttempt: '9' }]);
+  });
+
+  it('falls back to an earlier attempt once the latest has expired, as the sweep will', async () => {
+    await startServer();
+    const kept = await uploaded('a.apk', randomBytes(8), '&retention-days=5');
+    verifiedAs({ runAttempt: '2' });
+    await uploaded('a.apk', randomBytes(8), '&retention-days=1');
+    now = NOW.add({ hours: 24 });
+    expect(await list()).toMatchObject([{ id: kept.id, runAttempt: '1' }]);
+    expect(await list('?name=a.apk')).toMatchObject([{ id: kept.id, runAttempt: '1' }]);
+  });
+
+  it('leaves out what has expired, and answers an empty run with nothing', async () => {
+    await startServer();
+    await uploaded('a.apk', randomBytes(8), '&retention-days=1');
+    now = NOW.add({ hours: 24 });
+    expect(await list()).toEqual([]);
+    expect(await list('?name=a.apk')).toEqual([]);
+    expect(await list('?run-id=999')).toEqual([]);
+  });
+
+  it('narrows to names, taking any string as one that is simply not there', async () => {
+    await startServer();
+    await uploaded('a.zip', randomBytes(8));
+    await uploaded('b.apk', randomBytes(8));
+    expect(namesOf(await list('?name=a.zip&name=a'))).toEqual(['a.zip']);
+    expect(await list(`?name=${encodeURIComponent('../../etc/passwd')}`)).toEqual([]);
+    expect(await list(`?name=${'x'.repeat(10_000)}`)).toEqual([]);
+  });
+
+  describe('by ID', () => {
+    it('answers only with what belongs to the repository and run asked about', async () => {
+      await startServer();
+      const here = await uploaded('a.apk', randomBytes(8));
+      verifiedAs({ runId: '200' });
+      const otherRun = await uploaded('b.apk', randomBytes(8));
+      verifiedAs({ repositoryId: HOSTILE.repositoryId, runId: '100' }, HOSTILE.repository);
+      const otherRepository = await uploaded('c.apk', randomBytes(8));
+      verifiedAs({});
+
+      const query = `?id=${here.id}&id=${otherRun.id}&id=${otherRepository.id}`;
+      expect((await list(query)).map(({ id }) => id)).toEqual([here.id]);
+      expect((await list(`${query}&run-id=200`)).map(({ id }) => id)).toEqual([otherRun.id]);
+      expect((await list(`${query}&repository=${HOSTILE.repository}`)).map(({ id }) => id)).toEqual(
+        [otherRepository.id],
+      );
+    });
+
+    it("leaves out an earlier attempt's artifact once a later one holds its name", async () => {
+      await startServer();
+      const first = await uploaded('a.apk', randomBytes(8));
+      verifiedAs({ runAttempt: '2' });
+      const second = await uploaded('a.apk', randomBytes(8));
+      expect((await list(`?id=${first.id}`)).map(({ id }) => id)).toEqual([]);
+      expect((await list(`?id=${second.id}`)).map(({ id }) => id)).toEqual([second.id]);
+    });
+
+    it.each([
+      ['the wrong shape', '?id=short'],
+      ['a traversal', `?id=${encodeURIComponent('../../etc/passwd')}`],
+      ['one bad among good', `?id=${'a'.repeat(43)}&id=short`],
+      ['a name beside it', `?id=${'a'.repeat(43)}&name=a.apk`],
+    ])('refuses %s with a 400', async (_, query) => {
+      await startServer();
+      expect((await send('GET', `/artifacts${query}`, { headers: AUTH })).status).toBe(400);
+    });
+  });
+
+  describe('another repository of the owner', () => {
+    const uploadIn = async (repository: string, repositoryId: string, name: string) => {
+      verifiedAs({ repositoryId, runId: '200' }, repository);
+      const answer = await uploaded(name, randomBytes(8));
+      verifiedAs({});
+      return answer;
+    };
+
+    it('reads it by name and run, whatever the case', async () => {
+      await startServer();
+      const theirs = await uploadIn('fishballapp/Other', '8', 'theirs.apk');
+      expect((await list('?repository=fishballapp/other&run-id=200')).map(({ id }) => id)).toEqual([
+        theirs.id,
+      ]);
+      expect((await list('?repository=FISHBALLAPP/OTHER&run-id=200')).map(({ id }) => id)).toEqual([
+        theirs.id,
+      ]);
+    });
+
+    it("takes the token's run when only the repository is named, as upstream's rule has it", async () => {
+      await startServer();
+      await uploadIn('fishballapp/other', '8', 'theirs.apk');
+      expect(await list('?repository=fishballapp/other')).toEqual([]);
+    });
+
+    it('needs no record for the token’s own repository', async () => {
+      await startServer();
+      const own = await uploaded('a.apk', randomBytes(8));
+      await rm(join(storeDir, 'repositories'), { recursive: true });
+      expect((await list(`?repository=${VERIFIED.repository}`)).map(({ id }) => id)).toEqual([
+        own.id,
+      ]);
+    });
+
+    it('answers nothing for a repository that has never uploaded', async () => {
+      await startServer();
+      await uploaded('a.apk', randomBytes(8));
+      expect(await list('?repository=fishballapp/nobody')).toEqual([]);
+    });
+
+    it('follows a rename at the next upload, keeping the old name until nothing uses it', async () => {
+      await startServer();
+      const before = await uploadIn('fishballapp/old', '8', 'a.apk');
+      const after = await uploadIn('fishballapp/new', '8', 'b.apk');
+      const ids = [before.id, after.id].toSorted();
+      for (const repository of ['fishballapp/old', 'fishballapp/new']) {
+        const found = await list(`?repository=${repository}&run-id=200`);
+        expect(found.map(({ id }) => id).toSorted()).toEqual(ids);
+      }
+    });
+
+    it('points a name at whichever repository uploaded under it last', async () => {
+      await startServer();
+      await uploadIn('fishballapp/taken', '8', 'first.apk');
+      const second = await uploadIn('fishballapp/taken', '9', 'second.apk');
+      expect((await list('?repository=fishballapp/taken&run-id=200')).map(({ id }) => id)).toEqual([
+        second.id,
+      ]);
+    });
+
+    it('hashes the name, so it reaches no path', async () => {
+      await startServer();
+      await uploaded('a.apk', randomBytes(8));
+      await uploadIn('fishballapp/other', '8', 'theirs.apk');
+      expect((await readdir(join(storeDir, 'repositories'))).toSorted()).toEqual(
+        [`${sha256('fishballapp/other')}.json`, `${sha256(VERIFIED.repository)}.json`].toSorted(),
+      );
+      expect(await list(`?repository=${encodeURIComponent('..%2F..%2Fartifacts/x')}`)).toEqual([]);
+    });
+  });
+
+  it.each([
+    ['a repository with no owner', '?repository=nope'],
+    ['a repository with a traversal', `?repository=${encodeURIComponent('../../../etc/passwd')}`],
+    ['a repository with a space', `?repository=${encodeURIComponent('a b/c')}`],
+    ['a run that is not a number', '?run-id=abc'],
+    ['a run with a traversal', `?run-id=${encodeURIComponent('../../artifacts')}`],
+    ['a run too long for a path', `?run-id=${'1'.repeat(300)}`],
+  ])('refuses %s with a 400', async (_, query) => {
+    await startServer();
+    expect((await send('GET', `/artifacts${query}`, { headers: AUTH })).status).toBe(400);
+  });
+
+  it('answers 503 rather than an empty list while the store is missing', async () => {
+    await startServer({ storeDir: join(rootDir, 'volume') });
+    expect((await send('GET', '/artifacts', { headers: AUTH })).status).toBe(503);
+  });
+
+  it('logs the run and the count, never a token', async () => {
+    await startServer();
+    const { id } = await uploaded('a.apk', randomBytes(8));
+    logLines.length = 0;
+    await list();
+    const lines = logLines.join('\n');
+    expect(lines).toContain('list');
+    expect(lines).toContain('count=1');
+    expect(lines).not.toContain(id);
+    expect(lines).not.toContain(OIDC_TOKEN);
+  });
+});
+
+describe('who can read and delete', () => {
+  const routes = [
+    ['GET', '/artifacts'],
+    ['DELETE', `/artifacts/${'a'.repeat(43)}`],
+  ] as const;
+
+  describe.each(routes)('%s %s', (method, path) => {
+    it('answers 401 with no token, a malformed header or another scheme', async () => {
+      await startServer();
+      expect((await send(method, path)).status).toBe(401);
+      for (const authorization of ['Bearer', 'Basic abc', `Bearer ${OIDC_TOKEN} extra`]) {
+        const answer = await send(method, path, { headers: { Authorization: authorization } });
+        expect(answer.status).toBe(401);
+      }
+    });
+
+    it('answers 401 with a generic message for a rejected token, and logs the reason', async () => {
+      await startServer();
+      verification = { kind: 'rejected', reason: 'repository is not private' };
+      const answer = await send(method, path, { headers: AUTH });
+      expect(answer.status).toBe(401);
+      expect(JSON.parse(answer.body)).toEqual({ error: 'Token rejected' });
+      expect(logLines.join('\n')).toContain('repository is not private');
+    });
+
+    it('answers 503, not 401, when the key set is unavailable', async () => {
+      await startServer();
+      verification = { kind: 'unavailable', reason: 'could not fetch the JWKS' };
+      expect((await send(method, path, { headers: AUTH })).status).toBe(503);
+    });
+  });
+
+  it('checks auth before saying whether a deleted artifact exists', async () => {
+    await startServer();
+    const { id } = await uploaded('a.apk', randomBytes(8));
+    expect((await send('DELETE', `/artifacts/${id}`)).status).toBe(401);
+    expect((await send('GET', `/${id}/a.apk`)).status).toBe(200);
+  });
+});
+
+describe('deleting', () => {
+  const remove = (id: string) => send('DELETE', `/artifacts/${id}`, { headers: AUTH });
+
+  it('removes the name and the files together, and the link stops', async () => {
+    await startServer();
+    const { id, pathname } = await uploaded('a.apk', randomBytes(8));
+    const kept = await uploaded('b.apk', randomBytes(8));
+
+    const answer = await remove(id);
+
+    expect(answer.status).toBe(200);
+    expect(JSON.parse(answer.body)).toEqual({ id, name: 'a.apk' });
+    expect((await send('GET', pathname)).status).toBe(404);
+    expect(await artifactsOnDisk()).toEqual([kept.id]);
+    expect(await namesOnDisk()).toEqual([`${sha256('b.apk')}.json`]);
+  });
+
+  it('frees the name for another upload, and a later attempt uncovers an earlier one', async () => {
+    await startServer();
+    const first = await uploaded('a.apk', randomBytes(8));
+    verification = { ...VERIFIED, scope: { ...SCOPE, runAttempt: '2' } };
+    const second = await uploaded('a.apk', randomBytes(8));
+
+    expect((await remove(second.id)).status).toBe(200);
+
+    const listed = await send('GET', '/artifacts', { headers: AUTH });
+    expect(JSON.parse(listed.body).artifacts).toMatchObject([{ id: first.id }]);
+    await uploaded('a.apk', randomBytes(8));
+  });
+
+  it('reaches any run of the repository', async () => {
+    await startServer();
+    const { id } = await uploaded('a.apk', randomBytes(8));
+    verification = { ...VERIFIED, scope: { ...SCOPE, runId: '200', runAttempt: '3' } };
+    expect((await remove(id)).status).toBe(200);
+  });
+
+  it('refuses another repository of the same owner, leaving the artifact as it was', async () => {
+    await startServer();
+    const { id, pathname } = await uploaded('a.apk', randomBytes(8));
+    verification = {
+      kind: 'verified',
+      repository: 'fishballapp/other',
+      scope: { ...SCOPE, repositoryId: '8' },
+    };
+
+    const answer = await remove(id);
+
+    expect(answer.status).toBe(403);
+    expect(JSON.parse(answer.body)).toEqual({
+      error: 'A job can only delete artifacts of its own repository',
+    });
+    expect((await send('GET', pathname)).status).toBe(200);
+    expect(await artifactsOnDisk()).toEqual([id]);
+    expect(logLines.join('\n')).toContain('delete refused');
+  });
+
+  it('holds to the verified ID, not the repository that renamed itself to match', async () => {
+    await startServer();
+    const { id } = await uploaded('a.apk', randomBytes(8));
+    verification = {
+      kind: 'verified',
+      repository: VERIFIED.repository,
+      scope: { ...SCOPE, repositoryId: '8' },
+    };
+    expect((await remove(id)).status).toBe(403);
+  });
+
+  it.each([
+    ['an unknown ID', async () => 'a'.repeat(43)],
+    [
+      'an ID that was already deleted',
+      async () => {
+        const { id } = await uploaded('a.apk', randomBytes(8));
+        await remove(id);
+        return id;
+      },
+    ],
+    [
+      'an ID that was replaced',
+      async () => {
+        const { id } = await uploaded('a.apk', randomBytes(8));
+        await upload('a.apk', randomBytes(8), { query: '&overwrite=true' });
+        return id;
+      },
+    ],
+    [
+      'an expired artifact',
+      async () => {
+        const { id } = await uploaded('a.apk', randomBytes(8), '&retention-days=1');
+        now = NOW.add({ hours: 24 });
+        return id;
+      },
+    ],
+  ])('answers 404 for %s', async (_, makeId) => {
+    await startServer();
+    const answer = await remove(await makeId());
+    expect(answer.status).toBe(404);
+    expect(JSON.parse(answer.body)).toEqual({ error: 'Not found' });
+  });
+
+  it('leaves what a replaced ID would otherwise take with it', async () => {
+    await startServer();
+    const old = await uploaded('a.apk', randomBytes(8));
+    const copy = join(rootDir, 'kept-artifact');
+    await cp(join(storeDir, 'artifacts', old.id), copy, { recursive: true });
+    const replacement = stored(await upload('a.apk', randomBytes(8), { query: '&overwrite=true' }));
+    // What a crash mid-replacement leaves: the old artifact's files, its name already moved on.
+    await cp(copy, join(storeDir, 'artifacts', old.id), { recursive: true });
+
+    expect((await remove(old.id)).status).toBe(404);
+    expect((await send('GET', replacement.pathname)).status).toBe(200);
+  });
+
+  it.each([
+    ['a short ID', '/artifacts/abc'],
+    ['a traversal', '/artifacts/..%2f..%2fetc'],
+    ['an extra segment', `/artifacts/${'a'.repeat(43)}/more`],
+    ['a query string', `/artifacts/${'a'.repeat(43)}?x=1`],
+    ['no ID', '/artifacts/'],
+    ['the collection', '/artifacts'],
+  ])('answers 404 for %s, with or without a token', async (_, path) => {
+    await startServer();
+    expect((await send('DELETE', path, { headers: AUTH })).status).toBe(404);
+    expect((await send('DELETE', path)).status).toBe(404);
+  });
+
+  it('answers 503 while the store is missing', async () => {
+    await startServer({ storeDir: join(rootDir, 'volume') });
+    expect((await remove('a'.repeat(43))).status).toBe(503);
+  });
+
+  it('logs a short token, never the whole of it or the OIDC token', async () => {
+    await startServer();
+    const { id } = await uploaded('a.apk', randomBytes(8));
+    logLines.length = 0;
+    await remove(id);
+    const lines = logLines.join('\n');
+    expect(lines).toContain(id.slice(0, 8));
+    expect(lines).not.toContain(id);
+    expect(lines).not.toContain(OIDC_TOKEN);
+  });
+
+  describe('racing', () => {
+    it('with an overwrite of the same name, leaves one artifact and no orphan', async () => {
+      await startServer();
+      await Promise.all(
+        Array.from({ length: 20 }, async (_, index) => {
+          const { id } = await uploaded(`${index}.apk`, randomBytes(8));
+          const [deleted, replacement] = await Promise.all([
+            remove(id),
+            upload(`${index}.apk`, randomBytes(8), { query: '&overwrite=true' }),
+          ]);
+          expect([200, 404]).toContain(deleted.status);
+          expect(replacement.status).toBe(201);
+          expect((await send('GET', stored(replacement).pathname)).status).toBe(200);
+        }),
+      );
+      expect(await artifactsOnDisk()).toHaveLength(20);
+      expect(await namesOnDisk()).toHaveLength(20);
+    });
+
+    it('with itself, lets one of them have it', async () => {
+      await startServer();
+      const { id } = await uploaded('a.apk', randomBytes(8));
+      const answers = await Promise.all([remove(id), remove(id), remove(id)]);
+      expect(answers.map(({ status }) => status).toSorted()).toEqual([200, 404, 404]);
+    });
+
+    it('with a sweep, never breaks either', async () => {
+      await startServer();
+      for (const index of Array.from({ length: 20 }, (_, index) => index)) {
+        const { id } = await uploaded(`${index}.apk`, randomBytes(8));
+        const [answer] = await Promise.all([remove(id), sweep()]);
+        expect(answer.status).toBe(200);
+      }
+      await sweep();
+      expect(await artifactsOnDisk()).toEqual([]);
+    });
+  });
+});
+
 describe('links', () => {
   it('come from config, whatever Host and X-Forwarded-* say', async () => {
     await startServer();
@@ -469,7 +917,12 @@ describe('a store that goes away', () => {
     expect(refused.status).toBe(503);
     expect(JSON.parse(refused.body)).toEqual({ error: 'The store is missing' });
     expect((await send('GET', `/${'a'.repeat(43)}/a.apk`)).status).toBe(404);
-    expect(await sweep()).toEqual({ removedNames: 0, removedArtifacts: 0, removedTemps: 0 });
+    expect(await sweep()).toEqual({
+      removedNames: 0,
+      removedArtifacts: 0,
+      removedTemps: 0,
+      removedRepositories: 0,
+    });
     expect(existsSync(missing)).toBe(false);
 
     await mkdir(missing);
@@ -547,6 +1000,7 @@ describe('store.put', () => {
     return testServer.run(
       testServer.store
         .put({
+          repository: VERIFIED.repository,
           scope: SCOPE,
           name: 'a.apk',
           size,
@@ -938,7 +1392,12 @@ describe('the sweep', () => {
     await uploaded('a.apk', randomBytes(8), '&retention-days=1');
     now = NOW.add({ hours: 24 });
 
-    expect(await sweep()).toEqual({ removedNames: 1, removedArtifacts: 1, removedTemps: 0 });
+    expect(await sweep()).toEqual({
+      removedNames: 1,
+      removedArtifacts: 1,
+      removedTemps: 0,
+      removedRepositories: 1,
+    });
 
     expect(await artifactsOnDisk()).toEqual([]);
     expect(await readdir(runsDir())).toEqual([]);
@@ -950,7 +1409,12 @@ describe('the sweep', () => {
     const kept = await uploaded('b.apk', randomBytes(8), '&retention-days=2');
     now = NOW.add({ hours: 24 });
 
-    expect(await sweep()).toEqual({ removedNames: 1, removedArtifacts: 1, removedTemps: 0 });
+    expect(await sweep()).toEqual({
+      removedNames: 1,
+      removedArtifacts: 1,
+      removedTemps: 0,
+      removedRepositories: 0,
+    });
 
     expect(await artifactsOnDisk()).toEqual([kept.token]);
     expect(await namesOnDisk()).toEqual([`${sha256('b.apk')}.json`]);
@@ -989,6 +1453,104 @@ describe('the sweep', () => {
     await makeOldTemp(`${'a'.repeat(43)}.name`);
     expect(await sweep()).toMatchObject({ removedTemps: 1 });
     expect(await tempsOnDisk()).toEqual([]);
+  });
+
+  it('removes what a crash left between a deleted name and its artifact', async () => {
+    await startServer();
+    const { id, pathname } = await uploaded('a.apk', randomBytes(8));
+    await rm(nameFile('a.apk'));
+
+    expect((await send('GET', pathname)).status).toBe(404);
+    expect((await send('DELETE', `/artifacts/${id}`, { headers: AUTH })).status).toBe(404);
+    expect(await sweep()).toMatchObject({ removedArtifacts: 1 });
+    expect(await artifactsOnDisk()).toEqual([]);
+    expect(await readdir(join(storeDir, 'repositories'))).toEqual([]);
+  });
+
+  describe("a repository's record", () => {
+    const recordFile = (name = VERIFIED.repository) =>
+      join(storeDir, 'repositories', `${sha256(name)}.json`);
+
+    it('stays while a run of it does, and goes with the last one', async () => {
+      await startServer();
+      const { id } = await uploaded('a.apk', randomBytes(8));
+      await uploaded('b.apk', randomBytes(8), '&retention-days=1');
+      expect(JSON.parse(await readFile(recordFile(), 'utf8'))).toEqual({
+        name: VERIFIED.repository,
+        repositoryId: SCOPE.repositoryId,
+      });
+
+      now = NOW.add({ hours: 24 });
+      expect(await sweep()).toMatchObject({ removedRepositories: 0 });
+      expect(existsSync(recordFile())).toBe(true);
+
+      expect((await send('DELETE', `/artifacts/${id}`, { headers: AUTH })).status).toBe(200);
+      expect(await sweep()).toMatchObject({ removedRepositories: 1 });
+      expect(existsSync(recordFile())).toBe(false);
+    });
+
+    it('is swept when a crash left it with nothing, before the name was written', async () => {
+      await startServer();
+      await mkdir(join(storeDir, 'repositories'));
+      await writeFile(
+        recordFile(),
+        JSON.stringify({ name: VERIFIED.repository, repositoryId: SCOPE.repositoryId }),
+      );
+      await mkdir(namesDir(), { recursive: true });
+
+      expect(await sweep()).toMatchObject({ removedRepositories: 1 });
+      expect(await readdir(runsDir())).toEqual([]);
+    });
+
+    it('is swept when nothing can be read from it, and an upload writes it again', async () => {
+      await startServer();
+      await mkdir(join(storeDir, 'repositories'));
+      await writeFile(recordFile(), '{"name":3}');
+      await writeFile(join(storeDir, 'repositories', '.DS_Store'), 'junk');
+
+      expect(await sweep()).toMatchObject({ removedRepositories: 2 });
+
+      await uploaded('a.apk', randomBytes(8));
+      expect(existsSync(recordFile())).toBe(true);
+    });
+
+    it('is written over when a power cut left it corrupt', async () => {
+      await startServer();
+      await mkdir(join(storeDir, 'repositories'));
+      await writeFile(recordFile(), '{"name":3}');
+      await uploaded('a.apk', randomBytes(8));
+      expect(JSON.parse(await readFile(recordFile(), 'utf8'))).toMatchObject({
+        repositoryId: SCOPE.repositoryId,
+      });
+    });
+
+    it('sweeps what a crash left before a new record moved into place', async () => {
+      await startServer();
+      now = Temporal.Now.instant();
+      await makeOldTemp(`${'a'.repeat(43)}.repository`);
+      expect(await sweep()).toMatchObject({ removedTemps: 1 });
+      expect(await tempsOnDisk()).toEqual([]);
+    });
+
+    it('is not rewritten by an upload that finds it right, leaving no temp', async () => {
+      await startServer();
+      await uploaded('a.apk', randomBytes(8));
+      const { mtimeMs } = await stat(recordFile());
+      await new Promise(resolve => setTimeout(resolve, 20));
+      await uploaded('b.apk', randomBytes(8));
+      expect((await stat(recordFile())).mtimeMs).toBe(mtimeMs);
+      expect(await tempsOnDisk()).toEqual([]);
+    });
+
+    it('never goes while a publish is making it needed', async () => {
+      await startServer();
+      await Promise.all(
+        Array.from({ length: 25 }, async (_, index) => {
+          await Promise.all([uploaded(`${index}.apk`, randomBytes(8)), sweep()]);
+          expect(existsSync(recordFile())).toBe(true);
+        }),
+      );
+    });
   });
 
   it('recovers from a publish that fails after its directory has moved', async () => {
@@ -1068,6 +1630,21 @@ describe('/healthz', () => {
     await writeFile(file, 'not a directory');
     await startServer({ storeDir: file });
     expect((await send('GET', '/healthz')).status).toBe(503);
+  });
+});
+
+describe('listing by name', () => {
+  it('answers each name once, in name order', async () => {
+    await startServer();
+    await uploaded('a.zip', randomBytes(8));
+    await uploaded('z.zip', randomBytes(8));
+    const { status, body } = await send('GET', '/artifacts?name=z.zip&name=a.zip&name=z.zip', {
+      headers: AUTH,
+    });
+    expect(status).toBe(200);
+    expect(
+      (JSON.parse(String(body)) as { artifacts: { name: string }[] }).artifacts.map(a => a.name),
+    ).toEqual(['a.zip', 'z.zip']);
   });
 });
 
