@@ -81,7 +81,7 @@ jobs:
       - uses: actions/checkout@v6
       - run: ./build.sh
       - id: upload
-        uses: fishballapp/self-hosted-artifacts/upload@v0.1.0
+        uses: fishballapp/self-hosted-artifacts/upload@v0.2.0
         with:
           server-url: http://192.0.2.10:8420
           path: dist/
@@ -92,7 +92,7 @@ That uploads what's in `dist/` as one zip, `artifact.zip`. To upload one file as
 link ends in its own name, set `archive: false`:
 
 ```yaml
-      - uses: fishballapp/self-hosted-artifacts/upload@v0.1.0
+      - uses: fishballapp/self-hosted-artifacts/upload@v0.2.0
         with:
           server-url: http://192.0.2.10:8420
           path: dist/app.apk
@@ -200,7 +200,7 @@ File handling and retention match v7. What's left differs because the files go t
 The server and the action are released together under one version, which follows
 [semantic versioning](https://semver.org). Pin the action to a version tag, as above.
 
-Use the same minor version of both, so action `v0.1.x` with server `0.1.x`. A new minor version may
+Use the same minor version of both, so action `v0.2.x` with server `0.2.x`. A new minor version may
 change what they expect of each other.
 
 ## HTTP API
