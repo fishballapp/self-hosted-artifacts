@@ -1,9 +1,16 @@
 name: Self-hosted artifacts merge
-description: Merge a run's artifacts on your own artifact server into one, as actions/upload-artifact/merge does on GitHub.
+description: Merge a run's artifacts on your own artifact server or in your own bucket into one, as actions/upload-artifact/merge does on GitHub.
 inputs:
   server-url:
-    description: Base URL of the server, as the runner reaches it.
-    required: true
+    description: Base URL of the server, as the runner reaches it. Exactly one of this and `s3-bucket` is required.
+  s3-bucket:
+    description: The bucket to use rather than a server, with credentials in AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN. Exactly one of this and `server-url` is required.
+  s3-region:
+    description: The bucket's region. Defaults to AWS_REGION. On R2, `auto`.
+  s3-endpoint:
+    description: The endpoint of an S3-compatible store, such as R2 or MinIO. Without it, the bucket is on AWS.
+  s3-link-base:
+    description: What links start with, as `<s3-link-base>/artifacts/<id>/<name>`. Required with `s3-bucket`.
   name:
     description: The name of the artifact that the artifacts will be merged into, stored as `<name>.zip`.
     default: merged-artifacts
@@ -17,7 +24,7 @@ inputs:
       within the specified path. If false, the matched artifacts will combined in the same directory.
     default: 'false'
   retention-days:
-    description: Days to keep the merged artifact. 0 means the server's default; the server caps it.
+    description: Days to keep the merged artifact. 0 means the default, the server's or 90 with a bucket; a larger number is capped.
     default: '0'
   compression-level:
     description: >
@@ -35,7 +42,7 @@ inputs:
       excluded from the merged artifact.
     default: 'false'
   audience:
-    description: The OIDC audience to request, matching the server's oidcAudience.
+    description: With `server-url`, the OIDC audience to request, matching the server's oidcAudience.
     default: self-hosted-artifacts
 outputs:
   artifact-id:
@@ -47,7 +54,7 @@ outputs:
   links:
     description: Every download link, by label, as one-line JSON.
   expires-at:
-    description: When the server will delete the merged artifact, as an ISO instant.
+    description: When the merged artifact expires, as an ISO instant.
 runs:
   using: node24
   main: dist/action.mjs

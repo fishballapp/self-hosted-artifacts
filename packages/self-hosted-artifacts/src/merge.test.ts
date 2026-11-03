@@ -1,79 +1,72 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { existsSync, openAsBlob } from 'node:fs';
-import { mkdir, readdir, readFile, truncate, writeFile } from 'node:fs/promises';
-import { createServer, type Server } from 'node:http';
+import { existsSync } from 'node:fs';
+import { mkdir, readdir, truncate, writeFile } from 'node:fs/promises';
+import { createServer, type IncomingMessage } from 'node:http';
 import { join } from 'node:path';
 import * as NodeServices from '@effect/platform-node/NodeServices';
 import * as Effect from 'effect/Effect';
 import { strFromU8, strToU8, unzipSync, zipSync } from 'fflate';
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { MERGE_ACTION } from '../tsdown.config.ts';
 import {
   AUDIENCE,
   buildBundle,
-  closeServer,
   generateRunnerKeys,
-  listenOnLoopback,
   PEAK_REPORTER,
+  removeBundle,
+  type Stored,
   startRunner,
+  TARGET_KINDS,
 } from './action-harness.ts';
 import { zipFiles } from './zip.ts';
 
-const ACTION = new URL('../../../upload/merge/dist/action.mjs', import.meta.url).pathname;
+let ACTION: string;
 const BIN = new URL('./bin.ts', import.meta.url).pathname;
 // CI sets this to a Node 24 binary, as that is what the runner runs the action on.
 const ACTION_NODE = process.env.ACTION_NODE ?? process.execPath;
 
 const sha256 = (content: Uint8Array) => createHash('sha256').update(content).digest('hex');
 
-type Stored = { id: string; name: string; digest: string; size: number; expiresAt: string };
-
-describe('merging', () => {
+describe.each(TARGET_KINDS)('merging, against %s', kind => {
   let keys: CryptoKeyPair;
   let runner: Awaited<ReturnType<typeof startRunner>>;
+  let target: Awaited<ReturnType<typeof runner.startTarget>> | undefined;
   let serverUrl: string;
-  let ownServers: Server[];
 
   beforeAll(async () => {
-    await buildBundle(MERGE_ACTION);
+    ACTION = await buildBundle(MERGE_ACTION);
     keys = await generateRunnerKeys();
   }, 60_000);
 
+  afterAll(() => removeBundle(ACTION));
+
   beforeEach(async () => {
     runner = await startRunner({ keys });
+    target = undefined;
     serverUrl = '';
-    ownServers = [];
   });
 
   afterEach(async () => {
-    await Promise.all(ownServers.map(closeServer));
     await runner.stop();
   });
 
-  const startServer = async () => {
-    serverUrl = await runner.startArtifactServer();
+  const startTarget = async () => {
+    target = await runner.startTarget(kind);
   };
 
-  const authorized = async () => ({ Authorization: `Bearer ${await runner.signToken()}` });
+  const requireTarget = () => {
+    if (target === undefined) throw new Error('No target started');
+    return target;
+  };
 
-  /** Straight to the real server, as the job that uploaded would, with a real token. */
-  const store = async (
+  /** Straight to the real target, as the job that uploaded would. */
+  const store = (
     name: string,
     content: Uint8Array,
     run: Parameters<typeof runner.actAs>[0] = {},
-  ): Promise<Stored> => {
-    runner.actAs(run);
-    const response = await fetch(`${serverUrl}/artifacts?name=${name}`, {
-      method: 'POST',
-      headers: await authorized(),
-      body: new Uint8Array(content),
-    });
-    runner.actAs({});
-    expect(response.status).toBe(201);
-    return (await response.json()) as Stored;
-  };
+  ): Promise<Stored> => requireTarget().store(name, content, run);
 
   const storeZip = (
     name: string,
@@ -89,18 +82,14 @@ describe('merging', () => {
     );
 
   /** What the run holds, latest attempt of each name. */
-  const listRun = async (run: Parameters<typeof runner.actAs>[0] = {}) => {
-    runner.actAs(run);
-    const response = await fetch(`${serverUrl}/artifacts`, { headers: await authorized() });
-    runner.actAs({});
-    return ((await response.json()) as { artifacts: Stored[] }).artifacts;
-  };
+  const listRun = (run: Parameters<typeof runner.actAs>[0] = {}): Promise<Stored[]> =>
+    requireTarget().list(run);
 
   const namesInRun = async (run: Parameters<typeof runner.actAs>[0] = {}) =>
     (await listRun(run)).map(({ name }) => name);
 
-  const bytesOf = async ({ id, name }: Stored) =>
-    new Uint8Array(await (await fetch(`${serverUrl}/${id}/${name}`)).arrayBuffer());
+  const bytesOf = async (stored: Stored) =>
+    new Uint8Array(await (await fetch(requireTarget().linkOf(stored))).arrayBuffer());
 
   /** The files of a stored zip, as `path: content`. */
   const filesOf = async (stored: Stored) =>
@@ -120,43 +109,12 @@ describe('merging', () => {
   const merged = async (name = 'merged-artifacts', run: Parameters<typeof runner.actAs>[0] = {}) =>
     filesOf(await findInRun(`${name}.zip`, run));
 
-  /**
-   * A server in front of the real one, to refuse something the real one wouldn't. `refuse` answers
-   * a request instead of passing it on.
-   */
-  const forwardingServer = async (
-    refuse: (request: {
-      method?: string;
-      url?: string;
-    }) => { status: number; body: string } | undefined,
-  ) => {
-    const realUrl = serverUrl;
-    const proxy = createServer((req, res) => {
-      void (async () => {
-        const refusal = refuse(req);
-        if (refusal !== undefined) {
-          req.resume();
-          return void res
-            .writeHead(refusal.status, { 'Content-Type': 'application/json' })
-            .end(refusal.body);
-        }
-        const chunks: Buffer[] = [];
-        for await (const chunk of req) chunks.push(chunk as Buffer);
-        const body = Buffer.concat(chunks);
-        const answer = await fetch(`${realUrl}${req.url}`, {
-          method: req.method,
-          headers: req.headers.authorization ? { Authorization: req.headers.authorization } : {},
-          body: body.length > 0 ? body : undefined,
-        });
-        return void res
-          .writeHead(answer.status, { 'Content-Type': answer.headers.get('content-type') ?? '' })
-          .end(Buffer.from(await answer.arrayBuffer()));
-      })();
-    });
-    ownServers.push(proxy);
-    serverUrl = await listenOnLoopback(proxy);
-    return { realUrl };
-  };
+  /** Answers what the real target wouldn't. `refuse` answers a request instead of passing it on. */
+  const refuseWith = (
+    message: string,
+    isRefused: (request: IncomingMessage) => boolean,
+    status = 403,
+  ) => requireTarget().interpose(request => (isRefused(request) ? { status, message } : undefined));
 
   const statusOfLink = async (url: string | undefined) => (await fetch(url ?? '')).status;
 
@@ -165,8 +123,10 @@ describe('merging', () => {
     env: Record<string, string | undefined> = {},
   ) =>
     runner.runNode(ACTION_NODE, [ACTION], {
-      'INPUT_SERVER-URL': serverUrl,
-      INPUT_AUDIENCE: AUDIENCE,
+      // A server a test wrote, when it hasn't started the real target.
+      ...(target === undefined
+        ? { 'INPUT_SERVER-URL': serverUrl, INPUT_AUDIENCE: AUDIENCE }
+        : { ...target.inputs(), ...target.env() }),
       ...inputs,
       ...env,
     });
@@ -174,8 +134,8 @@ describe('merging', () => {
   const runCli = (args: readonly string[]) =>
     runner.runNode(
       process.execPath,
-      [BIN, 'merge', '--server-url', serverUrl, '--audience', AUDIENCE, ...args],
-      {},
+      [BIN, 'merge', ...requireTarget().flags(), ...args],
+      requireTarget().env(),
     );
 
   const expectSucceeded = ({ exitCode, stdout }: { exitCode: number; stdout: string }) => {
@@ -189,7 +149,7 @@ describe('merging', () => {
 
   describe('with no inputs but the server', () => {
     it('merges every artifact of the run into `merged-artifacts`, and leaves them', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build-a', { 'a.txt': 'a', 'dir/b.txt': 'b' });
       await storeZip('build-b', { 'c.txt': 'c' });
       await store('app.apk', strToU8('an apk, not a zip'));
@@ -215,7 +175,7 @@ describe('merging', () => {
     });
 
     it('answers with the three outputs of upstream, and the links of the other actions', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build-a', { 'a.txt': 'a' });
 
       expectSucceeded(await runAction());
@@ -223,17 +183,15 @@ describe('merging', () => {
       const outputs = await runner.readOutputs();
       const stored = await findInRun('merged-artifacts.zip');
       expect(outputs['artifact-id']).toBe(stored.id);
-      expect(outputs['artifact-url']).toBe(`http://127.0.0.1:1/${stored.id}/merged-artifacts.zip`);
+      expect(outputs['artifact-url']).toBe(Object.values(stored.links)[0]);
+      expect(outputs['artifact-url']).toContain(`${stored.id}/merged-artifacts.zip`);
       expect(outputs['artifact-digest']).toBe(sha256(await bytesOf(stored)));
-      expect(JSON.parse(outputs.links ?? '')).toEqual({
-        home: outputs['artifact-url'],
-        tailscale: `https://files.example/${stored.id}/merged-artifacts.zip`,
-      });
+      expect(JSON.parse(outputs.links ?? '')).toEqual(stored.links);
       expect(outputs['expires-at']).toBe(stored.expiresAt);
     });
 
     it('keeps the artifacts of other runs out of it', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('mine', { 'a.txt': 'a' });
       await storeZip('theirs', { 'b.txt': 'b' }, { run_id: '200' });
       await storeZip('elsewhere', { 'c.txt': 'c' }, { repository_id: '8' });
@@ -244,7 +202,7 @@ describe('merging', () => {
     });
 
     it('works in a temp folder whose name a glob would read', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build-a', { 'a.txt': 'a' });
       const odd = join(runner.rootDir, 'runner [temp] *?');
       await mkdir(odd);
@@ -255,22 +213,25 @@ describe('merging', () => {
       expect(await readdir(odd)).toEqual([]);
     });
 
-    it('fails without the id-token permission, before downloading anything', async () => {
-      await startServer();
-      await storeZip('build-a', { 'a.txt': 'a' });
-      const { exitCode, stdout, stderr } = await runAction(
-        {},
-        { ACTIONS_ID_TOKEN_REQUEST_URL: undefined },
-      );
-      expect(exitCode).toBe(1);
-      expect(stdout).toContain('::error::No OIDC token available');
-      expect(stderr).not.toContain('Preparing to download');
-    });
+    it.runIf(kind === 'server')(
+      'fails without the id-token permission, before downloading anything',
+      async () => {
+        await startTarget();
+        await storeZip('build-a', { 'a.txt': 'a' });
+        const { exitCode, stdout, stderr } = await runAction(
+          {},
+          { ACTIONS_ID_TOKEN_REQUEST_URL: undefined },
+        );
+        expect(exitCode).toBe(1);
+        expect(stdout).toContain('::error::No OIDC token available');
+        expect(stderr).not.toContain('Preparing to download');
+      },
+    );
   });
 
   describe('name', () => {
     it('stores the merged artifact as `<name>.zip`', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build-a', { 'a.txt': 'a' });
 
       expectSucceeded(await runAction({ INPUT_NAME: 'everything' }));
@@ -280,14 +241,14 @@ describe('merging', () => {
     });
 
     it('takes the default for an empty one, as the runner passes an unset input', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build-a', { 'a.txt': 'a' });
       expectSucceeded(await runAction({ INPUT_NAME: '', INPUT_PATTERN: '' }));
       expect(await merged()).toEqual({ 'a.txt': 'a' });
     });
 
     it('refuses a name the server would, before downloading anything', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build-a', { 'a.txt': 'a' });
       const { exitCode, stdout, stderr } = await runAction({ INPUT_NAME: 'no spaces' });
       expect(exitCode).toBe(1);
@@ -298,7 +259,7 @@ describe('merging', () => {
 
   describe('pattern', () => {
     beforeEach(async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build-a', { 'a.txt': 'a' });
       await storeZip('build-b', { 'b.txt': 'b' });
       await storeZip('other', { 'c.txt': 'c' });
@@ -326,7 +287,7 @@ describe('merging', () => {
 
   describe('separate-directories', () => {
     beforeEach(async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build-a', { 'a.txt': 'a', 'both.txt': 'from a' });
       await storeZip('build-b', { 'dir/b.txt': 'b', 'both.txt': 'from b' });
     });
@@ -373,16 +334,19 @@ describe('merging', () => {
 
   describe('retention-days and compression-level', () => {
     beforeEach(async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build-a', { 'a.txt': 'compressible '.repeat(20_000) });
     });
 
     const daysUntil = (expiresAt: string | undefined) =>
       (Date.parse(expiresAt ?? '') - Date.now()) / 86_400_000;
 
-    it("keeps for the server's default without it, and for the days asked with it", async () => {
+    it("keeps for the target's default without it, and for the days asked with it", async () => {
       expectSucceeded(await runAction({ INPUT_NAME: 'by-default' }));
-      expect(daysUntil((await runner.readOutputs())['expires-at'])).toBeCloseTo(7, 1);
+      expect(daysUntil((await runner.readOutputs())['expires-at'])).toBeCloseTo(
+        kind === 'server' ? 7 : 90,
+        1,
+      );
 
       await writeFile(runner.outputPath, '');
       expectSucceeded(await runAction({ INPUT_NAME: 'for-three', 'INPUT_RETENTION-DAYS': '3' }));
@@ -417,7 +381,7 @@ describe('merging', () => {
 
   describe('include-hidden-files', () => {
     beforeEach(async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build-a', {
         'index.html': 'i',
         '.env': 'secret',
@@ -455,7 +419,7 @@ describe('merging', () => {
 
   describe('delete-merged', () => {
     beforeEach(async () => {
-      await startServer();
+      await startTarget();
     });
 
     it('false leaves the originals, and their links', async () => {
@@ -463,7 +427,7 @@ describe('merging', () => {
       await storeZip('build-b', { 'b.txt': 'b' });
       expectSucceeded(await runAction({ 'INPUT_DELETE-MERGED': 'false' }));
       expect(await namesInRun()).toContain('build-a.zip');
-      expect(await statusOfLink(`${serverUrl}/${a.id}/build-a.zip`)).toBe(200);
+      expect(await statusOfLink(requireTarget().linkOf(a))).toBe(200);
     });
 
     it('true deletes them once merged, and only them', async () => {
@@ -477,8 +441,10 @@ describe('merging', () => {
       expectSucceeded(result);
       expect((await namesInRun()).toSorted()).toEqual(['merged-artifacts.zip', 'other.zip']);
       expect(await merged()).toEqual({ 'a.txt': 'a', 'b.txt': 'b' });
-      expect(await statusOfLink(`${serverUrl}/${a.id}/build-a.zip`)).toBe(404);
-      expect(await statusOfLink(`${serverUrl}/${kept.id}/theirs.zip`)).toBe(200);
+      expect(requireTarget().goneLinkStatuses).toContain(
+        await statusOfLink(requireTarget().linkOf(a)),
+      );
+      expect(await statusOfLink(requireTarget().linkOf(kept))).toBe(200);
       expect(result.stderr).toContain('The 2 artifact(s) have been deleted');
     });
 
@@ -504,16 +470,12 @@ describe('merging', () => {
 
     it('true leaves the originals when the server answers the upload with anything else', async () => {
       await storeZip('build-a', { 'a.txt': 'a' });
-      await forwardingServer(({ method, url }) =>
-        method === 'POST' && url?.startsWith('/artifacts')
-          ? { status: 403, body: '{"error":"no uploads today"}' }
-          : undefined,
-      );
+      await refuseWith('no uploads today', request => requireTarget().isUpload(request));
 
       const result = await runAction({ 'INPUT_DELETE-MERGED': 'true' });
 
       expect(result.exitCode).toBe(1);
-      expect(result.stdout).toContain('::error::no uploads today');
+      expect(result.stdout).toMatch(/^::error::.*no uploads today/m);
       expect(await namesInRun()).toEqual(['build-a.zip']);
     });
 
@@ -523,13 +485,12 @@ describe('merging', () => {
         zipSync({ 'a.txt': strToU8('corrupt me, please') }, { level: 0 }),
       );
       await storeZip('build-b', { 'b.txt': 'b' });
-      const dataFile = join(runner.storeDir, 'artifacts', a.id, 'data');
-      const bytes = await readFile(dataFile);
+      const bytes = await requireTarget().readBytes(a);
       bytes.writeUInt8(
         bytes.readUInt8(bytes.indexOf('corrupt me')) ^ 0xff,
         bytes.indexOf('corrupt me'),
       );
-      await writeFile(dataFile, bytes);
+      await requireTarget().replaceBytes(a, bytes);
 
       const result = await runAction({ 'INPUT_DELETE-MERGED': 'true' });
 
@@ -544,29 +505,27 @@ describe('merging', () => {
     it('true fails the step when a delete is refused, after the merge is stored and its outputs written', async () => {
       const a = await storeZip('build-a', { 'a.txt': 'a' });
       const b = await storeZip('build-b', { 'b.txt': 'b' });
-      await forwardingServer(({ method, url }) =>
-        method === 'DELETE' && url?.endsWith(b.id)
-          ? { status: 403, body: '{"error":"not yours"}' }
-          : undefined,
-      );
+      await refuseWith('not yours', request => requireTarget().isDeleteOf(b)(request));
 
       const result = await runAction({ 'INPUT_DELETE-MERGED': 'true' });
 
       expect(result.exitCode).toBe(1);
-      expect(result.stdout).toContain(
-        "::error::Merged into merged-artifacts.zip, but couldn't delete: build-b.zip (not yours)",
+      expect(result.stdout).toMatch(
+        /^::error::Merged into merged-artifacts\.zip, but couldn't delete: build-b\.zip \(.*not yours/m,
       );
       expect(await merged()).toEqual({ 'a.txt': 'a', 'b.txt': 'b' });
       expect((await runner.readOutputs())['artifact-id']).toBeTruthy();
       // Each is tried, so one refusal doesn't keep the rest.
       expect((await namesInRun()).toSorted()).toEqual(['build-b.zip', 'merged-artifacts.zip']);
-      expect(await statusOfLink(`${serverUrl}/${a.id}/build-a.zip`)).toBe(404);
+      expect(requireTarget().goneLinkStatuses).toContain(
+        await statusOfLink(requireTarget().linkOf(a)),
+      );
     });
   });
 
   describe('merging again', () => {
     beforeEach(async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build-a', { 'a.txt': 'a' });
       await storeZip('build-b', { 'b.txt': 'b' });
     });
@@ -591,9 +550,14 @@ describe('merging', () => {
       expect(rerun.stderr).toContain('The 2 artifact(s) have been successfully merged!');
       expect(await namesInRun({ run_attempt: '2' })).toEqual(['merged-artifacts.zip']);
       // Nor was the first attempt's deleted, as a later attempt only replaces what it uploads.
-      expect(await statusOfLink(`${serverUrl}/${first.id}/merged-artifacts.zip`)).toBe(200);
+      expect(await statusOfLink(requireTarget().linkOf(first))).toBe(200);
       expect(
-        await statusOfLink(`${serverUrl}/${outputs['artifact-id']}/merged-artifacts.zip`),
+        await statusOfLink(
+          requireTarget().linkOf({
+            id: outputs['artifact-id'] ?? '',
+            name: 'merged-artifacts.zip',
+          }),
+        ),
       ).toBe(200);
     });
 
@@ -632,17 +596,17 @@ describe('merging', () => {
 
     it('in the same attempt, after a merge that stored but could not delete, finishes the delete', async () => {
       const b = await findInRun('build-b.zip');
-      const { realUrl } = await forwardingServer(({ method }) =>
-        method === 'DELETE' ? { status: 403, body: '{"error":"not today"}' } : undefined,
-      );
+      await refuseWith('not today', ({ method }) => method === 'DELETE');
       expect((await runAction({ 'INPUT_DELETE-MERGED': 'true' })).exitCode).toBe(1);
       expect(await namesInRun()).toHaveLength(3);
 
-      serverUrl = realUrl;
+      requireTarget().removeProxy();
       expectSucceeded(await runAction({ 'INPUT_DELETE-MERGED': 'true' }));
 
       expect(await namesInRun()).toEqual(['merged-artifacts.zip']);
-      expect(await statusOfLink(`${serverUrl}/${b.id}/build-b.zip`)).toBe(404);
+      expect(requireTarget().goneLinkStatuses).toContain(
+        await statusOfLink(requireTarget().linkOf(b)),
+      );
     });
 
     it('in the same attempt, fails on other content under the name, as uploading it would', async () => {
@@ -659,7 +623,7 @@ describe('merging', () => {
 
   describe('from the command line', () => {
     beforeEach(async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build-a', { 'a.txt': 'a' });
       await storeZip('build-b', { 'b.txt': 'b' });
       await storeZip('other', { 'c.txt': 'c' });
@@ -678,7 +642,7 @@ describe('merging', () => {
         size: stored.size,
         merged: [{ name: 'build-a.zip' }, { name: 'build-b.zip' }, { name: 'other.zip' }],
       });
-      expect(printed.links.home).toBe(`http://127.0.0.1:1/${printed.id}/merged-artifacts.zip`);
+      expect(printed.links).toEqual(stored.links);
       expect(stderr).toContain('The 3 artifact(s) have been successfully merged!');
     });
 
@@ -713,9 +677,7 @@ describe('merging', () => {
     });
 
     it('prints the result even when a delete then fails', async () => {
-      await forwardingServer(({ method }) =>
-        method === 'DELETE' ? { status: 403, body: '{"error":"nope"}' } : undefined,
-      );
+      await refuseWith('nope', ({ method }) => method === 'DELETE');
       const { exitCode, stdout, stderr } = await runCli(['--delete-merged', 'true']);
       expect(exitCode).toBe(1);
       expect(JSON.parse(stdout).name).toBe('merged-artifacts.zip');
@@ -723,44 +685,47 @@ describe('merging', () => {
     });
   });
 
-  it('removes what it unpacked when the runner stops the step', async () => {
-    const { promise: requested, resolve: onRequest } = Promise.withResolvers<void>();
-    const content = strToU8('x'.repeat(1024));
-    const listing = JSON.stringify({
-      artifacts: [
-        {
-          id: 'a'.repeat(43),
-          name: 'a.bin',
-          size: content.length,
-          digest: sha256(content),
-          expiresAt: '2030-01-01T00:00:00Z',
-          links: { home: 'http://127.0.0.1:1/never' },
-          repositoryId: '7',
-          runId: '100',
-          runAttempt: '1',
-        },
-      ],
-    });
-    serverUrl = await runner.useFakeServer(
-      createServer((req, res) => {
-        if (req.url?.startsWith('/artifacts')) return void res.end(listing);
-        res.writeHead(200, { 'Content-Length': content.length });
-        res.write(Buffer.from(content.slice(0, 10)), () => onRequest());
-        return undefined;
-      }),
-    );
-    const child = spawn(ACTION_NODE, [ACTION], {
-      cwd: runner.workDir,
-      stdio: 'ignore',
-      env: { ...runner.runnerEnv, 'INPUT_SERVER-URL': serverUrl, INPUT_AUDIENCE: AUDIENCE },
-    });
-    await requested;
-    expect(await readdir(runner.runnerTemp)).not.toEqual([]);
+  it.runIf(kind === 'server')(
+    'removes what it unpacked when the runner stops the step',
+    async () => {
+      const { promise: requested, resolve: onRequest } = Promise.withResolvers<void>();
+      const content = strToU8('x'.repeat(1024));
+      const listing = JSON.stringify({
+        artifacts: [
+          {
+            id: 'a'.repeat(43),
+            name: 'a.bin',
+            size: content.length,
+            digest: sha256(content),
+            expiresAt: '2030-01-01T00:00:00Z',
+            links: { home: 'http://127.0.0.1:1/never' },
+            repositoryId: '7',
+            runId: '100',
+            runAttempt: '1',
+          },
+        ],
+      });
+      serverUrl = await runner.useFakeServer(
+        createServer((req, res) => {
+          if (req.url?.startsWith('/artifacts')) return void res.end(listing);
+          res.writeHead(200, { 'Content-Length': content.length });
+          res.write(Buffer.from(content.slice(0, 10)), () => onRequest());
+          return undefined;
+        }),
+      );
+      const child = spawn(ACTION_NODE, [ACTION], {
+        cwd: runner.workDir,
+        stdio: 'ignore',
+        env: { ...runner.runnerEnv, 'INPUT_SERVER-URL': serverUrl, INPUT_AUDIENCE: AUDIENCE },
+      });
+      await requested;
+      expect(await readdir(runner.runnerTemp)).not.toEqual([]);
 
-    child.kill('SIGTERM');
-    await once(child, 'exit');
-    await expectLeftNothingInTemp();
-  });
+      child.kill('SIGTERM');
+      await once(child, 'exit');
+      await expectLeftNothingInTemp();
+    },
+  );
 
   describe('holds it out of memory', () => {
     const fileBytes = 512 * 1024 ** 2;
@@ -782,16 +747,6 @@ describe('merging', () => {
       return zip;
     };
 
-    /** Sent from disk, as the real upload is: the test's own memory stays out of it. */
-    const storeFromDisk = async (name: string, path: string) => {
-      const response = await fetch(`${serverUrl}/artifacts?name=${name}`, {
-        method: 'POST',
-        headers: await authorized(),
-        body: await openAsBlob(path),
-      });
-      expect(response.status).toBe(201);
-    };
-
     it.each([
       ['level 0', 0],
       ['level 6', 6],
@@ -801,9 +756,15 @@ describe('merging', () => {
         timeout: 180_000,
       },
       async (_, compressionLevel) => {
-        await startServer();
-        await storeFromDisk('big-a.zip', await zipOfSparseFile('big-a', fileBytes / 2, 0));
-        await storeFromDisk('big-b.zip', await zipOfSparseFile('big-b', fileBytes / 2, 6));
+        await startTarget();
+        await requireTarget().storeFromDisk(
+          'big-a.zip',
+          await zipOfSparseFile('big-a', fileBytes / 2, 0),
+        );
+        await requireTarget().storeFromDisk(
+          'big-b.zip',
+          await zipOfSparseFile('big-b', fileBytes / 2, 6),
+        );
         const reporter = join(runner.rootDir, 'report-peak-memory.mjs');
         await writeFile(reporter, PEAK_REPORTER);
 

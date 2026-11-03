@@ -9,7 +9,8 @@ import * as FetchHttpClient from 'effect/http/FetchHttpClient';
 import * as HttpClient from 'effect/http/HttpClient';
 import * as Layer from 'effect/Layer';
 import * as Predicate from 'effect/Predicate';
-import { ClientError } from './client-support.ts';
+import { ClientError, DEFAULT_AUDIENCE } from './client-support.ts';
+import { targetLayer } from './target.ts';
 
 // The runner passes every input as a variable, an unset one as empty.
 export const input = (name: string) =>
@@ -28,6 +29,20 @@ export const requiredInput = Effect.fnUntraced(function* (name: string) {
   }
   return value;
 });
+
+/** Where the step's artifacts are: the inputs every action shares. */
+export const provideTarget = <A, E, R>(main: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    return targetLayer({
+      serverUrl: yield* input('server-url'),
+      audience: yield* inputOr('audience', DEFAULT_AUDIENCE),
+      s3Bucket: yield* input('s3-bucket'),
+      s3Region: yield* input('s3-region'),
+      s3Endpoint: yield* input('s3-endpoint'),
+      s3LinkBase: yield* input('s3-link-base'),
+      scope: '',
+    });
+  }).pipe(Effect.flatMap(target => main.pipe(Effect.provide(target))));
 
 // A workflow command ends at its line break, so one in the message has to be encoded.
 export const escapeCommand = (message: string) =>

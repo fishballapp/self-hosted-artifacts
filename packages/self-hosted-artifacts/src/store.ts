@@ -21,6 +21,7 @@ import * as Semaphore from 'effect/Semaphore';
 import * as Stream from 'effect/Stream';
 import { ServerConfig } from './config.ts';
 import { describeError } from './log.ts';
+import { newArtifactId } from './protocol.ts';
 
 /** Also the server's requestTimeout: enough for 2 GiB at about 5 Mbit/s. */
 export const UPLOAD_TIMEOUT = Duration.hours(1);
@@ -476,9 +477,7 @@ export class Store extends Context.Service<
           yield* ensureSubdirectory(tempDir).pipe(Effect.mapError(uploadFailed));
           yield* ensureSubdirectory(artifactsDir).pipe(Effect.mapError(uploadFailed));
           yield* ensureSubdirectory(repositoriesDir).pipe(Effect.mapError(uploadFailed));
-          const id = crypto
-            .getRandomValues(new Uint8Array(32))
-            .toBase64({ alphabet: 'base64url', omitPadding: true });
+          const id = newArtifactId();
           const now = yield* currentInstant;
           const expiresAt = now.add({ hours: retentionDays * 24 });
           const temp = path.join(tempDir, id);

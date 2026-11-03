@@ -16,13 +16,14 @@ import * as Layer from 'effect/Layer';
 import * as Logger from 'effect/Logger';
 import packageJson from '../package.json' with { type: 'json' };
 import { deleteArtifact, list } from './artifacts.ts';
-import type { ClientError } from './client-support.ts';
+import { type ClientError, DEFAULT_AUDIENCE } from './client-support.ts';
 import { ServerConfig } from './config.ts';
 import { DOWNLOAD_DEFAULTS, download } from './download.ts';
 import { MERGE_DEFAULTS, merge } from './merge.ts';
 import { TokenVerifier } from './oidc.ts';
 import { ArtifactServer, makeNodeServer } from './server.ts';
 import { Store, StoreSweeps } from './store.ts';
+import { type TargetInputs, targetLayer } from './target.ts';
 import { UPLOAD_DEFAULTS, upload } from './upload.ts';
 
 // launchd kills a daemon 20 seconds after SIGTERM, and a request stopped sooner can clean up.
@@ -71,23 +72,59 @@ const serve = Command.make(
     ),
 ).pipe(Command.withDescription('Run the file server'));
 
-const asClientCommand = <A, R>(self: Effect.Effect<A, ClientError, R>) =>
-  self.pipe(
-    Effect.catchTag('ClientError', (error: ClientError) =>
-      Effect.fail(new CliError.UserError({ cause: error, userMessage: error.message })),
+const targetFlags = {
+  serverUrl: Flag.String('server-url').pipe(
+    Flag.withDescription("The server's base URL, as this machine reaches it. Or use --s3-bucket"),
+    Flag.withDefault(''),
+  ),
+  audience: Flag.String('audience').pipe(
+    Flag.withDescription('The OIDC audience to request, with --server-url'),
+    Flag.withDefault(DEFAULT_AUDIENCE),
+  ),
+  s3Bucket: Flag.String('s3-bucket').pipe(
+    Flag.withDescription('The bucket to use rather than a server'),
+    Flag.withDefault(''),
+  ),
+  s3Region: Flag.String('s3-region').pipe(
+    Flag.withDescription("The bucket's region, or AWS_REGION. On R2, `auto`"),
+    Flag.withDefault(''),
+  ),
+  s3Endpoint: Flag.String('s3-endpoint').pipe(
+    Flag.withDescription('The endpoint of an S3-compatible store, such as R2 or MinIO'),
+    Flag.withDefault(''),
+  ),
+  s3LinkBase: Flag.String('s3-link-base').pipe(
+    Flag.withDescription('What links start with, with --s3-bucket: where the bucket is public'),
+    Flag.withDefault(''),
+  ),
+  scope: Flag.String('scope').pipe(
+    Flag.withDescription(
+      'With --s3-bucket outside GitHub Actions: <repository ID>/<run ID>/<run attempt>',
     ),
-    Effect.provide(
-      Layer.mergeAll(
-        FetchHttpClient.layer,
-        Layer.succeed(HttpClient.TracerPropagationEnabled, false),
+    Flag.withDefault(''),
+  ),
+};
+
+const asClientCommand =
+  (target: TargetInputs) =>
+  <A, R>(self: Effect.Effect<A, ClientError, R>) =>
+    self.pipe(
+      Effect.provide(targetLayer(target)),
+      Effect.catchTag('ClientError', (error: ClientError) =>
+        Effect.fail(new CliError.UserError({ cause: error, userMessage: error.message })),
       ),
-    ),
-  );
+      Effect.provide(
+        Layer.mergeAll(
+          FetchHttpClient.layer,
+          Layer.succeed(HttpClient.TracerPropagationEnabled, false),
+        ),
+      ),
+    );
 
 const uploadCommand = Command.make(
   'upload',
   {
-    serverUrl: Flag.String('server-url').pipe(Flag.withDescription("The server's base URL")),
+    target: targetFlags,
     path: Flag.String('path').pipe(
       Flag.withDescription(
         'A file, folder or wildcard pattern to upload, or to exclude with a leading `!`. Repeat for several',
@@ -105,7 +142,7 @@ const uploadCommand = Command.make(
       Flag.withDefault(UPLOAD_DEFAULTS.ifNoFilesFound),
     ),
     retentionDays: Flag.String('retention-days').pipe(
-      Flag.withDescription("Days to keep it. 0 means the server's default"),
+      Flag.withDescription("Days to keep it. 0 means the target's default"),
       Flag.withDefault(UPLOAD_DEFAULTS.retentionDays),
     ),
     compressionLevel: Flag.String('compression-level').pipe(
@@ -124,12 +161,8 @@ const uploadCommand = Command.make(
       Flag.withDescription('true to replace an artifact of this name in the same run attempt'),
       Flag.withDefault(UPLOAD_DEFAULTS.overwrite),
     ),
-    audience: Flag.String('audience').pipe(
-      Flag.withDescription('The OIDC audience to request'),
-      Flag.withDefault(UPLOAD_DEFAULTS.audience),
-    ),
   },
-  ({ path, ...inputs }) =>
+  ({ target, path, ...inputs }) =>
     upload({ ...inputs, path: path.join('\n') }).pipe(
       Effect.flatMap(result =>
         result._tag === 'NoFilesFound'
@@ -145,17 +178,10 @@ const uploadCommand = Command.make(
               }),
             ),
       ),
-      asClientCommand,
+      asClientCommand(target),
     ),
-).pipe(Command.withDescription('Upload files from a GitHub Actions job'));
+).pipe(Command.withDescription('Upload files'));
 
-const serverUrlFlag = Flag.String('server-url').pipe(
-  Flag.withDescription("The server's base URL, as this machine reaches it"),
-);
-const audienceFlag = Flag.String('audience').pipe(
-  Flag.withDescription('The OIDC audience to request'),
-  Flag.withDefault(DOWNLOAD_DEFAULTS.audience),
-);
 const repositoryFlag = Flag.String('repository').pipe(
   Flag.withDescription("Read from this owner/name. Defaults to the job's repository"),
   Flag.withDefault(''),
@@ -184,7 +210,7 @@ const warnOnStderr = (message: string) => Console.error(`Warning: ${message}`);
 const downloadCommand = Command.make(
   'download',
   {
-    serverUrl: serverUrlFlag,
+    target: targetFlags,
     name: Flag.String('name').pipe(
       Flag.withDescription('The artifact to download. Without it, every artifact in the run'),
       Flag.withDefault(''),
@@ -210,19 +236,18 @@ const downloadCommand = Command.make(
       Flag.withDescription('With the wrong digest: ignore, info, warn or error'),
       Flag.withDefault(DOWNLOAD_DEFAULTS.digestMismatch),
     ),
-    audience: audienceFlag,
   },
-  ({ githubToken, ...inputs }) =>
+  ({ target, githubToken, ...inputs }) =>
     download({ ...inputs, isGithubTokenGiven: githubToken !== '', warn: warnOnStderr }).pipe(
       Effect.flatMap(result => Console.log(JSON.stringify(result))),
-      asClientCommand,
+      asClientCommand(target),
     ),
-).pipe(Command.withDescription('Download artifacts from a GitHub Actions job'));
+).pipe(Command.withDescription('Download artifacts'));
 
 const listCommand = Command.make(
   'list',
   {
-    serverUrl: serverUrlFlag,
+    target: targetFlags,
     name: Flag.String('name').pipe(
       Flag.withDescription('Only the artifact of this name'),
       Flag.withDefault(''),
@@ -232,19 +257,18 @@ const listCommand = Command.make(
     githubToken: githubTokenFlag,
     repository: repositoryFlag,
     runId: runIdFlag,
-    audience: audienceFlag,
   },
-  ({ githubToken, ...inputs }) =>
+  ({ target, githubToken, ...inputs }) =>
     list({ ...inputs, isGithubTokenGiven: githubToken !== '', warn: warnOnStderr }).pipe(
       Effect.flatMap(artifacts => Console.log(JSON.stringify({ artifacts }))),
-      asClientCommand,
+      asClientCommand(target),
     ),
-).pipe(Command.withDescription("List a run's artifacts as JSON, from a GitHub Actions job"));
+).pipe(Command.withDescription("List a run's artifacts as JSON"));
 
 const deleteCommand = Command.make(
   'delete',
   {
-    serverUrl: serverUrlFlag,
+    target: targetFlags,
     name: Flag.String('name').pipe(
       Flag.withDescription('The artifact to delete, in the current run'),
       Flag.withDefault(''),
@@ -253,21 +277,18 @@ const deleteCommand = Command.make(
       Flag.withDescription("The artifact to delete, in any of this job's repository's runs"),
       Flag.withDefault(''),
     ),
-    audience: audienceFlag,
   },
-  inputs =>
+  ({ target, ...inputs }) =>
     deleteArtifact(inputs).pipe(
       Effect.flatMap(deleted => Console.log(JSON.stringify(deleted))),
-      asClientCommand,
+      asClientCommand(target),
     ),
-).pipe(
-  Command.withDescription("Delete one of a repository's artifacts, from a GitHub Actions job"),
-);
+).pipe(Command.withDescription("Delete one of a repository's artifacts"));
 
 const mergeCommand = Command.make(
   'merge',
   {
-    serverUrl: serverUrlFlag,
+    target: targetFlags,
     name: Flag.String('name').pipe(
       Flag.withDescription('The name to store the merged artifact under, plus `.zip`'),
       Flag.withDefault(MERGE_DEFAULTS.name),
@@ -281,7 +302,7 @@ const mergeCommand = Command.make(
       Flag.withDefault(MERGE_DEFAULTS.separateDirectories),
     ),
     retentionDays: Flag.String('retention-days').pipe(
-      Flag.withDescription("Days to keep it. 0 means the server's default"),
+      Flag.withDescription("Days to keep it. 0 means the target's default"),
       Flag.withDefault(MERGE_DEFAULTS.retentionDays),
     ),
     compressionLevel: Flag.String('compression-level').pipe(
@@ -296,9 +317,8 @@ const mergeCommand = Command.make(
       Flag.withDescription('true to include files and folders starting with a dot'),
       Flag.withDefault(MERGE_DEFAULTS.includeHiddenFiles),
     ),
-    audience: audienceFlag,
   },
-  inputs =>
+  ({ target, ...inputs }) =>
     merge({
       ...inputs,
       warn: warnOnStderr,
@@ -315,15 +335,15 @@ const mergeCommand = Command.make(
             merged: merged.map(artifact => ({ id: artifact.id, name: artifact.name })),
           }),
         ),
-    }).pipe(asClientCommand),
+    }).pipe(asClientCommand(target)),
 ).pipe(
   Command.withDescription(
-    "Merge a run's artifacts into one, as actions/upload-artifact/merge does, from a GitHub Actions job",
+    "Merge a run's artifacts into one, as actions/upload-artifact/merge does",
   ),
 );
 
 const command = Command.make('self-hosted-artifacts').pipe(
-  Command.withDescription('A small file server for builds from private repositories'),
+  Command.withDescription('Artifacts for GitHub Actions on your own disk or bucket'),
   Command.withSubcommands([
     serve,
     uploadCommand,

@@ -59,6 +59,16 @@ export const clockAt = (now: () => Temporal.Instant) => {
   });
 };
 
+export const listenOnLoopback = async (server: Server): Promise<string> => {
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+};
+
+export const closeServer = async (server: Server) => {
+  server.closeAllConnections();
+  await new Promise(resolve => server.close(resolve));
+};
+
 /** The real server and store on a loopback socket; the verifier, clock and logger are the test's. */
 export const startTestServer = async ({
   config,

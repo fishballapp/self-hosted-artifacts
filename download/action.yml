@@ -1,9 +1,16 @@
 name: Self-hosted artifacts download
-description: Download artifacts from your own artifact server to a private repository's workflow, as actions/download-artifact does from GitHub.
+description: Download artifacts from your own artifact server or bucket to a workflow, as actions/download-artifact does from GitHub.
 inputs:
   server-url:
-    description: Base URL of the server, as the runner reaches it.
-    required: true
+    description: Base URL of the server, as the runner reaches it. Exactly one of this and `s3-bucket` is required.
+  s3-bucket:
+    description: The bucket to use rather than a server, with credentials in AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_SESSION_TOKEN. Exactly one of this and `server-url` is required.
+  s3-region:
+    description: The bucket's region. Defaults to AWS_REGION. On R2, `auto`.
+  s3-endpoint:
+    description: The endpoint of an S3-compatible store, such as R2 or MinIO. Without it, the bucket is on AWS.
+  s3-link-base:
+    description: What links start with, as `<s3-link-base>/artifacts/<id>/<name>`. Required with `s3-bucket`.
   name:
     description: Name of the artifact to download. If unspecified, all artifacts for the run are downloaded.
   artifact-ids:
@@ -18,9 +25,9 @@ inputs:
       `path`. If false, each is extracted into a directory of its name within `path`.
     default: 'false'
   github-token:
-    description: Accepted so a workflow moving over needn't change, and ignored. The job's OIDC token proves who it is.
+    description: Accepted so a workflow moving over needn't change, and ignored.
   repository:
-    description: The owner/name to download from. Defaults to the job's repository. Reading works across the private repositories of the server's owner.
+    description: The owner/name to download from. Defaults to the job's repository. Reading works across the private repositories of the server's owner, or every repository in the bucket.
   run-id:
     description: The run to download from. Defaults to the job's run.
   skip-decompress:
@@ -28,11 +35,11 @@ inputs:
     default: 'false'
   digest-mismatch:
     description: >
-      What to do when a downloaded file's SHA-256 isn't the one the server stored. Options: ignore,
+      What to do when a downloaded file's SHA-256 isn't the one stored with it. Options: ignore,
       info, warn, error. With error, the action fails and that artifact isn't extracted.
     default: error
   audience:
-    description: The OIDC audience to request, matching the server's oidcAudience.
+    description: With `server-url`, the OIDC audience to request, matching the server's oidcAudience.
     default: self-hosted-artifacts
 outputs:
   download-path:

@@ -1,10 +1,10 @@
 # self-hosted-artifacts
 
-**A small file server for GitHub Actions builds from private repositories.**
+**GitHub Actions artifacts on your own disk or bucket: a small file server, and a client for it or S3.**
 
 ```sh
 npx self-hosted-artifacts serve --config ./config.json
 ```
 
 See the [self-hosted-artifacts README](https://github.com/fishballapp/self-hosted-artifacts#readme)
-for the config file, the upload and download actions, the HTTP contract and the security model.
+for the config file, setting up a bucket, the actions, the HTTP contract and the security model.

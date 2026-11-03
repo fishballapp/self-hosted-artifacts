@@ -2,13 +2,18 @@ import * as Config from 'effect/Config';
 import * as Console from 'effect/Console';
 import * as Effect from 'effect/Effect';
 import * as FileSystem from 'effect/FileSystem';
-import { inputOr, requiredInput, runAction, warnInWorkflow } from './action-support.ts';
+import {
+  inputOr,
+  provideTarget,
+  requiredInput,
+  runAction,
+  warnInWorkflow,
+} from './action-support.ts';
 import { UPLOAD_DEFAULTS, upload } from './upload.ts';
 
 const main = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
   const result = yield* upload({
-    serverUrl: yield* requiredInput('server-url'),
     path: yield* requiredInput('path'),
     name: yield* inputOr('name', UPLOAD_DEFAULTS.name),
     ifNoFilesFound: yield* inputOr('if-no-files-found', UPLOAD_DEFAULTS.ifNoFilesFound),
@@ -17,7 +22,6 @@ const main = Effect.gen(function* () {
     includeHiddenFiles: yield* inputOr('include-hidden-files', UPLOAD_DEFAULTS.includeHiddenFiles),
     archive: yield* inputOr('archive', UPLOAD_DEFAULTS.archive),
     overwrite: yield* inputOr('overwrite', UPLOAD_DEFAULTS.overwrite),
-    audience: yield* inputOr('audience', UPLOAD_DEFAULTS.audience),
   });
   if (result._tag === 'NoFilesFound') {
     return yield* result.isWarning ? warnInWorkflow(result.message) : Console.log(result.message);
@@ -37,4 +41,4 @@ const main = Effect.gen(function* () {
   return yield* Console.log(`Uploaded ${name} (${size} bytes), expires at ${expiresAt}`);
 });
 
-runAction(main);
+runAction(provideTarget(main));

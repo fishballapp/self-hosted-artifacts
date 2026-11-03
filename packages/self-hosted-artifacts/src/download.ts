@@ -13,18 +13,9 @@ import {
   parseRun,
   type Warn,
 } from './artifacts.ts';
-import {
-  ClientError,
-  DEFAULT_AUDIENCE,
-  makeRunnerTempFile,
-  parseBooleanInput,
-} from './client-support.ts';
-import {
-  connectToServer,
-  fetchFromServer,
-  type ListedArtifact,
-  type ServerConnection,
-} from './server-client.ts';
+import { ClientError, makeRunnerTempFile, parseBooleanInput } from './client-support.ts';
+import { ArtifactTarget } from './target.ts';
+import type { ListedArtifact } from './transport.ts';
 import { directoriesBelow, extractZip } from './unzip.ts';
 
 const PARALLEL_DOWNLOADS = 5;
@@ -35,7 +26,6 @@ export const DOWNLOAD_DEFAULTS = {
   mergeMultiple: 'false',
   skipDecompress: 'false',
   digestMismatch: 'error',
-  audience: DEFAULT_AUDIENCE,
 } as const;
 
 const DigestMismatchSchema = Schema.Literals(['ignore', 'info', 'warn', 'error']);
@@ -83,7 +73,6 @@ const moveInto = Effect.fnUntraced(function* ({ temp, target }: { temp: string; 
 /** Fetches one artifact to a temp file, checks it, and only then unpacks or moves it. */
 const fetchAndPlace = Effect.fnUntraced(
   function* ({
-    connection,
     artifact,
     root,
     subdirectory,
@@ -91,7 +80,6 @@ const fetchAndPlace = Effect.fnUntraced(
     digestMismatch,
     warn,
   }: {
-    connection: ServerConnection;
     artifact: ListedArtifact;
     root: string;
     subdirectory: readonly string[];
@@ -100,7 +88,7 @@ const fetchAndPlace = Effect.fnUntraced(
     warn: Warn;
   }) {
     const temp = yield* makeRunnerTempFile('.download');
-    const digest = yield* fetchFromServer({ connection, artifact, target: temp });
+    const digest = yield* (yield* ArtifactTarget).fetch({ artifact, target: temp });
     const isMismatch = digest !== artifact.digest;
     if (isMismatch && digestMismatch === 'error') return { isMismatch };
     if (isMismatch) {
@@ -130,10 +118,9 @@ const fetchAndPlace = Effect.fnUntraced(
 
 /**
  * Fetches each artifact below `root`, into a folder of its name or all into `root` itself, and says
- * which didn't match the digest the server stored.
+ * which didn't match the digest stored with them.
  */
 export const placeArtifacts = Effect.fnUntraced(function* ({
-  connection,
   artifacts,
   root,
   isOneFolder,
@@ -141,7 +128,6 @@ export const placeArtifacts = Effect.fnUntraced(function* ({
   digestMismatch,
   warn,
 }: {
-  connection: ServerConnection;
   artifacts: readonly ListedArtifact[];
   root: string;
   isOneFolder: boolean;
@@ -168,7 +154,6 @@ export const placeArtifacts = Effect.fnUntraced(function* ({
     artifacts,
     Effect.fnUntraced(function* (artifact) {
       const { isMismatch } = yield* fetchAndPlace({
-        connection,
         artifact,
         root,
         subdirectory: isOneFolder ? [] : [artifactNameOf(artifact)],
@@ -184,7 +169,6 @@ export const placeArtifacts = Effect.fnUntraced(function* ({
 });
 
 export const download = Effect.fn('download.download')(function* (inputs: {
-  serverUrl: string;
   name: string;
   artifactIds: string;
   path: string;
@@ -195,7 +179,6 @@ export const download = Effect.fn('download.download')(function* (inputs: {
   runId: string;
   skipDecompress: string;
   digestMismatch: string;
-  audience: string;
   warn: Warn;
 }) {
   const { warn } = inputs;
@@ -206,9 +189,8 @@ export const download = Effect.fn('download.download')(function* (inputs: {
   const downloadPath = yield* resolveDestination(inputs.path);
   if (inputs.isGithubTokenGiven) yield* noteGithubTokenIgnored;
 
-  const connection = yield* connectToServer(inputs);
+  yield* (yield* ArtifactTarget).ready;
   const artifacts = yield* findArtifacts({
-    connection,
     name: inputs.name,
     artifactIds: inputs.artifactIds,
     pattern: inputs.pattern,
@@ -219,7 +201,6 @@ export const download = Effect.fn('download.download')(function* (inputs: {
 
   const isOneFolder = inputs.name !== '' || mergeMultiple || artifacts.length === 1;
   const placed = yield* placeArtifacts({
-    connection,
     artifacts,
     root: downloadPath,
     isOneFolder,

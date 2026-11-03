@@ -3,20 +3,15 @@ import * as Effect from 'effect/Effect';
 import { Minimatch } from 'minimatch';
 import { ClientError } from './client-support.ts';
 import { ARTIFACT_ID } from './protocol.ts';
-import {
-  connectToServer,
-  deleteOnServer,
-  type ListedArtifact,
-  listOnServer,
-  type ServerConnection,
-} from './server-client.ts';
+import { ArtifactTarget } from './target.ts';
+import type { ListedArtifact } from './transport.ts';
 
 /** Says a thing that needs attention, in whatever way the action or the command does. */
 export type Warn = (message: string) => Effect.Effect<void>;
 
 /** A workflow moving over keeps its input, and shouldn't wonder why it made no difference. */
 export const noteGithubTokenIgnored = Console.error(
-  "github-token is ignored: the server takes the job's OIDC token, whichever repository or run is asked for",
+  'github-token is ignored: no token of that kind is needed, whichever repository or run is asked for',
 );
 
 /** The name it was uploaded under: a zip is stored as `<name>.zip`, a file under its own name. */
@@ -65,18 +60,17 @@ const parseArtifactIds = Effect.fnUntraced(function* (input: string) {
 
 /** A name means its zip if there is one, as most artifacts are, then a file of exactly that name. */
 const findNamed = Effect.fnUntraced(function* ({
-  connection,
   repository,
   runId,
   name,
 }: {
-  connection: ServerConnection;
   repository: string;
   runId: string;
   name: string;
 }) {
+  const target = yield* ArtifactTarget;
   const zipName = `${name}.zip`;
-  const found = yield* listOnServer({ connection, repository, runId, names: [zipName, name] });
+  const found = yield* target.list({ repository, runId, names: [zipName, name] });
   const artifact = found.find(listed => listed.name === zipName) ?? found[0];
   if (artifact === undefined) {
     return yield* new ClientError({ message: `Artifact '${name}' not found` });
@@ -85,20 +79,19 @@ const findNamed = Effect.fnUntraced(function* ({
 });
 
 const findByIds = Effect.fnUntraced(function* ({
-  connection,
   repository,
   runId,
   artifactIds,
   warn,
 }: {
-  connection: ServerConnection;
   repository: string;
   runId: string;
   artifactIds: string;
   warn: Warn;
 }) {
+  const target = yield* ArtifactTarget;
   const ids = yield* parseArtifactIds(artifactIds);
-  const found = yield* listOnServer({ connection, repository, runId, ids });
+  const found = yield* target.list({ repository, runId, ids });
   if (found.length === 0) {
     return yield* new ClientError({ message: 'None of the provided artifact IDs were found' });
   }
@@ -111,7 +104,6 @@ const findByIds = Effect.fnUntraced(function* ({
 
 /** What `name`, `artifact-ids` and `pattern` select, as actions/download-artifact has them. */
 export const findArtifacts = Effect.fnUntraced(function* ({
-  connection,
   name,
   artifactIds,
   pattern,
@@ -119,7 +111,6 @@ export const findArtifacts = Effect.fnUntraced(function* ({
   runId,
   warn,
 }: {
-  connection: ServerConnection;
   name: string;
   artifactIds: string;
   pattern: string;
@@ -132,11 +123,10 @@ export const findArtifacts = Effect.fnUntraced(function* ({
       message: "Inputs 'name' and 'artifact-ids' cannot be used together. Please specify only one.",
     });
   }
-  if (name !== '') return [yield* findNamed({ connection, repository, runId, name })];
-  if (artifactIds !== '') {
-    return yield* findByIds({ connection, repository, runId, artifactIds, warn });
-  }
-  const artifacts = yield* listOnServer({ connection, repository, runId });
+  if (name !== '') return [yield* findNamed({ repository, runId, name })];
+  if (artifactIds !== '') return yield* findByIds({ repository, runId, artifactIds, warn });
+  const target = yield* ArtifactTarget;
+  const artifacts = yield* target.list({ repository, runId });
   if (pattern === '') return artifacts;
   const matcher = new Minimatch(pattern);
   return artifacts.filter(artifact => matcher.match(artifactNameOf(artifact)));
@@ -144,8 +134,6 @@ export const findArtifacts = Effect.fnUntraced(function* ({
 
 /** Each artifact's latest in a run, narrowed as a download would narrow it. */
 export const list = Effect.fn('artifacts.list')(function* ({
-  serverUrl,
-  audience,
   name,
   artifactIds,
   pattern,
@@ -153,8 +141,6 @@ export const list = Effect.fn('artifacts.list')(function* ({
   warn,
   ...scope
 }: {
-  serverUrl: string;
-  audience: string;
   name: string;
   artifactIds: string;
   pattern: string;
@@ -165,19 +151,15 @@ export const list = Effect.fn('artifacts.list')(function* ({
 }) {
   const { repository, runId } = yield* parseRun(scope);
   if (isGithubTokenGiven) yield* noteGithubTokenIgnored;
-  const connection = yield* connectToServer({ serverUrl, audience });
-  return yield* findArtifacts({ connection, name, artifactIds, pattern, repository, runId, warn });
+  yield* (yield* ArtifactTarget).ready;
+  return yield* findArtifacts({ name, artifactIds, pattern, repository, runId, warn });
 });
 
-/** Removes one artifact of the token's repository: by ID in any run, or by name in the current one. */
+/** Removes one artifact of the job's repository: by ID in any run, or by name in the current one. */
 export const deleteArtifact = Effect.fn('artifacts.deleteArtifact')(function* ({
-  serverUrl,
-  audience,
   name,
   artifactId,
 }: {
-  serverUrl: string;
-  audience: string;
   name: string;
   artifactId: string;
 }) {
@@ -185,10 +167,9 @@ export const deleteArtifact = Effect.fn('artifacts.deleteArtifact')(function* ({
     return yield* new ClientError({ message: 'Give one of --name and --artifact-id' });
   }
   if (artifactId !== '') yield* parseArtifactId(artifactId);
-  const connection = yield* connectToServer({ serverUrl, audience });
+  const target = yield* ArtifactTarget;
+  yield* target.ready;
   const id =
-    artifactId !== ''
-      ? artifactId
-      : (yield* findNamed({ connection, repository: '', runId: '', name })).id;
-  return yield* deleteOnServer({ connection, id });
+    artifactId !== '' ? artifactId : (yield* findNamed({ repository: '', runId: '', name })).id;
+  return yield* target.remove(id);
 });

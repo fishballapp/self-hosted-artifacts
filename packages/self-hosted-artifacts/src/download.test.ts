@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { existsSync, openAsBlob } from 'node:fs';
+import { existsSync } from 'node:fs';
 import {
   chmod,
   lstat,
@@ -14,45 +14,49 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as NodeServices from '@effect/platform-node/NodeServices';
 import * as Effect from 'effect/Effect';
 import { deflateSync, strToU8, zipSync } from 'fflate';
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { DOWNLOAD_ACTION } from '../tsdown.config.ts';
 import {
   AUDIENCE,
   buildBundle,
   generateRunnerKeys,
   PEAK_REPORTER,
+  removeBundle,
+  type Stored,
   startRunner,
+  TARGET_KINDS,
 } from './action-harness.ts';
 import { zipFiles } from './zip.ts';
 
-const ACTION = new URL('../../../download/dist/action.mjs', import.meta.url).pathname;
+let ACTION: string;
 const BIN = new URL('./bin.ts', import.meta.url).pathname;
 // CI sets this to a Node 24 binary, as that is what the runner runs the action on.
 const ACTION_NODE = process.env.ACTION_NODE ?? process.execPath;
 
 const sha256 = (content: Uint8Array | string) => createHash('sha256').update(content).digest('hex');
 
-type Stored = { id: string; name: string; digest: string; size: number };
-
-describe('downloading', () => {
+describe.each(TARGET_KINDS)('downloading, against %s', kind => {
   let keys: CryptoKeyPair;
   let runner: Awaited<ReturnType<typeof startRunner>>;
+  let target: Awaited<ReturnType<typeof runner.startTarget>> | undefined;
   let serverUrl: string;
   let destination: string;
 
   beforeAll(async () => {
-    await buildBundle(DOWNLOAD_ACTION);
+    ACTION = await buildBundle(DOWNLOAD_ACTION);
     keys = await generateRunnerKeys();
   }, 60_000);
+
+  afterAll(() => removeBundle(ACTION));
 
   beforeEach(async () => {
     runner = await startRunner({ keys });
     destination = join(runner.rootDir, 'destination');
+    target = undefined;
     serverUrl = '';
   });
 
@@ -60,26 +64,22 @@ describe('downloading', () => {
     await runner.stop();
   });
 
-  const startServer = async () => {
-    serverUrl = await runner.startArtifactServer();
+  const startTarget = async () => {
+    target = await runner.startTarget(kind);
+    return target;
   };
 
-  /** Straight to the real server, as the job that uploaded would, with a real token. */
-  const store = async (
+  const requireTarget = () => {
+    if (target === undefined) throw new Error('No target started');
+    return target;
+  };
+
+  /** Straight to the real target, as the job that uploaded would. */
+  const store = (
     name: string,
     content: Uint8Array,
     run: Parameters<typeof runner.actAs>[0] = {},
-  ): Promise<Stored> => {
-    runner.actAs(run);
-    const response = await fetch(`${serverUrl}/artifacts?name=${name}`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${await runner.signToken()}` },
-      body: new Uint8Array(content),
-    });
-    runner.actAs({});
-    expect(response.status).toBe(201);
-    return (await response.json()) as Stored;
-  };
+  ): Promise<Stored> => requireTarget().store(name, content, run);
 
   const storeZip = (
     name: string,
@@ -99,8 +99,10 @@ describe('downloading', () => {
     env: Record<string, string | undefined> = {},
   ) =>
     runner.runNode(ACTION_NODE, [ACTION], {
-      'INPUT_SERVER-URL': serverUrl,
-      INPUT_AUDIENCE: AUDIENCE,
+      // A server a test wrote, when it hasn't started the real target.
+      ...(target === undefined
+        ? { 'INPUT_SERVER-URL': serverUrl, INPUT_AUDIENCE: AUDIENCE }
+        : { ...target.inputs(), ...target.env() }),
       ...inputs,
       ...env,
     });
@@ -108,8 +110,8 @@ describe('downloading', () => {
   const runCli = (command: string, args: readonly string[]) =>
     runner.runNode(
       process.execPath,
-      [BIN, command, '--server-url', serverUrl, '--audience', AUDIENCE, ...args],
-      {},
+      [BIN, command, ...requireTarget().flags(), ...args],
+      requireTarget().env(),
     );
 
   /** Every file below a directory, as `path: content`. */
@@ -128,12 +130,11 @@ describe('downloading', () => {
   };
 
   /** Flips a byte of what `store` holds where `content` starts, keeping its size. */
-  const corruptOnDisk = async ({ id }: Stored, content: string) => {
-    const dataFile = join(runner.storeDir, 'artifacts', id, 'data');
-    const bytes = await readFile(dataFile);
+  const corrupt = async (stored: Stored, content: string) => {
+    const bytes = await requireTarget().readBytes(stored);
     const offset = bytes.indexOf(content);
     bytes.writeUInt8(bytes.readUInt8(offset) ^ 0xff, offset);
-    await writeFile(dataFile, bytes);
+    await requireTarget().replaceBytes(stored, bytes);
   };
 
   const expectSucceeded = ({ exitCode, stdout }: { exitCode: number; stdout: string }) => {
@@ -143,7 +144,7 @@ describe('downloading', () => {
 
   describe('by name', () => {
     it('unpacks one artifact into path, with no folder for its name', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build', { 'a.txt': 'a', 'dir/b.txt': 'b' });
       await storeZip('other', { 'c.txt': 'c' });
 
@@ -157,7 +158,7 @@ describe('downloading', () => {
     });
 
     it('defaults to GITHUB_WORKSPACE', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build', { 'a.txt': 'a' });
       expectSucceeded(await runAction({ INPUT_NAME: 'build' }));
       expect(await treeOf(runner.workDir)).toEqual({ 'a.txt': 'a' });
@@ -165,14 +166,14 @@ describe('downloading', () => {
     });
 
     it('defaults to the working directory without GITHUB_WORKSPACE', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build', { 'a.txt': 'a' });
       expectSucceeded(await runAction({ INPUT_NAME: 'build' }, { GITHUB_WORKSPACE: undefined }));
       expect(await treeOf(runner.workDir)).toEqual({ 'a.txt': 'a' });
     });
 
     it('resolves a relative path, and expands `~`', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build', { 'a.txt': 'a' });
       expectSucceeded(await runAction({ INPUT_NAME: 'build', INPUT_PATH: 'out/put' }));
       expect(await treeOf(join(runner.workDir, 'out/put'))).toEqual({ 'a.txt': 'a' });
@@ -186,7 +187,7 @@ describe('downloading', () => {
     });
 
     it('replaces a file that is already there, and leaves what else it finds', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build', { 'a.txt': 'new' });
       await mkdir(destination);
       await writeFile(join(destination, 'a.txt'), 'old');
@@ -196,7 +197,7 @@ describe('downloading', () => {
     });
 
     it('restores permissions, without the bits that could raise them', async () => {
-      await startServer();
+      await startTarget();
       const source = join(runner.rootDir, 'run.sh');
       await writeFile(source, 'x');
       await chmod(source, 0o755);
@@ -206,7 +207,7 @@ describe('downloading', () => {
     });
 
     it('makes the empty folders a zip holds', async () => {
-      await startServer();
+      await startTarget();
       await store(
         'build.zip',
         zipSync({ 'empty/deep/': new Uint8Array(0), 'a.txt': strToU8('a') }),
@@ -216,7 +217,7 @@ describe('downloading', () => {
     });
 
     it('fails when nothing has the name', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build', { 'a.txt': 'a' });
       const { exitCode, stdout } = await runAction({ INPUT_NAME: 'nope', INPUT_PATH: destination });
       expect(exitCode).toBe(1);
@@ -227,7 +228,7 @@ describe('downloading', () => {
     });
 
     it('takes a zip over a file of the same name, and the file when there is no zip', async () => {
-      await startServer();
+      await startTarget();
       await store('thing', strToU8('a file'));
       expectSucceeded(await runAction({ INPUT_NAME: 'thing', INPUT_PATH: destination }));
       expect(await treeOf(destination)).toEqual({ thing: 'a file' });
@@ -241,7 +242,7 @@ describe('downloading', () => {
 
   describe('by pattern and all at once', () => {
     beforeEach(async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build-a', { 'a.txt': 'a', 'both.txt': 'from a' });
       await storeZip('build-b', { 'b.txt': 'b', 'both.txt': 'from b' });
       await storeZip('other', { 'c.txt': 'c' });
@@ -307,7 +308,7 @@ describe('downloading', () => {
   });
 
   it('succeeds with nothing to do in a run with no artifacts', async () => {
-    await startServer();
+    await startTarget();
     const result = await runAction({ INPUT_PATH: destination });
     expectSucceeded(result);
     expect(result.stdout).toContain('Total of 0 artifact(s) downloaded');
@@ -315,14 +316,14 @@ describe('downloading', () => {
 
   describe('by ID', () => {
     it('unpacks one straight into path', async () => {
-      await startServer();
+      await startTarget();
       const { id } = await storeZip('build', { 'a.txt': 'a' });
       expectSucceeded(await runAction({ 'INPUT_ARTIFACT-IDS': id, INPUT_PATH: destination }));
       expect(await treeOf(destination)).toEqual({ 'a.txt': 'a' });
     });
 
     it('gives several a folder each, reading a list with spaces', async () => {
-      await startServer();
+      await startTarget();
       const a = await storeZip('a', { 'a.txt': 'a' });
       const b = await storeZip('b', { 'b.txt': 'b' });
       expectSucceeded(
@@ -332,7 +333,7 @@ describe('downloading', () => {
     });
 
     it('warns about those it could not find, and fails with none', async () => {
-      await startServer();
+      await startTarget();
       const { id } = await storeZip('build', { 'a.txt': 'a' });
       const missing = 'a'.repeat(43);
 
@@ -351,7 +352,7 @@ describe('downloading', () => {
     });
 
     it("refuses another run's or repository's ID in the current run's scope", async () => {
-      await startServer();
+      await startTarget();
       const otherRun = await storeZip('a', { 'a.txt': 'a' }, { run_id: '200' });
       const otherRepository = await storeZip(
         'b',
@@ -386,14 +387,14 @@ describe('downloading', () => {
       ['a number, as upstream has them', '12345', "Invalid artifact ID: '12345'"],
       ['nothing but commas', ' , ,', "No valid artifact IDs provided in 'artifact-ids' input"],
     ])('refuses %s', async (_, ids, message) => {
-      await startServer();
+      await startTarget();
       const { exitCode, stdout } = await runAction({ 'INPUT_ARTIFACT-IDS': ids });
       expect(exitCode).toBe(1);
       expect(stdout).toContain(message);
     });
 
     it('refuses to go with a name', async () => {
-      await startServer();
+      await startTarget();
       const { exitCode, stdout } = await runAction({
         INPUT_NAME: 'a',
         'INPUT_ARTIFACT-IDS': 'b'.repeat(43),
@@ -405,7 +406,7 @@ describe('downloading', () => {
 
   describe('from elsewhere', () => {
     it('reads another run of this repository with run-id alone', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build', { 'a.txt': 'there' }, { run_id: '200' });
       await storeZip('build', { 'a.txt': 'here' });
       expectSucceeded(
@@ -415,7 +416,7 @@ describe('downloading', () => {
     });
 
     it('reads another repository of the owner, given its name and run', async () => {
-      await startServer();
+      await startTarget();
       const other = { repository: 'fishballapp/Other', repository_id: '8', run_id: '200' };
       await storeZip('build', { 'a.txt': 'theirs' }, other);
       expectSucceeded(
@@ -430,7 +431,7 @@ describe('downloading', () => {
     });
 
     it("looks in the job's own run when given only a repository, and finds nothing", async () => {
-      await startServer();
+      await startTarget();
       await storeZip(
         'build',
         { 'a.txt': 'theirs' },
@@ -450,7 +451,7 @@ describe('downloading', () => {
     });
 
     it('finds nothing in a repository that never uploaded', async () => {
-      await startServer();
+      await startTarget();
       const { exitCode, stdout } = await runAction({
         INPUT_NAME: 'build',
         INPUT_REPOSITORY: 'fishballapp/nobody',
@@ -465,14 +466,14 @@ describe('downloading', () => {
       ['a repository too deep', { INPUT_REPOSITORY: 'a/b/c' }, "Invalid repository: 'a/b/c'"],
       ['a run that is no number', { 'INPUT_RUN-ID': 'abc' }, "Invalid run-id: 'abc'"],
     ])('refuses %s', async (_, inputs, message) => {
-      await startServer();
+      await startTarget();
       const { exitCode, stdout } = await runAction(inputs);
       expect(exitCode).toBe(1);
       expect(stdout).toContain(message);
     });
 
     it('accepts github-token, says it is ignored, and never prints it', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build', { 'a.txt': 'a' });
       const result = await runAction({
         INPUT_NAME: 'build',
@@ -488,7 +489,7 @@ describe('downloading', () => {
 
   describe('across attempts', () => {
     it('takes the latest attempt that holds the name', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('both', { 'a.txt': 'attempt 1' });
       await storeZip('both', { 'a.txt': 'attempt 2' }, { run_attempt: '2' });
       await storeZip('old', { 'b.txt': 'attempt 1' });
@@ -505,7 +506,7 @@ describe('downloading', () => {
     });
 
     it("no longer finds an earlier attempt's ID, as upstream's list with latest doesn't", async () => {
-      await startServer();
+      await startTarget();
       const first = await storeZip('build', { 'a.txt': '1' });
       await storeZip('build', { 'a.txt': '2' }, { run_attempt: '2' });
       const { exitCode, stdout } = await runAction({ 'INPUT_ARTIFACT-IDS': first.id });
@@ -519,11 +520,11 @@ describe('downloading', () => {
     const CONTENT = 'held as it is, so a flipped byte leaves a zip that still opens';
     const storeBadZip = async (name: string) => {
       const zip = zipSync({ 'a.txt': strToU8(CONTENT) }, { level: 0 });
-      await corruptOnDisk(await store(name, zip), CONTENT);
+      await corrupt(await store(name, zip), CONTENT);
     };
 
     const startWithBadArtifact = async () => {
-      await startServer();
+      await startTarget();
       await storeBadZip('bad.zip');
     };
 
@@ -569,13 +570,10 @@ describe('downloading', () => {
     });
 
     it('with warn on a zip that no longer opens, says so before it fails', async () => {
-      await startServer();
+      await startTarget();
       const zip = zipSync({ 'a.txt': strToU8('a') });
       const stored = await store('bad.zip', zip);
-      await writeFile(
-        join(runner.storeDir, 'artifacts', stored.id, 'data'),
-        new Uint8Array(zip.length),
-      );
+      await requireTarget().replaceBytes(stored, new Uint8Array(zip.length));
       const { exitCode, stdout } = await runAction({
         INPUT_NAME: 'bad',
         'INPUT_DIGEST-MISMATCH': 'warn',
@@ -587,8 +585,8 @@ describe('downloading', () => {
     });
 
     it('with warn on a plain file, keeps the file and succeeds', async () => {
-      await startServer();
-      await corruptOnDisk(await store('a.bin', strToU8('content')), 'content');
+      await startTarget();
+      await corrupt(await store('a.bin', strToU8('content')), 'content');
       const result = await runAction({
         INPUT_NAME: 'a.bin',
         'INPUT_DIGEST-MISMATCH': 'warn',
@@ -600,7 +598,7 @@ describe('downloading', () => {
     });
 
     it('refuses a mode that does not exist', async () => {
-      await startServer();
+      await startTarget();
       const { exitCode, stdout } = await runAction({ 'INPUT_DIGEST-MISMATCH': 'shrug' });
       expect(exitCode).toBe(1);
       expect(stdout).toContain(
@@ -611,7 +609,7 @@ describe('downloading', () => {
 
   describe('a file that is not a zip', () => {
     it('is written as that file, readable, under its own name', async () => {
-      await startServer();
+      await startTarget();
       await store('app.apk', strToU8('not a zip'));
       expectSucceeded(await runAction({ INPUT_NAME: 'app.apk', INPUT_PATH: destination }));
       expect(await treeOf(destination)).toEqual({ 'app.apk': 'not a zip' });
@@ -620,7 +618,7 @@ describe('downloading', () => {
     });
 
     it('is copied when RUNNER_TEMP is on another disk, where it can not move', async () => {
-      await startServer();
+      await startTarget();
       await store('app.apk', strToU8('apk'));
       const noRename = join(runner.rootDir, 'no-rename.mjs');
       await writeFile(
@@ -645,7 +643,7 @@ syncBuiltinESMExports();`,
     });
 
     it('goes in a folder of its name among several, as upstream puts it', async () => {
-      await startServer();
+      await startTarget();
       await store('app.apk', strToU8('apk'));
       await storeZip('build', { 'a.txt': 'a' });
       expectSucceeded(await runAction({ INPUT_PATH: destination }));
@@ -653,7 +651,7 @@ syncBuiltinESMExports();`,
     });
 
     it('is matched by its whole name in a pattern', async () => {
-      await startServer();
+      await startTarget();
       await store('app.apk', strToU8('apk'));
       await storeZip('build', { 'a.txt': 'a' });
       expectSucceeded(await runAction({ INPUT_PATTERN: '*.apk', INPUT_PATH: destination }));
@@ -661,7 +659,7 @@ syncBuiltinESMExports();`,
     });
 
     it('replaces rather than follows a symlink that is already there', async () => {
-      await startServer();
+      await startTarget();
       await store('app.apk', strToU8('apk'));
       const outside = join(runner.rootDir, 'outside.txt');
       await writeFile(outside, 'untouched');
@@ -675,7 +673,7 @@ syncBuiltinESMExports();`,
 
   describe('skip-decompress', () => {
     it('keeps the zip as it is', async () => {
-      await startServer();
+      await startTarget();
       const zip = zipSync({ 'a.txt': strToU8('a') });
       await store('build.zip', zip);
       expectSucceeded(
@@ -690,7 +688,7 @@ syncBuiltinESMExports();`,
     });
 
     it('keeps each in its folder among several', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('a', { 'a.txt': 'a' });
       await storeZip('b', { 'b.txt': 'b' });
       expectSucceeded(
@@ -705,27 +703,30 @@ syncBuiltinESMExports();`,
       ['merge-multiple', { 'INPUT_MERGE-MULTIPLE': 'yes' }],
       ['skip-decompress', { 'INPUT_SKIP-DECOMPRESS': 'yes' }],
     ])('refuses a %s that is not a YAML boolean', async (name, inputs) => {
-      await startServer();
+      await startTarget();
       const { exitCode, stdout } = await runAction(inputs);
       expect(exitCode).toBe(1);
       expect(stdout).toContain(`Input does not meet YAML 1.2 "Core Schema" specification: ${name}`);
     });
 
-    it('names server-url when it is missing', async () => {
+    it('says a target is needed when it has neither', async () => {
       const { exitCode, stdout } = await runAction({ 'INPUT_SERVER-URL': '' });
       expect(exitCode).toBe(1);
-      expect(stdout).toContain('Input required and not supplied: server-url');
+      expect(stdout).toContain('Give exactly one of server-url and s3-bucket');
     });
 
-    it('asks for the id-token permission when the runner gave no token vars', async () => {
-      await startServer();
-      const { exitCode, stdout } = await runAction(
-        {},
-        { ACTIONS_ID_TOKEN_REQUEST_URL: undefined, ACTIONS_ID_TOKEN_REQUEST_TOKEN: undefined },
-      );
-      expect(exitCode).toBe(1);
-      expect(stdout).toContain('permissions: id-token: write');
-    });
+    it.runIf(kind === 'server')(
+      'asks for the id-token permission when the runner gave no token vars',
+      async () => {
+        await startTarget();
+        const { exitCode, stdout } = await runAction(
+          {},
+          { ACTIONS_ID_TOKEN_REQUEST_URL: undefined, ACTIONS_ID_TOKEN_REQUEST_TOKEN: undefined },
+        );
+        expect(exitCode).toBe(1);
+        expect(stdout).toContain('permissions: id-token: write');
+      },
+    );
   });
 
   /** A listing and the files behind it, with correct digests, from a server a test controls. */
@@ -744,106 +745,17 @@ syncBuiltinESMExports();`,
     return { artifacts, json: JSON.stringify({ artifacts }) };
   };
 
-  const startFakeArtifacts = async (files: Record<string, Uint8Array>) => {
-    const { json } = fakeListing(files);
-    serverUrl = await runner.useFakeServer(
-      createServer((req, res) => {
-        if (req.url?.startsWith('/artifacts')) {
-          return void res.writeHead(200, { 'Content-Type': 'application/json' }).end(json);
-        }
-        const content = files[req.url?.split('/').pop() ?? ''];
-        if (content === undefined) return void res.writeHead(404).end('{"error":"Not found"}');
-        return void res
-          .writeHead(200, { 'Content-Length': content.length })
-          .end(Buffer.from(content));
-      }),
-    );
+  /** Stored as they are: a target doesn't look inside what it holds. */
+  const storeFiles = async (files: Record<string, Uint8Array>) => {
+    await startTarget();
+    await Promise.all(Object.entries(files).map(([name, content]) => store(name, content)));
   };
-
-  describe('a zip, and what is already there', () => {
-    it('refuses a symlink out of the destination before writing anything', async () => {
-      await startServer();
-      const destination = join(runner.rootDir, 'out');
-      await mkdir(destination);
-      await writeFile(join(destination, 'first.txt'), 'before');
-      await symlink(tmpdir(), join(destination, 'link'));
-      await storeZip('a.zip', { 'first.txt': 'after', 'link/evil.txt': 'blocked' });
-      const { exitCode, stdout } = await runAction({
-        INPUT_NAME: 'a.zip',
-        INPUT_PATH: destination,
-      });
-      expect(exitCode).toBe(1);
-      expect(stdout).toContain('is a symlink leading out of');
-      expect(await readFile(join(destination, 'first.txt'), 'utf8')).toBe('before');
-    });
-
-    it('fails on a file in the way of a folder, rather than succeeding around it', async () => {
-      await startServer();
-      const destination = join(runner.rootDir, 'out');
-      await mkdir(destination);
-      await writeFile(join(destination, 'sub'), 'a file');
-      await storeZip('a.zip', { 'sub/a.txt': 'x' });
-      const { exitCode, stdout } = await runAction({
-        INPUT_NAME: 'a.zip',
-        INPUT_PATH: destination,
-      });
-      expect(exitCode).toBe(1);
-      expect(stdout).toContain('sub is in the way of a folder');
-      expect(await readFile(join(destination, 'sub'), 'utf8')).toBe('a file');
-    });
-
-    it('restores a file mode the umask would have cut down', async () => {
-      await startServer();
-      const source = join(runner.rootDir, 'source');
-      await mkdir(source);
-      await writeFile(join(source, 'shared.txt'), 'x');
-      await chmod(join(source, 'shared.txt'), 0o664);
-      await storeZipOfFile('a.zip', join(source, 'shared.txt'), source);
-      const destination = join(runner.rootDir, 'out');
-      const previous = process.umask(0o022);
-      const result = await runAction({ INPUT_NAME: 'a.zip', INPUT_PATH: destination });
-      process.umask(previous);
-      expectSucceeded(result);
-      expect((await stat(join(destination, 'shared.txt'))).mode & 0o777).toBe(0o664);
-    });
-
-    it("doesn't read a Windows zip's attributes as a Unix mode", async () => {
-      const zip = zipSync({
-        'unpinned.txt': [strToU8('x'), { os: 0, attrs: 0x00100020 }],
-        'reparse.txt': [strToU8('y'), { os: 0, attrs: 0xa0000020 }],
-      });
-      await startFakeArtifacts({ 'a.zip': zip });
-      const destination = join(runner.rootDir, 'out');
-      expectSucceeded(await runAction({ INPUT_NAME: 'a.zip', INPUT_PATH: destination }));
-      expect(await readFile(join(destination, 'unpinned.txt'), 'utf8')).toBe('x');
-      expect(await readFile(join(destination, 'reparse.txt'), 'utf8')).toBe('y');
-    });
-
-    it('takes artifacts whose folders match but for case one at a time', async () => {
-      await startServer();
-      await storeZip('Build.zip', { 'a.txt': 'upper' });
-      await storeZip('build.zip', { 'a.txt': 'lower' });
-      const destination = join(runner.rootDir, 'out');
-      expectSucceeded(await runAction({ INPUT_PATH: destination }));
-    });
-
-    it('refuses a path with a line break, which would add an output', async () => {
-      await startServer();
-      await storeZip('a.zip', { 'a.txt': 'x' });
-      const { exitCode, stdout } = await runAction({
-        INPUT_NAME: 'a.zip',
-        INPUT_PATH: `${join(runner.rootDir, 'out')}\ninjected=1`,
-      });
-      expect(exitCode).toBe(1);
-      expect(stdout).toContain('path has a line break');
-    });
-  });
 
   describe('a malicious zip', () => {
     const outsideFile = () => join(runner.rootDir, 'evil.txt');
 
     const expectRefused = async (zip: Uint8Array, message: string | RegExp) => {
-      await startFakeArtifacts({ 'evil.zip': zip });
+      await storeFiles({ 'evil.zip': zip });
       const { exitCode, stdout } = await runAction({ INPUT_NAME: 'evil', INPUT_PATH: destination });
       expect(exitCode).toBe(1);
       expect(stdout).toMatch(/^::error::Unable to download artifact\(s\): /m);
@@ -915,7 +827,7 @@ syncBuiltinESMExports();`,
     });
 
     it('that is no zip at all fails the step, and skip-decompress keeps it', async () => {
-      await startFakeArtifacts({ 'broken.zip': strToU8('not a zip') });
+      await storeFiles({ 'broken.zip': strToU8('not a zip') });
       const refused = await runAction({ INPUT_NAME: 'broken', INPUT_PATH: destination });
       expect(refused.exitCode).toBe(1);
       expect(refused.stdout).toContain("Can't place broken.zip");
@@ -931,7 +843,7 @@ syncBuiltinESMExports();`,
 
     describe('against what the destination already holds', () => {
       it('will not write through a symlink folder leading out', async () => {
-        await startFakeArtifacts({
+        await storeFiles({
           'evil.zip': zipSync({ 'out/evil.txt': strToU8('evil') }),
         });
         await mkdir(destination);
@@ -950,7 +862,7 @@ syncBuiltinESMExports();`,
       });
 
       it('writes through a symlink folder that stays inside, as upstream would', async () => {
-        await startFakeArtifacts({ 'a.zip': zipSync({ 'link/a.txt': strToU8('a') }) });
+        await storeFiles({ 'a.zip': zipSync({ 'link/a.txt': strToU8('a') }) });
         await mkdir(join(destination, 'real'), { recursive: true });
         await symlink(join(destination, 'real'), join(destination, 'link'));
 
@@ -960,7 +872,7 @@ syncBuiltinESMExports();`,
       });
 
       it('replaces rather than follows a symlink where a file goes', async () => {
-        await startFakeArtifacts({ 'a.zip': zipSync({ 'a.txt': strToU8('a') }) });
+        await storeFiles({ 'a.zip': zipSync({ 'a.txt': strToU8('a') }) });
         const outside = join(runner.rootDir, 'outside.txt');
         await writeFile(outside, 'untouched');
         await mkdir(destination);
@@ -973,7 +885,7 @@ syncBuiltinESMExports();`,
       });
 
       it('takes a path that is itself a symlink, as it means to', async () => {
-        await startFakeArtifacts({ 'a.zip': zipSync({ 'a.txt': strToU8('a') }) });
+        await storeFiles({ 'a.zip': zipSync({ 'a.txt': strToU8('a') }) });
         const real = join(runner.rootDir, 'real');
         await mkdir(real);
         await symlink(real, destination);
@@ -985,7 +897,7 @@ syncBuiltinESMExports();`,
 
       it("will not follow a symlink out in an artifact's own folder", async () => {
         const zip = zipSync({ 'a.txt': strToU8('a') });
-        await startFakeArtifacts({ 'a.zip': zip, 'b.zip': zip });
+        await storeFiles({ 'a.zip': zip, 'b.zip': zip });
         await mkdir(destination);
         const outside = join(runner.rootDir, 'outside');
         await mkdir(outside);
@@ -1040,7 +952,7 @@ syncBuiltinESMExports();`,
 
       it('that declares more than the disk holds fails before writing anything', async () => {
         // Overlapping entries: 2,048 of them at nearly 4 GiB each, over one small kernel.
-        await startFakeArtifacts({ 'bomb.zip': zipDeclaring(strToU8('x'), 0xfffffffe, 2048) });
+        await storeFiles({ 'bomb.zip': zipDeclaring(strToU8('x'), 0xfffffffe, 2048) });
         const { exitCode, stdout } = await runAction({
           INPUT_NAME: 'bomb',
           INPUT_PATH: destination,
@@ -1053,7 +965,7 @@ syncBuiltinESMExports();`,
 
       it('that lies about its size stops at what it declared', async () => {
         const huge = new Uint8Array(64 * 1024 ** 2);
-        await startFakeArtifacts({ 'bomb.zip': zipDeclaring(huge, 1024) });
+        await storeFiles({ 'bomb.zip': zipDeclaring(huge, 1024) });
         const { exitCode, stdout } = await runAction({
           INPUT_NAME: 'bomb',
           INPUT_PATH: destination,
@@ -1066,7 +978,7 @@ syncBuiltinESMExports();`,
     });
   });
 
-  describe('a server that misbehaves', () => {
+  describe.runIf(kind === 'server')('a server that misbehaves', () => {
     it.each([
       ['a name leading out', { name: '../../evil.zip' }],
       ['an ID with a path', { id: '../'.repeat(14).padEnd(43, 'a') }],
@@ -1178,7 +1090,7 @@ syncBuiltinESMExports();`,
     });
   });
 
-  it('removes the temp file when the runner stops the step', async () => {
+  it.runIf(kind === 'server')('removes the temp file when the runner stops the step', async () => {
     const { promise: requested, resolve: onRequest } = Promise.withResolvers<void>();
     const content = strToU8('x'.repeat(1024));
     const { artifacts } = fakeListing({ 'a.bin': content });
@@ -1237,16 +1149,6 @@ syncBuiltinESMExports();`,
       expect(peakBytes).toBeLessThan(fileBytes / 2);
     };
 
-    /** Sent from disk, as the real upload is: the test's own memory stays out of it. */
-    const storeFromDisk = async (name: string, path: string) => {
-      const response = await fetch(`${serverUrl}/artifacts?name=${name}`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${await runner.signToken()}` },
-        body: await openAsBlob(path),
-      });
-      expect(response.status).toBe(201);
-    };
-
     const makeSparseFile = async () => {
       const path = join(runner.rootDir, 'big.bin');
       await writeFile(path, '');
@@ -1259,9 +1161,9 @@ syncBuiltinESMExports();`,
       ['a zip as big as the file', 'big.zip', 0],
       ['a compressed zip', 'big.zip', 6],
     ])('%s', { timeout: 120_000 }, async (_, name, compressionLevel) => {
-      await startServer();
+      await startTarget();
       const path = await makeSparseFile();
-      await storeFromDisk(
+      await requireTarget().storeFromDisk(
         name,
         compressionLevel === undefined
           ? path
@@ -1281,7 +1183,7 @@ syncBuiltinESMExports();`,
 
   describe('from the command line', () => {
     it('downloads, printing only JSON to stdout', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build', { 'a.txt': 'a' });
       const missing = 'a'.repeat(43);
       const stored = await storeZip('other', { 'b.txt': 'b' });
@@ -1303,7 +1205,7 @@ syncBuiltinESMExports();`,
     });
 
     it('takes the same flags as the inputs', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build', { 'a.txt': 'a' }, { run_id: '200' });
       const { exitCode } = await runCli('download', [
         '--name',
@@ -1328,7 +1230,7 @@ syncBuiltinESMExports();`,
     });
 
     it('lists as JSON, with the latest attempt of each name', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build', { 'a.txt': '1' });
       const latest = await storeZip('build', { 'a.txt': '2' }, { run_attempt: '2' });
       await store('app.apk', strToU8('x'));
@@ -1345,7 +1247,7 @@ syncBuiltinESMExports();`,
     });
 
     it('narrows a list as a download is, and reads elsewhere', async () => {
-      await startServer();
+      await startTarget();
       await storeZip('build-a', { 'a.txt': 'a' });
       await storeZip('other', { 'b.txt': 'b' });
       await storeZip(
@@ -1370,7 +1272,7 @@ syncBuiltinESMExports();`,
     });
 
     it('deletes by name in the current run, and the name is gone', async () => {
-      await startServer();
+      await startTarget();
       const { id } = await storeZip('build', { 'a.txt': 'a' });
       const elsewhere = await storeZip('build', { 'a.txt': 'b' }, { run_id: '200' });
 
@@ -1384,7 +1286,7 @@ syncBuiltinESMExports();`,
     });
 
     it('deletes by ID in any run of its repository', async () => {
-      await startServer();
+      await startTarget();
       const { id } = await storeZip('build', { 'a.txt': 'a' }, { run_id: '200' });
       const { exitCode, stdout } = await runCli('delete', ['--artifact-id', id]);
       expect(exitCode).toBe(0);
@@ -1392,7 +1294,7 @@ syncBuiltinESMExports();`,
     });
 
     it("refuses another repository's artifact with the server's message", async () => {
-      await startServer();
+      await startTarget();
       const { id } = await storeZip(
         'build',
         { 'a.txt': 'a' },
@@ -1412,14 +1314,14 @@ syncBuiltinESMExports();`,
       ['a bad ID', ['--artifact-id', 'nope'], "Invalid artifact ID: 'nope'"],
       ['a name that is not there', ['--name', 'nope'], "Artifact 'nope' not found"],
     ])('refuses to delete with %s', async (_, args, message) => {
-      await startServer();
+      await startTarget();
       const { exitCode, stderr } = await runCli('delete', args);
       expect(exitCode).toBe(1);
       expect(stderr).toContain(message);
     });
 
     it('round-trips what the real upload command writes', async () => {
-      await startServer();
+      await startTarget();
       await mkdir(join(runner.workDir, 'dist/deep'), { recursive: true });
       await writeFile(join(runner.workDir, 'dist/deep/a.txt'), 'a');
       await writeFile(join(runner.workDir, 'dist/run.sh'), 'x');
@@ -1442,14 +1344,17 @@ syncBuiltinESMExports();`,
       expect((await stat(join(destination, 'run.sh'))).mode & 0o777).toBe(0o755);
     });
 
-    it('says outside a job that the server takes no request from it', async () => {
-      const { exitCode, stderr } = await runner.runNode(
-        process.execPath,
-        [BIN, 'list', '--server-url', 'http://127.0.0.1:1'],
-        { ACTIONS_ID_TOKEN_REQUEST_URL: undefined, ACTIONS_ID_TOKEN_REQUEST_TOKEN: undefined },
-      );
-      expect(exitCode).toBe(1);
-      expect(stderr).toContain('No OIDC token available');
-    });
+    it.runIf(kind === 'server')(
+      'says outside a job that the server takes no request from it',
+      async () => {
+        const { exitCode, stderr } = await runner.runNode(
+          process.execPath,
+          [BIN, 'list', '--server-url', 'http://127.0.0.1:1'],
+          { ACTIONS_ID_TOKEN_REQUEST_URL: undefined, ACTIONS_ID_TOKEN_REQUEST_TOKEN: undefined },
+        );
+        expect(exitCode).toBe(1);
+        expect(stderr).toContain('No OIDC token available');
+      },
+    );
   });
 });

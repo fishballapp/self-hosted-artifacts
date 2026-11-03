@@ -17,10 +17,11 @@ describe('self-hosted-artifacts', () => {
     [['serve'], 'Missing required flag: --config'],
     [['serve', '--nope'], 'Unrecognized flag: --nope'],
     [['serve', '--config'], '--config'],
-    [['upload', '--path', 'a'], 'Missing required flag: --server-url'],
-    [['download'], 'Missing required flag: --server-url'],
-    [['list'], 'Missing required flag: --server-url'],
-    [['delete'], 'Missing required flag: --server-url'],
+    [['upload', '--path', 'a'], 'Give exactly one of server-url and s3-bucket'],
+    [['download'], 'Give exactly one of server-url and s3-bucket'],
+    [['list'], 'Give exactly one of server-url and s3-bucket'],
+    [['delete'], 'Give exactly one of server-url and s3-bucket'],
+    [['merge'], 'Give exactly one of server-url and s3-bucket'],
   ])('prints the error and fails for arguments %j', async (args, message) => {
     await expect(run(args)).rejects.toMatchObject({
       code: 1,

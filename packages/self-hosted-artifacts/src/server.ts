@@ -17,8 +17,11 @@ import { describeError, shortToken } from './log.ts';
 import { TokenVerifier } from './oidc.ts';
 import {
   ARTIFACT_ID,
+  BAD_RETENTION,
   FILE_NAME,
   FILE_NAME_MESSAGE,
+  NAME_TAKEN,
+  OTHER_REPOSITORY,
   REPOSITORY,
   RUN_ID,
   SHA_256,
@@ -29,8 +32,6 @@ const ARTIFACTS_URL = /^\/artifacts(?:\?(.*))?$/;
 const ARTIFACT_URL = /^\/artifacts\/([A-Za-z0-9_-]{43})$/;
 const DOWNLOAD_URL = /^\/([A-Za-z0-9_-]{43})\/([^/?#]+)$/;
 const UNREAD_BODY_GRACE = Duration.seconds(5);
-const NAME_TAKEN =
-  'An artifact with this name already exists on the workflow run. Set overwrite to replace it';
 // A client that stops reading or sending gets cut off, so a stalled download can't keep an expired
 // file's blocks on disk after its sweep. Long enough for a phone to return from the background. With
 // a write pending, Node restarts this timer, so a stalled download goes at two or three times this.
@@ -164,7 +165,7 @@ export const ArtifactRoutes = Layer.unwrap(
       }
       const retentionDays = parseRetentionDays(params.get('retention-days'), config);
       if (retentionDays === undefined) {
-        return yield* refuseAndLog(request, 400, 'retention-days must be a positive integer');
+        return yield* refuseAndLog(request, 400, BAD_RETENTION);
       }
       const digest = params.get('digest') ?? undefined;
       if (digest !== undefined && !SHA_256.test(digest)) {
@@ -344,8 +345,7 @@ export const ArtifactRoutes = Layer.unwrap(
       const removed = yield* store.remove({ id, repositoryId: scope.repositoryId }).pipe(
         Effect.catchTags({
           ArtifactNotFoundError: () => Effect.fail(refusal(404, 'Not found')),
-          OtherRepositoryError: () =>
-            Effect.fail(refusal(403, 'A job can only delete artifacts of its own repository')),
+          OtherRepositoryError: () => Effect.fail(refusal(403, OTHER_REPOSITORY)),
         }),
       );
       yield* Effect.logInfo('delete').pipe(

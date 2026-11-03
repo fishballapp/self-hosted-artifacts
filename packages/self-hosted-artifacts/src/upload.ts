@@ -6,14 +6,9 @@ import * as Effect from 'effect/Effect';
 import * as FileSystem from 'effect/FileSystem';
 import * as Schema from 'effect/Schema';
 import * as Stream from 'effect/Stream';
-import {
-  ClientError,
-  DEFAULT_AUDIENCE,
-  makeRunnerTempFile,
-  parseBooleanInput,
-} from './client-support.ts';
+import { ClientError, makeRunnerTempFile, parseBooleanInput } from './client-support.ts';
 import { findFilesToUpload } from './search.ts';
-import { connectToServer, sendToServer } from './server-client.ts';
+import { ArtifactTarget } from './target.ts';
 import { zipFiles } from './zip.ts';
 
 const openFile = Effect.fnUntraced(function* ({ path, name }: { path: string; name: string }) {
@@ -30,7 +25,7 @@ const openFile = Effect.fnUntraced(function* ({ path, name }: { path: string; na
   return file;
 });
 
-/** The SHA-256 of what is sent, streamed. In the client, so a target with no server gets it too. */
+/** The SHA-256 of what is sent, streamed, which every target checks it against. */
 const digestFile = Effect.fnUntraced(function* (path: string) {
   const fs = yield* FileSystem.FileSystem;
   const hash = createHash('sha256');
@@ -50,7 +45,6 @@ export const UPLOAD_DEFAULTS = {
   includeHiddenFiles: 'false',
   archive: 'true',
   overwrite: 'false',
-  audience: DEFAULT_AUDIENCE,
 } as const;
 
 const IfNoFilesFoundSchema = Schema.Literals(['warn', 'error', 'ignore']);
@@ -102,7 +96,6 @@ const zipToTempFile = Effect.fnUntraced(function* ({
 
 export const upload = Effect.fn('upload.upload')(
   function* (inputs: {
-    serverUrl: string;
     path: string;
     name: string;
     ifNoFilesFound: string;
@@ -111,7 +104,6 @@ export const upload = Effect.fn('upload.upload')(
     includeHiddenFiles: string;
     archive: string;
     overwrite: string;
-    audience: string;
     /** Stamped on every file in the zip, for a caller whose files' own times mean nothing. */
     zipModifiedAt?: Date;
   }) {
@@ -145,11 +137,9 @@ export const upload = Effect.fn('upload.upload')(
       });
     }
 
-    // Before the zip, so a job without the permission finds out without waiting for it.
-    const connection = yield* connectToServer({
-      serverUrl: inputs.serverUrl,
-      audience: inputs.audience,
-    });
+    // Before the zip, so a job that can't use the target finds out without waiting for it.
+    const target = yield* ArtifactTarget;
+    yield* target.ready;
     const filePath = archive
       ? yield* zipToTempFile({
           files,
@@ -161,14 +151,7 @@ export const upload = Effect.fn('upload.upload')(
     const name = archive ? `${inputs.name}.zip` : basename(firstFile);
     const file = yield* openFile({ path: filePath, name });
     const digest = yield* digestFile(filePath);
-    const stored = yield* sendToServer({
-      connection,
-      file,
-      name,
-      digest,
-      overwrite,
-      retentionDays,
-    });
+    const stored = yield* target.send({ file, name, digest, overwrite, retentionDays });
     return { _tag: 'Uploaded', name, size: file.size, digest, ...stored } as const;
   },
   // Holds the zip until the last retry is over, and removes it however the upload ends.

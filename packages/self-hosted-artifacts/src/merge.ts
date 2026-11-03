@@ -1,21 +1,17 @@
 import * as Console from 'effect/Console';
 import * as Effect from 'effect/Effect';
 import { findArtifacts, type Warn } from './artifacts.ts';
-import {
-  ClientError,
-  DEFAULT_AUDIENCE,
-  makeRunnerTempDirectory,
-  parseBooleanInput,
-} from './client-support.ts';
+import { ClientError, makeRunnerTempDirectory, parseBooleanInput } from './client-support.ts';
 import { placeArtifacts } from './download.ts';
 import { FILE_NAME, FILE_NAME_MESSAGE } from './protocol.ts';
 import { globEscape } from './search.ts';
-import { connectToServer, deleteOnServer, type ListedArtifact } from './server-client.ts';
+import { ArtifactTarget } from './target.ts';
+import type { ListedArtifact } from './transport.ts';
 import { parseCompressionLevel, parseRetentionDays, UPLOAD_DEFAULTS, upload } from './upload.ts';
 
 const PARALLEL_DELETES = 5;
 // A file unpacked here has the time it was unpacked, which would make the same merge a different zip
-// each time. The earliest time a zip can hold, so a retried merge comes out the same and the server
+// each time. The earliest time a zip can hold, so a retried merge comes out the same and the target
 // recognises it.
 const MERGED_FILES_MODIFIED_AT = new Date(1980, 0, 1);
 
@@ -28,7 +24,6 @@ export const MERGE_DEFAULTS = {
   compressionLevel: UPLOAD_DEFAULTS.compressionLevel,
   deleteMerged: 'false',
   includeHiddenFiles: UPLOAD_DEFAULTS.includeHiddenFiles,
-  audience: DEFAULT_AUDIENCE,
 } as const;
 
 /** What the merge stored, and which artifacts went into it. */
@@ -50,7 +45,6 @@ export type Merged = {
  */
 export const merge = Effect.fn('merge.merge')(
   function* <E, R>(inputs: {
-    serverUrl: string;
     name: string;
     pattern: string;
     separateDirectories: string;
@@ -58,7 +52,6 @@ export const merge = Effect.fn('merge.merge')(
     compressionLevel: string;
     deleteMerged: string;
     includeHiddenFiles: string;
-    audience: string;
     warn: Warn;
     onMerged: (merged: Merged) => Effect.Effect<void, E, R>;
   }) {
@@ -75,9 +68,9 @@ export const merge = Effect.fn('merge.merge')(
     const storedName = `${name}.zip`;
     if (!FILE_NAME.test(storedName)) return yield* new ClientError({ message: FILE_NAME_MESSAGE });
 
-    const connection = yield* connectToServer(inputs);
+    const target = yield* ArtifactTarget;
+    yield* target.ready;
     const listed = yield* findArtifacts({
-      connection,
       name: '',
       artifactIds: '',
       pattern,
@@ -96,7 +89,6 @@ export const merge = Effect.fn('merge.merge')(
 
     const directory = yield* makeRunnerTempDirectory();
     const placed = yield* placeArtifacts({
-      connection,
       artifacts,
       root: directory,
       isOneFolder: !separateDirectories,
@@ -113,7 +105,6 @@ export const merge = Effect.fn('merge.merge')(
     }
 
     const uploaded = yield* upload({
-      serverUrl: inputs.serverUrl,
       // The folder is the path, whatever it holds that a glob would read.
       path: globEscape(directory),
       name,
@@ -123,7 +114,6 @@ export const merge = Effect.fn('merge.merge')(
       includeHiddenFiles: inputs.includeHiddenFiles,
       archive: 'true',
       overwrite: 'false',
-      audience: inputs.audience,
       zipModifiedAt: MERGED_FILES_MODIFIED_AT,
     });
     if (uploaded._tag === 'NoFilesFound') {
@@ -148,9 +138,9 @@ export const merge = Effect.fn('merge.merge')(
     const [, failed] = yield* Effect.partition(
       artifacts,
       artifact =>
-        deleteOnServer({ connection, id: artifact.id }).pipe(
-          Effect.mapError(({ message }) => `${artifact.name} (${message})`),
-        ),
+        target
+          .remove(artifact.id)
+          .pipe(Effect.mapError(({ message }) => `${artifact.name} (${message})`)),
       { concurrency: PARALLEL_DELETES },
     );
     if (failed.length > 0) {
