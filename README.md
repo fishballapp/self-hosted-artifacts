@@ -1,11 +1,12 @@
 # self-hosted-artifacts
 
 **Keep the builds from your private GitHub repositories on a disk you own.** A small file server,
-and GitHub Actions that upload to it and download from it.
+and GitHub Actions that upload to it, download from it and merge what's on it.
 
 GitHub's artifacts cap private storage at 500 MB on the free plan, which a few app builds fill, and
 `actions/upload-artifact` can't target your own server. These actions take the same inputs by the
-same rules as `actions/upload-artifact` and `actions/download-artifact`, so moving to them means
+same rules as `actions/upload-artifact`, `actions/upload-artifact/merge` and
+`actions/download-artifact`, so moving to them means
 changing the `uses:` lines and adding `server-url` and `id-token: write`. Public repositories'
 artifacts are free, so this is for private repositories only: the server refuses requests from
 anything else.
@@ -85,7 +86,7 @@ jobs:
       - uses: actions/checkout@v6
       - run: ./build.sh
       - id: upload
-        uses: fishballapp/self-hosted-artifacts/upload@v0.4.0
+        uses: fishballapp/self-hosted-artifacts/upload@v0.5.0
         with:
           server-url: http://192.0.2.10:8420
           path: dist/
@@ -96,7 +97,7 @@ That uploads what's in `dist/` as one zip, `artifact.zip`. To upload one file as
 link ends in its own name, set `archive: false`:
 
 ```yaml
-      - uses: fishballapp/self-hosted-artifacts/upload@v0.4.0
+      - uses: fishballapp/self-hosted-artifacts/upload@v0.5.0
         with:
           server-url: http://192.0.2.10:8420
           path: dist/app.apk
@@ -222,7 +223,7 @@ jobs:
       id-token: write # to prove to the server which repository this is
     steps:
       - id: download
-        uses: fishballapp/self-hosted-artifacts/download@v0.4.0
+        uses: fishballapp/self-hosted-artifacts/download@v0.5.0
         with:
           server-url: http://192.0.2.10:8420
           name: build
@@ -303,6 +304,105 @@ Inputs, layout and messages match v8. What's left differs because the files come
 | Symlinks in a zip | Written as a file holding the target | Refused, with nothing written |
 | A zip that declares more than the disk has | Fails when the disk fills | Fails before writing anything |
 
+## Merge
+
+Combines the artifacts of a run into one, as `actions/upload-artifact/merge` does. It downloads the
+matching artifacts, uploads what they hold as one, and can delete them once that is stored.
+
+```yaml
+jobs:
+  merge:
+    needs: build
+    runs-on: self-hosted
+    permissions:
+      id-token: write # to prove to the server which repository this is
+    steps:
+      - id: merge
+        uses: fishballapp/self-hosted-artifacts/upload/merge@v0.5.0
+        with:
+          server-url: http://192.0.2.10:8420
+          name: all-builds
+          pattern: build-*
+          delete-merged: true
+      - run: curl -fO "${{ steps.merge.outputs.artifact-url }}"
+```
+
+With no inputs but `server-url`, every artifact of the run becomes one called `merged-artifacts`, which
+is stored as `merged-artifacts.zip`.
+
+| Input | Default | Meaning |
+| --- | --- | --- |
+| `server-url` | required | The server's base URL, as the runner reaches it. Redirects are not followed. |
+| `name` | `merged-artifacts` | The name of the merged artifact, stored as `<name>.zip`. It must pass the server's [name rule](#http-api) with `.zip` added. |
+| `pattern` | `*` | A glob the artifacts' names must match, without their `.zip`, as in [the download action](#download). |
+| `separate-directories` | `false` | Whether each artifact goes in a folder of its name in the merged zip, rather than all in the root. |
+| `retention-days` | `0` | Days to keep the merged artifact. `0` means the server's default. The server caps it. |
+| `compression-level` | `6` | Zlib's level for the merged zip, from `0` (none) to `9` (best). |
+| `delete-merged` | `false` | Whether to delete the merged artifacts once the merged one is stored. |
+| `include-hidden-files` | `false` | Whether the merged zip holds files and folders whose names start with a `.`. |
+| `audience` | `self-hosted-artifacts` | The OIDC audience to request. |
+
+| Output | Meaning |
+| --- | --- |
+| `artifact-id` | The merged artifact's ID, which is also the token in its links. |
+| `artifact-url` | Its first link. |
+| `artifact-digest` | The SHA-256 of its zip, in hex. |
+| `links` | Every link, by label, as one-line JSON. |
+| `expires-at` | When it expires, as an ISO instant. |
+
+- **It reads this run only,** each name's latest attempt, as `actions/download-artifact` lists it.
+  Nothing matching the `pattern` fails the step, with `No artifacts found matching pattern '<pattern>'`.
+- **The merged artifact is never one of its own inputs.** A re-run's `*` would otherwise take in the
+  attempt before's `<name>.zip`, and `delete-merged` would delete it. Another artifact of any other
+  name that the pattern matches is merged as usual.
+- **Layout:** with `separate-directories: false`, they unpack one at a time in name order into one
+  folder, so the last wins a path they both hold. With `true`, each goes in a folder of its name, even
+  when only one matches. A file uploaded with `archive: false` is a file `app.apk` in the root, or in
+  `app.apk/app.apk`. Then `include-hidden-files` decides what the new zip takes, so with `false`, a
+  hidden file in an artifact is left out of the merged one.
+- **Each artifact's digest is checked** as [the download action's](#download) `digest-mismatch: error`
+  does. A mismatch fails the step with nothing uploaded and nothing deleted.
+- **Originals go last.** A failure at any step before the merged artifact is stored, a refused upload
+  included, leaves every one in place. Then each is deleted, five at a time. If any delete fails, the
+  step fails naming each one, though the merged artifact stays and the outputs are already set.
+  Deleting is checked against the token's repository, as [the `delete` command](#from-the-command-line)
+  is.
+- **Merging again** is [a name in a run attempt](#one-name-one-artifact) like any other. A re-run holds
+  `<name>.zip` afresh, and leaves the attempt before's alone. Within one attempt, the same files merge
+  to the same zip, since every file in it is stamped 1980-01-01, so a step that runs twice, or is
+  retried after a delete failed, succeeds with the artifact already there and goes on to delete. Other
+  content under the name fails the step as an upload would. If a delete failed part-way, the rest are
+  fewer, so merging again fails this way: delete what's left with `delete`.
+- **Nothing is held in memory,** but the runner's temp folder holds every artifact unpacked, then the
+  merged zip, and removes them however the step ends. `RUNNER_TEMP` needs room for both. The merged zip
+  counts as one file towards [the limits](#limits).
+
+### Compared with `actions/upload-artifact/merge`
+
+Inputs, outputs, defaults and messages match v7. What's left differs because the files go to your
+server:
+
+| | `actions/upload-artifact/merge` | This action |
+| --- | --- | --- |
+| **Inputs** | | |
+| `name`, `pattern`, `separate-directories`, `retention-days`, `compression-level`, `delete-merged`, `include-hidden-files` | | The same names and defaults |
+| `name` | Without `"`, `:`, `<`, `>`, `\|`, `*`, `?`, `\`, `/` | Stored as `<name>.zip`, and stricter: see [Upload](#upload) |
+| `server-url`, `audience` | Not applicable | Where to read and write, and the OIDC audience |
+| **Outputs** | | |
+| `artifact-id`, `artifact-url`, `artifact-digest` | A number, a URL that needs a GitHub login, SHA-256 in hex | A string, a link anyone can use, and the same digest |
+| `links`, `expires-at` | No | Every link by label, and when it expires |
+| **Behaviour** | | |
+| Which artifacts | The pattern alone | The pattern, less the merged artifact's own name |
+| Downloads | Five at once, so a path two artifacts hold goes to whichever finished last | One at a time, in name order |
+| Digest of a download | Not checked | Checked, and a mismatch fails the step with nothing uploaded |
+| Deleting | By name, all at once, after the upload | By ID, five at a time, after the upload, and each is tried |
+| Where it unpacks | A folder in the working directory | A folder in `RUNNER_TEMP`, removed however the step ends |
+| Merging again in a run attempt | Fails | The same files succeed; other content fails |
+| A bad input | Fails once the rest has run | Fails before anything is downloaded |
+| Which repositories | Any | Private ones of one owner |
+| Runners | Any | Linux and macOS |
+| Job permission | None to add | `id-token: write` |
+
 ## From the command line
 
 The actions wrap commands that take the same inputs as flags, values included, and print the result
@@ -326,6 +426,11 @@ npx self-hosted-artifacts list --server-url http://192.0.2.10:8420 --pattern 'bu
 # One artifact of this job's repository: by name in this run, or by ID in any run.
 npx self-hosted-artifacts delete --server-url http://192.0.2.10:8420 --name build
 npx self-hosted-artifacts delete --server-url http://192.0.2.10:8420 --artifact-id "$ID"
+
+# As the merge action. It prints the merged artifact, and what went into it, before it deletes.
+npx self-hosted-artifacts merge \
+  --server-url http://192.0.2.10:8420 \
+  --pattern 'build-*' --name all-builds --delete-merged true
 ```
 
 With nothing to upload, `upload` writes the message to stderr and prints nothing to stdout, and exits
@@ -336,7 +441,7 @@ With nothing to upload, `upload` writes the message to stderr and prints nothing
 The server and the action are released together under one version, which follows
 [semantic versioning](https://semver.org). Pin the action to a version tag, as above.
 
-Use the same minor version of both, so action `v0.4.x` with server `0.4.x`. A new minor version may
+Use the same minor version of both, so action `v0.5.x` with server `0.5.x`. A new minor version may
 change what they expect of each other.
 
 ## HTTP API
@@ -439,7 +544,7 @@ replaced.
   the token's claims, and no request can name another scope.
 - **Who can delete an artifact:** only a job of the same repository, by the `repository_id` claim, in
   any run. Another repository of the owner gets a `403`, so a read across repositories can't become a
-  write.
+  write. A merge deletes only what it lists in its own run, by those rules.
 - **Who can download:** anyone who has the link and can reach the server. There is no login: a link
   holds 256 random bits, so it can't be guessed, and it is meant to be shared. What keeps a file
   private is who can reach the server, so keep it on a network you trust. Plain `http` is readable by
@@ -472,8 +577,9 @@ replaced.
 
 ## Not supported
 
-S3 or other storage, a web UI, a merge action, `Range` requests, Windows runners, resuming a download,
-and a list of a run's earlier attempts where a later one holds the name.
+S3 or other storage, a web UI, `Range` requests, Windows runners, resuming a download, merging the
+artifacts of another run or repository, and a list of a run's earlier attempts where a later one holds
+the name.
 
 ## License
 

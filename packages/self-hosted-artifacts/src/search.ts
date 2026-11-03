@@ -51,7 +51,7 @@ const literalOf = (segment: string): string | undefined => {
   return literals.includes(undefined) ? undefined : literals.join('');
 };
 
-const globEscape = (path: string) =>
+export const globEscape = (path: string) =>
   path
     .replaceAll('\\', '\\\\')
     .replaceAll(/\[(?=[^/]+\])/gu, '[[]')

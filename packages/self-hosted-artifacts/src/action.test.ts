@@ -20,7 +20,7 @@ import * as Layer from 'effect/Layer';
 import { unzipSync } from 'fflate';
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { UPLOAD_ACTION } from '../tsdown.config.ts';
-import { buildBundle, PEAK_REPORTER } from './action-harness.ts';
+import { buildBundle, exitCodeOf, PEAK_REPORTER } from './action-harness.ts';
 import { type Config, ServerConfig } from './config.ts';
 import { TokenVerifier } from './oidc.ts';
 import { startTestServer, verifierAnswering } from './test-support.ts';
@@ -196,7 +196,7 @@ describe('the upload action', () => {
         },
         (error, stdout, stderr) => {
           resolve({
-            exitCode: error === null ? 0 : Number(error.code),
+            exitCode: exitCodeOf(error),
             stdout,
             stderr,
           });
@@ -329,7 +329,7 @@ describe('the upload action', () => {
           },
         },
         (error, stdout, stderr) => {
-          resolve({ exitCode: error === null ? 0 : Number(error.code), stdout, stderr });
+          resolve({ exitCode: exitCodeOf(error), stdout, stderr });
         },
       );
     });

@@ -22,18 +22,34 @@ export const parseBooleanInput = Effect.fnUntraced(function* (name: string, valu
   return value.toLowerCase() === 'true';
 });
 
+const runnerTemp = Config.String('RUNNER_TEMP').pipe(
+  Config.withDefault(undefined),
+  Effect.catchTag('ConfigError', Effect.die),
+);
+
 /** A temp file in `RUNNER_TEMP`, removed with the surrounding scope however the step ends. */
 export const makeRunnerTempFile = Effect.fnUntraced(function* (suffix: string) {
   const fs = yield* FileSystem.FileSystem;
-  const directory = yield* Config.String('RUNNER_TEMP').pipe(
-    Config.withDefault(undefined),
-    Effect.catchTag('ConfigError', Effect.die),
-  );
+  const directory = yield* runnerTemp;
   return yield* fs.makeTempFileScoped({ directory, prefix: 'self-hosted-artifacts-', suffix }).pipe(
     Effect.mapError(
       () =>
         new ClientError({
           message: `Can't create a temporary file in ${directory ?? 'the system temp folder'}`,
+        }),
+    ),
+  );
+});
+
+/** A temp folder in `RUNNER_TEMP`, removed with what's in it as the surrounding scope ends. */
+export const makeRunnerTempDirectory = Effect.fnUntraced(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const directory = yield* runnerTemp;
+  return yield* fs.makeTempDirectoryScoped({ directory, prefix: 'self-hosted-artifacts-' }).pipe(
+    Effect.mapError(
+      () =>
+        new ClientError({
+          message: `Can't create a temporary folder in ${directory ?? 'the system temp folder'}`,
         }),
     ),
   );

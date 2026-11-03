@@ -41,4 +41,4 @@ jobs:
       - run: pnpm build
       - run: node packages/self-hosted-artifacts/dist/bin.js --version
       # The eject builds these files on another machine, and a release tag finds its commit by tree.
-      - run: git diff --exit-code -- upload/dist download/dist
+      - run: git diff --exit-code -- upload/dist upload/merge/dist download/dist

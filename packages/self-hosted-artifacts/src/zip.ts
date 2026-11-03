@@ -47,16 +47,21 @@ const describeAbortableCause = (cause: unknown) => {
   return Predicate.isError(reason) ? reason.message : String(reason);
 };
 
-/** Streams `files` into a zip at `target`, each named by its path below `rootDirectory`. */
+/**
+ * Streams `files` into a zip at `target`, each named by its path below `rootDirectory`. Each entry
+ * has its file's modified time, or `modifiedAt` when given, which makes the same files the same zip.
+ */
 export const zipFiles = Effect.fn('zip.zipFiles')(function* ({
   files,
   rootDirectory,
   compressionLevel,
+  modifiedAt,
   target,
 }: {
   files: readonly string[];
   rootDirectory: string;
   compressionLevel: number;
+  modifiedAt?: Date;
   target: string;
 }) {
   const entries = files.map(file => ({ file, name: relative(rootDirectory, file) }));
@@ -66,7 +71,12 @@ export const zipFiles = Effect.fn('zip.zipFiles')(function* ({
       const zip = new ZipFile();
       const unreadable = new AbortController();
       zip.on('error', cause => unreadable.abort(cause));
-      for (const { file, name } of entries) zip.addFile(file, name, { compressionLevel });
+      for (const { file, name } of entries) {
+        zip.addFile(file, name, {
+          compressionLevel,
+          ...(modifiedAt === undefined ? {} : { mtime: modifiedAt }),
+        });
+      }
       zip.end();
       return pipeline(zip.outputStream, createWriteStream(target), {
         signal: AbortSignal.any([signal, unreadable.signal]),

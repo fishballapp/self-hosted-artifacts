@@ -1,0 +1,53 @@
+name: Self-hosted artifacts merge
+description: Merge a run's artifacts on your own artifact server into one, as actions/upload-artifact/merge does on GitHub.
+inputs:
+  server-url:
+    description: Base URL of the server, as the runner reaches it.
+    required: true
+  name:
+    description: The name of the artifact that the artifacts will be merged into, stored as `<name>.zip`.
+    default: merged-artifacts
+  pattern:
+    description: A glob pattern matching the artifact names that should be merged.
+    default: '*'
+  separate-directories:
+    description: >
+      When multiple artifacts are matched, this changes the behavior of how they are merged in the
+      archive. If true, the matched artifacts will be extracted into individual named directories
+      within the specified path. If false, the matched artifacts will combined in the same directory.
+    default: 'false'
+  retention-days:
+    description: Days to keep the merged artifact. 0 means the server's default; the server caps it.
+    default: '0'
+  compression-level:
+    description: >
+      The level of compression for Zlib to be applied to the merged archive, from 0 (none) to 9
+      (best). For large files that are not easily compressed, 0 is significantly faster.
+    default: '6'
+  delete-merged:
+    description: >
+      If true, the artifacts that were merged will be deleted, once the merged artifact is stored.
+      If false, the artifacts will still exist.
+    default: 'false'
+  include-hidden-files:
+    description: >
+      If true, hidden files will be included in the merged artifact. If false, hidden files will be
+      excluded from the merged artifact.
+    default: 'false'
+  audience:
+    description: The OIDC audience to request, matching the server's oidcAudience.
+    default: self-hosted-artifacts
+outputs:
+  artifact-id:
+    description: The merged artifact's ID, which is also its download token.
+  artifact-url:
+    description: The first download link of the merged artifact.
+  artifact-digest:
+    description: The SHA-256 of the merged artifact's zip, in hex.
+  links:
+    description: Every download link, by label, as one-line JSON.
+  expires-at:
+    description: When the server will delete the merged artifact, as an ISO instant.
+runs:
+  using: node24
+  main: dist/action.mjs

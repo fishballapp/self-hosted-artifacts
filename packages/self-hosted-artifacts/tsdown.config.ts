@@ -26,6 +26,13 @@ export const DOWNLOAD_ACTION: UserConfig = {
   outDir: '../../download/dist',
 };
 
+/** What the merge action runs, on the same terms. */
+export const MERGE_ACTION: UserConfig = {
+  ...UPLOAD_ACTION,
+  entry: { action: 'src/merge-action.ts' },
+  outDir: '../../upload/merge/dist',
+};
+
 // Everything is bundled (effect and @effect/platform-node are devDependencies): the published CLI
 // installs with zero dependencies, since platform-node's `redis` peer would otherwise land on every
 // user's machine.
@@ -37,4 +44,5 @@ export default defineConfig([
   },
   UPLOAD_ACTION,
   DOWNLOAD_ACTION,
+  MERGE_ACTION,
 ]);

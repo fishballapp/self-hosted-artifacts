@@ -15,7 +15,14 @@ import * as Stream from 'effect/Stream';
 import { type Config, ServerConfig } from './config.ts';
 import { describeError, shortToken } from './log.ts';
 import { TokenVerifier } from './oidc.ts';
-import { ARTIFACT_ID, FILE_NAME, REPOSITORY, RUN_ID, SHA_256 } from './protocol.ts';
+import {
+  ARTIFACT_ID,
+  FILE_NAME,
+  FILE_NAME_MESSAGE,
+  REPOSITORY,
+  RUN_ID,
+  SHA_256,
+} from './protocol.ts';
 import { type ArtifactMeta, Store, UPLOAD_TIMEOUT, UploadFailedError } from './store.ts';
 
 const ARTIFACTS_URL = /^\/artifacts(?:\?(.*))?$/;
@@ -153,11 +160,7 @@ export const ArtifactRoutes = Layer.unwrap(
       const params = new URLSearchParams(uploadMatch[1] ?? '');
       const name = params.get('name');
       if (name === null || !FILE_NAME.test(name)) {
-        return yield* refuseAndLog(
-          request,
-          400,
-          'name must match [A-Za-z0-9][A-Za-z0-9._-]{0,254}',
-        );
+        return yield* refuseAndLog(request, 400, FILE_NAME_MESSAGE);
       }
       const retentionDays = parseRetentionDays(params.get('retention-days'), config);
       if (retentionDays === undefined) {

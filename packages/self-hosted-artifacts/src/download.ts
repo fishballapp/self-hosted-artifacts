@@ -39,7 +39,7 @@ export const DOWNLOAD_DEFAULTS = {
 } as const;
 
 const DigestMismatchSchema = Schema.Literals(['ignore', 'info', 'warn', 'error']);
-type DigestMismatch = typeof DigestMismatchSchema.Type;
+export type DigestMismatch = typeof DigestMismatchSchema.Type;
 
 const parseDigestMismatch = Effect.fnUntraced(function* (value: string) {
   if (!Schema.is(DigestMismatchSchema)(value)) {
@@ -128,6 +128,61 @@ const fetchAndPlace = Effect.fnUntraced(
   Effect.scoped,
 );
 
+/**
+ * Fetches each artifact below `root`, into a folder of its name or all into `root` itself, and says
+ * which didn't match the digest the server stored.
+ */
+export const placeArtifacts = Effect.fnUntraced(function* ({
+  connection,
+  artifacts,
+  root,
+  isOneFolder,
+  skipDecompress,
+  digestMismatch,
+  warn,
+}: {
+  connection: ServerConnection;
+  artifacts: readonly ListedArtifact[];
+  root: string;
+  isOneFolder: boolean;
+  skipDecompress: boolean;
+  digestMismatch: DigestMismatch;
+  warn: Warn;
+}) {
+  if (artifacts.length > 0) {
+    yield* Console.error('Preparing to download the following artifacts:');
+    yield* Effect.forEach(
+      artifacts,
+      ({ name, id, size, digest }) =>
+        Console.error(`- ${name} (ID: ${id}, Size: ${size}, Expected Digest: ${digest})`),
+      { concurrency: 1, discard: true },
+    );
+  }
+
+  // By lower case, for a disk that folds it: `Build.zip` and `build.zip` are two artifacts, one folder.
+  const isSharingFolders =
+    isOneFolder ||
+    new Set(artifacts.map(artifact => artifactNameOf(artifact).toLowerCase())).size <
+      artifacts.length;
+  return yield* Effect.forEach(
+    artifacts,
+    Effect.fnUntraced(function* (artifact) {
+      const { isMismatch } = yield* fetchAndPlace({
+        connection,
+        artifact,
+        root,
+        subdirectory: isOneFolder ? [] : [artifactNameOf(artifact)],
+        skipDecompress,
+        digestMismatch,
+        warn,
+      });
+      return { artifact, isMismatch };
+    }),
+    // In order when they share a folder, so the last one wins a path they both hold, every time.
+    { concurrency: isSharingFolders ? 1 : PARALLEL_DOWNLOADS },
+  );
+});
+
 export const download = Effect.fn('download.download')(function* (inputs: {
   serverUrl: string;
   name: string;
@@ -162,39 +217,16 @@ export const download = Effect.fn('download.download')(function* (inputs: {
     warn,
   });
 
-  if (artifacts.length > 0) {
-    yield* Console.error('Preparing to download the following artifacts:');
-    yield* Effect.forEach(
-      artifacts,
-      ({ name, id, size, digest }) =>
-        Console.error(`- ${name} (ID: ${id}, Size: ${size}, Expected Digest: ${digest})`),
-      { concurrency: 1, discard: true },
-    );
-  }
-
   const isOneFolder = inputs.name !== '' || mergeMultiple || artifacts.length === 1;
-  // By lower case, for a disk that folds it: `Build.zip` and `build.zip` are two artifacts, one folder.
-  const isSharingFolders =
-    mergeMultiple ||
-    new Set(artifacts.map(artifact => artifactNameOf(artifact).toLowerCase())).size <
-      artifacts.length;
-  const placed = yield* Effect.forEach(
+  const placed = yield* placeArtifacts({
+    connection,
     artifacts,
-    Effect.fnUntraced(function* (artifact) {
-      const { isMismatch } = yield* fetchAndPlace({
-        connection,
-        artifact,
-        root: downloadPath,
-        subdirectory: isOneFolder ? [] : [artifactNameOf(artifact)],
-        skipDecompress,
-        digestMismatch,
-        warn,
-      });
-      return { artifact, isMismatch };
-    }),
-    // In order when they share a folder, so the last one wins a path they both hold, every time.
-    { concurrency: isSharingFolders ? 1 : PARALLEL_DOWNLOADS },
-  );
+    root: downloadPath,
+    isOneFolder,
+    skipDecompress,
+    digestMismatch,
+    warn,
+  });
 
   const mismatched = placed.filter(({ isMismatch }) => isMismatch);
   if (mismatched.length > 0 && digestMismatch === 'error') {

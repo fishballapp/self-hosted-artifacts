@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { type ExecFileException, execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -15,6 +15,12 @@ import { startTestServer } from './test-support.ts';
  * One bundle rather than the whole package, as test files run side by side and a build cleans its
  * output folder: each file builds only the action it runs.
  */
+/** A process killed by a signal has no code, and must not read as having succeeded. */
+export const exitCodeOf = (error: ExecFileException | null) => {
+  if (error === null) return 0;
+  return typeof error.code === 'number' ? error.code : 128;
+};
+
 /**
  * A script for `--import` that prints a process's peak memory. On Linux, `maxRSS` carries over the
  * parent's peak through fork and exec, so it would report this test run's own memory.
@@ -193,7 +199,7 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
           [...args],
           { cwd: workDir, env: { ...runnerEnv, ...env } },
           (error, stdout, stderr) => {
-            resolve({ exitCode: error === null ? 0 : Number(error.code), stdout, stderr });
+            resolve({ exitCode: exitCodeOf(error), stdout, stderr });
           },
         );
       }),

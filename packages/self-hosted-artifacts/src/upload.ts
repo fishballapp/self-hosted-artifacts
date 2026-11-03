@@ -64,13 +64,13 @@ const parseIfNoFilesFound = Effect.fnUntraced(function* (value: string) {
   return value;
 });
 
-const parseRetentionDays = Effect.fnUntraced(function* (value: string) {
+export const parseRetentionDays = Effect.fnUntraced(function* (value: string) {
   const days = Number.parseInt(value, 10);
   if (Number.isNaN(days)) return yield* new ClientError({ message: 'Invalid retention-days' });
   return days;
 });
 
-const parseCompressionLevel = Effect.fnUntraced(function* (value: string) {
+export const parseCompressionLevel = Effect.fnUntraced(function* (value: string) {
   const level = Number.parseInt(value, 10);
   if (Number.isNaN(level)) return yield* new ClientError({ message: 'Invalid compression-level' });
   if (level < 0 || level > 9) {
@@ -86,13 +86,15 @@ const zipToTempFile = Effect.fnUntraced(function* ({
   files,
   rootDirectory,
   compressionLevel,
+  modifiedAt,
 }: {
   files: readonly string[];
   rootDirectory: string;
   compressionLevel: number;
+  modifiedAt?: Date;
 }) {
   const target = yield* makeRunnerTempFile('.zip');
-  yield* zipFiles({ files, rootDirectory, compressionLevel, target }).pipe(
+  yield* zipFiles({ files, rootDirectory, compressionLevel, modifiedAt, target }).pipe(
     Effect.mapError(({ message }) => new ClientError({ message })),
   );
   return target;
@@ -110,6 +112,8 @@ export const upload = Effect.fn('upload.upload')(
     archive: string;
     overwrite: string;
     audience: string;
+    /** Stamped on every file in the zip, for a caller whose files' own times mean nothing. */
+    zipModifiedAt?: Date;
   }) {
     const includeHiddenFiles = yield* parseBooleanInput(
       'include-hidden-files',
@@ -147,7 +151,12 @@ export const upload = Effect.fn('upload.upload')(
       audience: inputs.audience,
     });
     const filePath = archive
-      ? yield* zipToTempFile({ files, rootDirectory, compressionLevel })
+      ? yield* zipToTempFile({
+          files,
+          rootDirectory,
+          compressionLevel,
+          modifiedAt: inputs.zipModifiedAt,
+        })
       : firstFile;
     const name = archive ? `${inputs.name}.zip` : basename(firstFile);
     const file = yield* openFile({ path: filePath, name });

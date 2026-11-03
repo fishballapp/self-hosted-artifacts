@@ -19,6 +19,7 @@ import { deleteArtifact, list } from './artifacts.ts';
 import type { ClientError } from './client-support.ts';
 import { ServerConfig } from './config.ts';
 import { DOWNLOAD_DEFAULTS, download } from './download.ts';
+import { MERGE_DEFAULTS, merge } from './merge.ts';
 import { TokenVerifier } from './oidc.ts';
 import { ArtifactServer, makeNodeServer } from './server.ts';
 import { Store, StoreSweeps } from './store.ts';
@@ -263,9 +264,74 @@ const deleteCommand = Command.make(
   Command.withDescription("Delete one of a repository's artifacts, from a GitHub Actions job"),
 );
 
+const mergeCommand = Command.make(
+  'merge',
+  {
+    serverUrl: serverUrlFlag,
+    name: Flag.String('name').pipe(
+      Flag.withDescription('The name to store the merged artifact under, plus `.zip`'),
+      Flag.withDefault(MERGE_DEFAULTS.name),
+    ),
+    pattern: Flag.String('pattern').pipe(
+      Flag.withDescription('A glob the names of the artifacts to merge must match'),
+      Flag.withDefault(MERGE_DEFAULTS.pattern),
+    ),
+    separateDirectories: Flag.String('separate-directories').pipe(
+      Flag.withDescription('true to put each artifact in a folder of its name'),
+      Flag.withDefault(MERGE_DEFAULTS.separateDirectories),
+    ),
+    retentionDays: Flag.String('retention-days').pipe(
+      Flag.withDescription("Days to keep it. 0 means the server's default"),
+      Flag.withDefault(MERGE_DEFAULTS.retentionDays),
+    ),
+    compressionLevel: Flag.String('compression-level').pipe(
+      Flag.withDescription('Zlib compression level for the zip, 0 to 9'),
+      Flag.withDefault(MERGE_DEFAULTS.compressionLevel),
+    ),
+    deleteMerged: Flag.String('delete-merged').pipe(
+      Flag.withDescription('true to delete the artifacts once they are merged'),
+      Flag.withDefault(MERGE_DEFAULTS.deleteMerged),
+    ),
+    includeHiddenFiles: Flag.String('include-hidden-files').pipe(
+      Flag.withDescription('true to include files and folders starting with a dot'),
+      Flag.withDefault(MERGE_DEFAULTS.includeHiddenFiles),
+    ),
+    audience: audienceFlag,
+  },
+  inputs =>
+    merge({
+      ...inputs,
+      warn: warnOnStderr,
+      // Before any original is deleted, so a failed delete still leaves the result.
+      onMerged: ({ id, name, size, digest, links, expiresAt, merged }) =>
+        Console.log(
+          JSON.stringify({
+            id,
+            name,
+            size,
+            digest,
+            links,
+            expiresAt,
+            merged: merged.map(artifact => ({ id: artifact.id, name: artifact.name })),
+          }),
+        ),
+    }).pipe(asClientCommand),
+).pipe(
+  Command.withDescription(
+    "Merge a run's artifacts into one, as actions/upload-artifact/merge does, from a GitHub Actions job",
+  ),
+);
+
 const command = Command.make('self-hosted-artifacts').pipe(
   Command.withDescription('A small file server for builds from private repositories'),
-  Command.withSubcommands([serve, uploadCommand, downloadCommand, listCommand, deleteCommand]),
+  Command.withSubcommands([
+    serve,
+    uploadCommand,
+    downloadCommand,
+    listCommand,
+    deleteCommand,
+    mergeCommand,
+  ]),
 );
 
 Command.run(command, { version: packageJson.version }).pipe(
