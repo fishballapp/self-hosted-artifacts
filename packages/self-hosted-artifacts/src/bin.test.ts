@@ -13,9 +13,10 @@ const run = (args: string[]) => promisify(execFile)(process.execPath, [BIN, ...a
 
 describe('self-hosted-artifacts', () => {
   it.each([
-    [[], 'Missing required flag: --config'],
-    [['--nope'], 'Unrecognized flag: --nope'],
-    [['--config'], '--config'],
+    [['serve'], 'Missing required flag: --config'],
+    [['serve', '--nope'], 'Unrecognized flag: --nope'],
+    [['serve', '--config'], '--config'],
+    [['upload', '--path', 'a'], 'Missing required flag: --server-url'],
   ])('prints the error and fails for arguments %j', async (args, message) => {
     await expect(run(args)).rejects.toMatchObject({
       code: 1,
@@ -25,7 +26,9 @@ describe('self-hosted-artifacts', () => {
 
   it('prints the usage for --help', async () => {
     const { stdout } = await run(['--help']);
-    expect(stdout).toContain('--config string');
+    expect(stdout).toContain('serve');
+    expect(stdout).toContain('upload');
+    expect((await run(['serve', '--help'])).stdout).toContain('--config string');
   });
 
   it('prints the package version for --version', async () => {
@@ -35,12 +38,32 @@ describe('self-hosted-artifacts', () => {
   });
 
   it('fails at startup with a clear message when the config is bad', async () => {
-    await expect(run(['--config', '/nonexistent/config.json'])).rejects.toMatchObject({
+    await expect(run(['serve', '--config', '/nonexistent/config.json'])).rejects.toMatchObject({
       code: 1,
       stderr: expect.stringContaining(
         "Can't read the config file /nonexistent/config.json: ENOENT",
       ),
     });
+  });
+
+  it('says outside a GitHub Actions job that the server takes no upload from it', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'self-hosted-artifacts-bin-'));
+    const path = join(dir, 'a.bin');
+    await writeFile(path, 'x');
+    try {
+      await expect(
+        promisify(execFile)(
+          process.execPath,
+          [BIN, 'upload', '--server-url', 'http://127.0.0.1:1', '--path', path],
+          { env: { PATH: process.env.PATH } },
+        ),
+      ).rejects.toMatchObject({
+        code: 1,
+        stderr: expect.stringContaining('No OIDC token available'),
+      });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   const withRunningServer = async (
@@ -62,7 +85,7 @@ describe('self-hosted-artifacts', () => {
         port: 0,
       }),
     );
-    const child = spawn(process.execPath, [BIN, '--config', configPath], {
+    const child = spawn(process.execPath, [BIN, 'serve', '--config', configPath], {
       stdio: ['ignore', 'pipe', 'inherit'],
       // A test that times out never reaches its cleanup, and a live child would hang the run.
       timeout: 25_000,

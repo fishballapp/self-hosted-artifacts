@@ -3,7 +3,7 @@
 **A small file server for GitHub Actions builds from private repositories.**
 
 ```sh
-npx self-hosted-artifacts --config ./config.json
+npx self-hosted-artifacts serve --config ./config.json
 ```
 
 See the [self-hosted-artifacts README](https://github.com/fishballapp/self-hosted-artifacts#readme)

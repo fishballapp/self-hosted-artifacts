@@ -26,4 +26,4 @@ outputs:
     description: When the server will delete the file, as an ISO instant.
 runs:
   using: node24
-  main: upload.mjs
+  main: dist/action.mjs

@@ -24,6 +24,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: pnpm/action-setup@v6
+      # The runner runs the action on Node 24, so its tests do too.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - run: echo "ACTION_NODE=$(which node)" >> "$GITHUB_ENV"
       - uses: actions/setup-node@v6
         with:
           node-version: 26
@@ -35,3 +40,5 @@ jobs:
       - run: pnpm test
       - run: pnpm build
       - run: node packages/self-hosted-artifacts/dist/bin.js --version
+      # The eject builds this file on another machine, and a release tag finds its commit by tree.
+      - run: git diff --exit-code -- upload/dist

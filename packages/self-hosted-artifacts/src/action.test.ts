@@ -4,6 +4,7 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import * as FetchHttpClient from 'effect/http/FetchHttpClient';
 import * as Layer from 'effect/Layer';
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -11,7 +12,9 @@ import { type Config, ServerConfig } from './config.ts';
 import { TokenVerifier } from './oidc.ts';
 import { startTestServer, verifierAnswering } from './test-support.ts';
 
-const ACTION = new URL('../../../upload/upload.mjs', import.meta.url).pathname;
+const ACTION = new URL('../../../upload/dist/action.mjs', import.meta.url).pathname;
+// CI sets this to a Node 24 binary, as that is what the runner runs the action on.
+const ACTION_NODE = process.env.ACTION_NODE ?? process.execPath;
 const RSA = {
   name: 'RSASSA-PKCS1-v1_5',
   hash: 'SHA-256',
@@ -50,8 +53,11 @@ describe('the upload action', () => {
   let tokenRequestAuth: (string | undefined)[];
 
   beforeAll(async () => {
+    await promisify(execFile)('pnpm', ['exec', 'tsdown'], {
+      cwd: new URL('..', import.meta.url).pathname,
+    });
     keys = await crypto.subtle.generateKey(RSA, true, ['sign', 'verify']);
-  });
+  }, 60_000);
 
   const signToken = async () => {
     const nowSeconds = Temporal.Now.instant().epochMilliseconds / 1000;
@@ -152,7 +158,7 @@ describe('the upload action', () => {
   ) =>
     new Promise<{ exitCode: number; stdout: string; stderr: string }>(resolve => {
       execFile(
-        process.execPath,
+        ACTION_NODE,
         [ACTION],
         {
           cwd: rootDir,
@@ -247,6 +253,40 @@ describe('the upload action', () => {
     expect(peakBytes).toBeLessThan(fileBytes / 2);
   });
 
+  it('uploads through the CLI too, printing the result as JSON', async () => {
+    await startArtifactServer();
+    const path = join(rootDir, 'from-cli.bin');
+    await writeFile(path, 'x');
+    const { stdout } = await new Promise<{ stdout: string }>((resolve, reject) => {
+      execFile(
+        process.execPath,
+        [
+          new URL('./bin.ts', import.meta.url).pathname,
+          'upload',
+          '--server-url',
+          serverUrl,
+          '--path',
+          path,
+          '--audience',
+          AUDIENCE,
+        ],
+        {
+          env: {
+            PATH: process.env.PATH,
+            ACTIONS_ID_TOKEN_REQUEST_URL: tokenRequestUrl,
+            ACTIONS_ID_TOKEN_REQUEST_TOKEN: REQUEST_TOKEN,
+          },
+        },
+        (error, out) => (error === null ? resolve({ stdout: out }) : reject(error)),
+      );
+    });
+    expect(JSON.parse(stdout)).toMatchObject({
+      name: 'from-cli.bin',
+      size: 1,
+      links: { home: expect.stringMatching(/\/from-cli\.bin$/) },
+    });
+  });
+
   it('uses the name input over the basename', async () => {
     await startArtifactServer();
     const path = join(rootDir, 'local.bin');
@@ -318,8 +358,8 @@ describe('the upload action', () => {
     });
     const path = join(rootDir, 'a.bin');
     await writeFile(path, 'x');
-    const { exitCode, stdout } = await runAction({ INPUT_PATH: path });
-    expect(stdout).toContain('Attempt 1 failed (GitHub signing keys are unavailable)');
+    const { exitCode, stderr } = await runAction({ INPUT_PATH: path });
+    expect(stderr).toContain('Attempt 1 failed (GitHub signing keys are unavailable)');
     expect(exitCode).toBe(0);
     expect(tokenRequests).toHaveLength(2);
   });
@@ -366,9 +406,10 @@ describe('the upload action', () => {
     ]);
     const path = join(rootDir, 'a.bin');
     await writeFile(path, 'x');
-    const { exitCode, stdout } = await runAction({ INPUT_PATH: path });
+    const { exitCode, stdout, stderr } = await runAction({ INPUT_PATH: path });
     expect(exitCode).toBe(0);
     expect(stdout).not.toMatch(/^::warning::/m);
+    expect(stderr).not.toMatch(/^::warning::/m);
   });
 
   it('gives up on a network error after retrying, with the cause', {

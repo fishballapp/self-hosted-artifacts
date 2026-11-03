@@ -33,7 +33,7 @@ Needs Node 26 and an existing directory to store files in. Write a config file:
 Then start the server:
 
 ```bash
-npx self-hosted-artifacts --config ./config.json
+npx self-hosted-artifacts serve --config ./config.json
 ```
 
 For a long-running service, install a pinned version rather than downloading at each start:
@@ -105,6 +105,16 @@ The file is streamed, not read into memory. A network error or a 5xx is retried 
 short backoff and a fresh token, since a failure here would otherwise throw away a whole build; any
 other refusal fails the step at once with the server's message.
 
+### From the command line
+
+The action wraps a command that takes the same inputs as flags and prints the result as JSON. The
+server only accepts a GitHub OIDC token, so this works only inside a workflow's job, with
+`id-token: write`:
+
+```bash
+npx self-hosted-artifacts upload --server-url http://192.0.2.10:8420 --path dist/app.apk
+```
+
 ### Compared with `actions/upload-artifact`
 
 Not a drop-in: it takes one file, never zips it, and needs its own server. Compared with v7:
@@ -137,12 +147,8 @@ Not a drop-in: it takes one file, never zips it, and needs its own server. Compa
 The server and the action are released together under one version, which follows
 [semantic versioning](https://semver.org). Pin the action to a version tag, as above.
 
-- **Below 1.0:** use the same minor version of both, so action `v0.1.x` with server `0.1.x`. A new
-  minor version may change what they expect of each other.
-- **From 1.0:** any minor versions of the same major version work together.
-
-1.0 is planned for when the action matches `actions/upload-artifact` and the server can store files
-on S3.
+Use the same minor version of both, so action `v0.1.x` with server `0.1.x`. A new minor version may
+change what they expect of each other.
 
 ## HTTP API
 
