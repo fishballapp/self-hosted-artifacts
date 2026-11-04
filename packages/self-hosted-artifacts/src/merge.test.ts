@@ -19,6 +19,7 @@ import {
   type Stored,
   startRunner,
   TARGET_KINDS,
+  UNUSUAL_NAME,
 } from './action-harness.ts';
 import { zipFiles } from './zip.ts';
 
@@ -88,8 +89,11 @@ describe.each(TARGET_KINDS)('merging, against %s', kind => {
   const namesInRun = async (run: Parameters<typeof runner.actAs>[0] = {}) =>
     (await listRun(run)).map(({ name }) => name);
 
-  const bytesOf = async (stored: Stored) =>
-    new Uint8Array(await (await fetch(requireTarget().linkOf(stored))).arrayBuffer());
+  const bytesOf = async (stored: Stored) => {
+    const response = await fetch(requireTarget().linkOf(stored));
+    if (!response.ok) throw new Error(`Reading ${stored.name}: ${await response.text()}`);
+    return new Uint8Array(await response.arrayBuffer());
+  };
 
   /** The files of a stored zip, as `path: content`. */
   const filesOf = async (stored: Stored) =>
@@ -240,6 +244,37 @@ describe.each(TARGET_KINDS)('merging, against %s', kind => {
       expect(await namesInRun()).not.toContain('merged-artifacts.zip');
     });
 
+    it('keeps an artifact with a hidden name out, and undeleted, unless hidden files are asked for', async () => {
+      await startTarget();
+      await storeZip('.cache', { 'a.txt': 'a' });
+      await storeZip('build', { 'b.txt': 'b' });
+      const inputs = {
+        INPUT_PATTERN: '{build,.cache}',
+        'INPUT_SEPARATE-DIRECTORIES': 'true',
+        'INPUT_DELETE-MERGED': 'true',
+      };
+      expectSucceeded(await runAction(inputs));
+      expect(await merged()).toEqual({ 'build/b.txt': 'b' });
+      expect(await namesInRun()).toEqual(['.cache.zip', 'merged-artifacts.zip']);
+
+      expectSucceeded(
+        await runAction({ ...inputs, INPUT_NAME: 'all', 'INPUT_INCLUDE-HIDDEN-FILES': 'true' }),
+      );
+      expect(await merged('all')).toEqual({ '.cache/a.txt': 'a' });
+    });
+
+    it('takes any name upstream does, in, out and as a folder', async () => {
+      await startTarget();
+      await storeZip(UNUSUAL_NAME, { 'a.txt': 'a' });
+      const result = await runAction({
+        INPUT_NAME: `${UNUSUAL_NAME} merged`,
+        'INPUT_SEPARATE-DIRECTORIES': 'true',
+      });
+      expectSucceeded(result);
+      expect(result.stdout).toContain('Artifact download URL: ');
+      expect(await merged(`${UNUSUAL_NAME} merged`)).toEqual({ [`${UNUSUAL_NAME}/a.txt`]: 'a' });
+    });
+
     it('takes the default for an empty one, as the runner passes an unset input', async () => {
       await startTarget();
       await storeZip('build-a', { 'a.txt': 'a' });
@@ -250,9 +285,9 @@ describe.each(TARGET_KINDS)('merging, against %s', kind => {
     it('refuses a name the server would, before downloading anything', async () => {
       await startTarget();
       await storeZip('build-a', { 'a.txt': 'a' });
-      const { exitCode, stdout, stderr } = await runAction({ INPUT_NAME: 'no spaces' });
+      const { exitCode, stdout, stderr } = await runAction({ INPUT_NAME: 'no/slash' });
       expect(exitCode).toBe(1);
-      expect(stdout).toContain('::error::name must match [A-Za-z0-9][A-Za-z0-9._-]{0,254}');
+      expect(stdout).toContain('::error::name must be 1 to 255 bytes');
       expect(stderr).not.toContain('Preparing to download');
     });
   });

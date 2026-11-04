@@ -48,6 +48,12 @@ export const provideTarget = <A, E, R>(main: Effect.Effect<A, E, R>) =>
 export const escapeCommand = (message: string) =>
   message.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
 
+/** Upstream's line, once for each of a server's links. */
+export const logLinks = (links: Readonly<Record<string, string>>) =>
+  Effect.forEach(Object.values(links), link => Console.log(`Artifact download URL: ${link}`), {
+    discard: true,
+  });
+
 export const warnInWorkflow = (message: string) =>
   Console.log(`::warning::${escapeCommand(message)}`);
 

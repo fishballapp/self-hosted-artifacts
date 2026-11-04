@@ -1,5 +1,6 @@
 import { createHash, createHmac } from 'node:crypto';
 import * as Redacted from 'effect/Redacted';
+import { uriEncode } from './protocol.ts';
 
 // AWS Signature Version 4 for S3, with no SDK. Pure, so the time is an argument, and AWS's published
 // examples hold it in `s3-sigv4.test.ts`.
@@ -17,13 +18,6 @@ export type S3Credentials = {
   readonly secretAccessKey: Redacted.Redacted<string>;
   readonly sessionToken?: Redacted.Redacted<string>;
 };
-
-/** RFC 3986, as SigV4 has it: `encodeURIComponent` plus the four characters it leaves alone. */
-const uriEncode = (value: string) =>
-  encodeURIComponent(value).replace(
-    /[!*'()]/gu,
-    character => `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
-  );
 
 /** An object's path, encoded per segment. S3 alone isn't encoded twice, unlike other services. */
 export const encodeS3Path = (path: string) => path.split('/').map(uriEncode).join('/');

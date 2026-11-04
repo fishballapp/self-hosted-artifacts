@@ -14,7 +14,7 @@ import * as Schema from 'effect/Schema';
 import * as Stream from 'effect/Stream';
 import { ClientError } from './client-support.ts';
 import { codeOf } from './log.ts';
-import { ARTIFACT_ID, FILE_NAME, SHA_256 } from './protocol.ts';
+import { ARTIFACT_ID, FILE_NAME_MESSAGE, isFileName, SHA_256 } from './protocol.ts';
 
 // What both targets need of HTTP: the retries, a request that doesn't hold its body in memory, a body
 // streamed to a file, and the rules a stored artifact is held to.
@@ -27,13 +27,13 @@ export class UnavailableError extends Schema.TaggedError<UnavailableError>()('Un
 }) {}
 
 // A line break in a value the action writes to its outputs would add an output of the target's
-// choosing.
-export const SingleLineSchema = Schema.String.check(Schema.isPattern(/^[^\r\n]*$/u));
+// choosing, and the runner reads `##[` as a command anywhere in a line of the log.
+export const SingleLineSchema = Schema.String.check(Schema.isPattern(/^(?!.*##\[)[^\r\n]*$/u));
 
 // Held to the same rules everywhere, as an ID and a name go into a URL and a name into a path here.
 export const StoredArtifactFields = {
   id: Schema.String.check(Schema.isPattern(ARTIFACT_ID)),
-  name: Schema.String.check(Schema.isPattern(FILE_NAME)),
+  name: Schema.String.check(Schema.makeFilter(isFileName, { message: FILE_NAME_MESSAGE })),
   size: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   digest: Schema.String.check(Schema.isPattern(SHA_256)),
   expiresAt: SingleLineSchema,
@@ -128,7 +128,7 @@ export const withRetries = <A, R>(
           Predicate.isTagged(input, 'UnavailableError')
             ? note(
                 // A line of the target's choosing could otherwise start a workflow command.
-                `Attempt ${failed} failed (${input.message.replaceAll(/[\r\n]+/gu, ' ')}), retrying in ${Duration.toSeconds(duration)}s`,
+                `Attempt ${failed} failed (${input.message.replaceAll(/[\r\n]+|##\[/gu, ' ')}), retrying in ${Duration.toSeconds(duration)}s`,
               )
             : Effect.void,
         ),

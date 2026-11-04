@@ -10,6 +10,7 @@ import * as Option from 'effect/Option';
 import * as Redacted from 'effect/Redacted';
 import * as Schema from 'effect/Schema';
 import { ClientError } from './client-support.ts';
+import { uriEncode } from './protocol.ts';
 import type { Target } from './target.ts';
 import {
   downloadUnavailable,
@@ -251,7 +252,7 @@ export const makeServerTarget = Effect.fnUntraced(function* ({
         Effect.gen(function* () {
           const response = yield* executeDownload(
             client,
-            HttpClientRequest.get(`${base}/${artifact.id}/${artifact.name}`, {
+            HttpClientRequest.get(`${base}/${artifact.id}/${uriEncode(artifact.name)}`, {
               // `fetch` asks for gzip by default, and R2 would then compress what the digest is of.
               headers: { 'accept-encoding': 'identity' },
             }),

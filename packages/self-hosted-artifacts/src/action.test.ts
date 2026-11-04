@@ -23,6 +23,7 @@ import {
   removeBundle,
   startRunner,
   TARGET_KINDS,
+  UNUSUAL_NAME,
 } from './action-harness.ts';
 import { closeServer, listenOnLoopback, verifierAnswering } from './test-support.ts';
 
@@ -480,7 +481,7 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
     expect(runner.tokenRequests).toEqual([]);
   });
 
-  it("with archive false, fails with the server's message on a hidden file's name", async () => {
+  it('with archive false, takes a hidden file under its own name', async () => {
     await startTarget();
     await writeFiles({ '.env': 'x' });
     const { exitCode, stdout } = await runAction({
@@ -488,8 +489,41 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
       INPUT_ARCHIVE: 'false',
       'INPUT_INCLUDE-HIDDEN-FILES': 'true',
     });
+    expect(stdout).not.toContain('::error::');
+    expect(exitCode).toBe(0);
+    expect((await readOutputs())['artifact-url']).toMatch(/\/\.env$/);
+  });
+
+  it('prints each link, as upstream prints its URL, and takes any name upstream does', async () => {
+    await startTarget();
+    const content = 'an unusual name';
+    await writeFiles({ 'a.txt': content });
+    const zipped = await runAction({ INPUT_PATH: 'a.txt', INPUT_NAME: UNUSUAL_NAME });
+    expect(zipped.stdout).not.toContain('::error::');
+    expect(zipped.exitCode).toBe(0);
+    const zippedLinks = JSON.parse((await readOutputs()).links ?? '') as Record<string, string>;
+    for (const link of Object.values(zippedLinks)) {
+      expect(zipped.stdout).toContain(`Artifact download URL: ${link}`);
+      expect(new URL(link).pathname).toMatch(/\/[^/]*%27%E4%BD%A0%E5%A5%BD\.zip$/u);
+    }
+    const [zippedLink = ''] = Object.values(zippedLinks);
+    const [entry] = Object.values(unzipSync(await downloadOutput(zippedLink)));
+    expect(Buffer.from(entry ?? []).toString()).toBe(content);
+
+    await writeFiles({ [`plain/${UNUSUAL_NAME}`]: content });
+    const plain = await runAction({ INPUT_PATH: 'plain/*', INPUT_ARCHIVE: 'false' });
+    expect(plain.stdout).not.toContain('::error::');
+    expect(plain.exitCode).toBe(0);
+    const plainLink = (await readOutputs())['artifact-url'] ?? '';
+    expect(Buffer.from(await downloadOutput(plainLink)).toString()).toBe(content);
+  });
+
+  it.each(['no/slash', 'a"quote', 'a:colon', '..'])('fails on %s as a name', async name => {
+    await startTarget();
+    await writeFiles({ 'a.txt': 'x' });
+    const { exitCode, stdout } = await runAction({ INPUT_PATH: 'a.txt', INPUT_NAME: name });
     expect(exitCode).toBe(1);
-    expect(stdout).toMatch(/^::error::name must match/m);
+    expect(stdout).toMatch(/^::error::name must be 1 to 255 bytes/m);
   });
 
   it('compresses at the level asked for', async () => {
@@ -637,7 +671,7 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
   it('removes the zip after a refusal', async () => {
     await startTarget();
     await writeFiles({ 'a.txt': 'a' });
-    expect((await runAction({ INPUT_PATH: 'a.txt', INPUT_NAME: '.bad' })).exitCode).toBe(1);
+    expect((await runAction({ INPUT_PATH: 'a.txt', INPUT_NAME: 'a/bad' })).exitCode).toBe(1);
     expect(await readdir(runnerTemp)).toEqual([]);
   });
 
@@ -1228,9 +1262,9 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
     await startTarget();
     const path = join(rootDir, 'a.bin');
     await writeFile(path, 'x');
-    const { exitCode, stdout } = await runAction({ INPUT_PATH: path, INPUT_NAME: '.bad name' });
+    const { exitCode, stdout } = await runAction({ INPUT_PATH: path, INPUT_NAME: 'a/bad name' });
     expect(exitCode).toBe(1);
-    expect(stdout).toMatch(/^::error::name must match/m);
+    expect(stdout).toMatch(/^::error::name must be 1 to 255 bytes/m);
     expectTokenRequests(1);
   });
 
@@ -1337,6 +1371,21 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
     expect(stdout).toMatch(/^::error::.* answered without a usable upload/m);
     expect(puts).toEqual([]);
   });
+
+  it.runIf(kind === 'server')(
+    'refuses a link holding what the runner would read as a command, as it goes in the log',
+    async () => {
+      const links = { home: 'https://files.example/a##[stop-commands]pause' };
+      await useUploadServer({
+        commit: (_req, res) => answerJson(res, 201, { id: 'an-id', links, expiresAt: 'x' }),
+      });
+      await writeFiles({ 'a.bin': 'x' });
+      const { exitCode, stdout } = await runAction({ INPUT_PATH: 'a.bin' });
+      expect(exitCode).toBe(1);
+      expect(stdout).toMatch(/^::error::.* answered without a usable link/m);
+      expect(stdout).not.toContain('stop-commands');
+    },
+  );
 
   it.runIf(kind === 'server')(
     'refuses a commit answered with no usable link, writing no outputs',

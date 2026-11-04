@@ -4,6 +4,7 @@ import * as Effect from 'effect/Effect';
 import * as FileSystem from 'effect/FileSystem';
 import {
   inputOr,
+  logLinks,
   provideTarget,
   requiredInput,
   runAction,
@@ -38,6 +39,7 @@ const main = Effect.gen(function* () {
     ].join('\n'),
     { flag: 'a' },
   );
+  yield* logLinks(links);
   return yield* Console.log(`Uploaded ${name} (${size} bytes), expires at ${expiresAt}`);
 });
 

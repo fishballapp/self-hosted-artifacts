@@ -4,7 +4,8 @@ import { createServer } from 'node:http';
 import { convertV4MiniflareOptions, type Json, Miniflare } from 'miniflare';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { WORKER } from '../tsdown.config.ts';
-import { buildBundle, generateRunnerKeys, removeBundle } from './action-harness.ts';
+import { buildBundle, generateRunnerKeys, removeBundle, UNUSUAL_NAME } from './action-harness.ts';
+import { uriEncode } from './protocol.ts';
 import { FAKE_ACCESS_KEY_ID, FAKE_SECRET_ACCESS_KEY, startFakeS3 } from './s3-fake.ts';
 import { closeServer, listenOnLoopback } from './test-support.ts';
 
@@ -43,8 +44,8 @@ const encodeJson = (value: unknown) =>
 
 const body = new TextEncoder().encode('x');
 const digestOf = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
-const declarationOf = (bytes: Uint8Array, extra = '') =>
-  `name=a.apk&digest=${digestOf(bytes)}&size=${bytes.length}${extra}`;
+const declarationOf = (bytes: Uint8Array, extra = '', name = 'a.apk') =>
+  `name=${encodeURIComponent(name)}&digest=${digestOf(bytes)}&size=${bytes.length}${extra}`;
 
 describe('the built Worker, in workerd', { timeout: 30_000 }, () => {
   let bundle: string;
@@ -169,8 +170,14 @@ describe('the built Worker, in workerd', { timeout: 30_000 }, () => {
   type Worker = Awaited<ReturnType<typeof startWorker>>;
 
   /** A job's three steps, with the body going straight to the bucket as the job's would. */
-  const uploadThrough = async ({ request }: Worker, token: string, bytes = body, extra = '') => {
-    const declaration = declarationOf(bytes, extra);
+  const uploadThrough = async (
+    { request }: Worker,
+    token: string,
+    bytes = body,
+    extra = '',
+    name = 'a.apk',
+  ) => {
+    const declaration = declarationOf(bytes, extra, name);
     const created = await request(`/uploads?${declaration}`, { method: 'POST', token });
     expect(created.status).toBe(201);
     const { upload } = JSON.parse(created.text) as {
@@ -244,6 +251,17 @@ describe('the built Worker, in workerd', { timeout: 30_000 }, () => {
       const deleted = await worker.request(`/artifacts/${id}`, { method: 'DELETE', token });
       expect(deleted.status).toBe(200);
       expect((await worker.request(`/${id}/a.apk`)).status).toBe(404);
+    });
+
+    it('reaches the bucket for any name upstream takes', async () => {
+      const { worker } = await startOverFake();
+      const name = `${UNUSUAL_NAME}.apk`;
+      const { id, stored } = await uploadThrough(worker, await signToken(), body, '', name);
+      expect(stored.links).toEqual({ home: `${ORIGIN}/${id}/${uriEncode(name)}` });
+      const read = await worker.request(`/${id}/${uriEncode(name)}`);
+      expect(read.status).toBe(302);
+      expect((await fetch(read.headers.get('location') ?? '')).status).toBe(200);
+      expect((await worker.request(`/${id}/%ZZ`)).status).toBe(404);
     });
 
     it('replaces a name with `If-Match`, so `accept-encoding: identity` reached the bucket', async () => {

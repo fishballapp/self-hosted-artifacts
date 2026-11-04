@@ -3,7 +3,7 @@ import * as Effect from 'effect/Effect';
 import { findArtifacts, type Warn } from './artifacts.ts';
 import { ClientError, makeRunnerTempDirectory, parseBooleanInput } from './client-support.ts';
 import { placeArtifacts } from './download.ts';
-import { FILE_NAME, FILE_NAME_MESSAGE } from './protocol.ts';
+import { FILE_NAME_MESSAGE, isFileName } from './protocol.ts';
 import { globEscape } from './search.ts';
 import { ArtifactTarget } from './target.ts';
 import type { ListedArtifact } from './transport.ts';
@@ -62,11 +62,14 @@ export const merge = Effect.fn('merge.merge')(
       inputs.separateDirectories,
     );
     const deleteMerged = yield* parseBooleanInput('delete-merged', inputs.deleteMerged);
-    yield* parseBooleanInput('include-hidden-files', inputs.includeHiddenFiles);
+    const includeHidden = yield* parseBooleanInput(
+      'include-hidden-files',
+      inputs.includeHiddenFiles,
+    );
     yield* parseRetentionDays(inputs.retentionDays);
     yield* parseCompressionLevel(inputs.compressionLevel);
     const storedName = `${name}.zip`;
-    if (!FILE_NAME.test(storedName)) return yield* new ClientError({ message: FILE_NAME_MESSAGE });
+    if (!isFileName(storedName)) return yield* new ClientError({ message: FILE_NAME_MESSAGE });
 
     const target = yield* ArtifactTarget;
     yield* target.ready;
@@ -79,8 +82,11 @@ export const merge = Effect.fn('merge.merge')(
       warn,
     });
     // A re-run's pattern may match the merged artifact of the attempt before: it is not an input,
-    // and deleting it would delete the result.
-    const artifacts = listed.filter(artifact => artifact.name !== storedName);
+    // and deleting it would delete the result. A hidden name's folder or file would be left out of
+    // the zip, and deleted all the same, so it isn't one either unless hidden files are asked for.
+    const artifacts = listed.filter(
+      artifact => artifact.name !== storedName && (includeHidden || !artifact.name.startsWith('.')),
+    );
     if (artifacts.length === 0) {
       return yield* new ClientError({
         message: `No artifacts found matching pattern '${pattern}'`,

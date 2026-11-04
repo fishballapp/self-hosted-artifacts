@@ -15,14 +15,16 @@ import { describeError, shortToken } from './log.ts';
 import { TokenVerifier } from './oidc.ts';
 import {
   ARTIFACT_ID,
+  attachmentOf,
   BAD_RETENTION,
-  FILE_NAME,
   FILE_NAME_MESSAGE,
+  isFileName,
   NAME_TAKEN,
   OTHER_REPOSITORY,
   REPOSITORY,
   RUN_ID,
   SHA_256,
+  uriEncode,
 } from './protocol.ts';
 import { type ArtifactMeta, Store, type UploadDeclaration } from './store-contract.ts';
 
@@ -34,6 +36,15 @@ const ARTIFACT_URL = /^\/artifacts\/([A-Za-z0-9_-]{43})$/;
 const UPLOADS_URL = /^\/uploads(?:\?(.*))?$/;
 const COMMIT_URL = /^\/uploads\/([A-Za-z0-9_-]{43})\/commit(?:\?(.*))?$/;
 const DOWNLOAD_URL = /^\/([A-Za-z0-9_-]{43})\/([^/?#]+)$/;
+
+/** A bad escape in a link is a link to nothing. */
+const decodedSegment = (segment: string) => {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return undefined;
+  }
+};
 
 /** What only the platform under the routes can do. */
 export class ResponseBreaker extends Context.Service<
@@ -128,7 +139,10 @@ export const ArtifactRoutes = Layer.unwrap(
       digest,
       expiresAt,
       links: Object.fromEntries(
-        Object.entries(config.linkBases).map(([label, base]) => [label, `${base}/${id}/${name}`]),
+        Object.entries(config.linkBases).map(([label, base]) => [
+          label,
+          `${base}/${id}/${uriEncode(name)}`,
+        ]),
       ),
     });
 
@@ -136,7 +150,7 @@ export const ArtifactRoutes = Layer.unwrap(
     const parseDeclaration = Effect.fnUntraced(function* (query: string) {
       const params = new URLSearchParams(query);
       const name = params.get('name');
-      if (name === null || !FILE_NAME.test(name)) return yield* refusal(400, FILE_NAME_MESSAGE);
+      if (name === null || !isFileName(name)) return yield* refusal(400, FILE_NAME_MESSAGE);
       const retentionDays = parseRetentionDays(params.get('retention-days'), config);
       if (retentionDays === undefined) return yield* refusal(400, BAD_RETENTION);
       const digest = params.get('digest');
@@ -336,7 +350,8 @@ export const ArtifactRoutes = Layer.unwrap(
       });
 
     const download = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
-      const [, token, name] = DOWNLOAD_URL.exec(request.url) ?? [];
+      const [, token, segment = ''] = DOWNLOAD_URL.exec(request.url) ?? [];
+      const name = decodedSegment(segment);
       const isRead = request.method === 'GET' || request.method === 'HEAD';
       if (token === undefined || name === undefined || !isRead) return notFound;
 
@@ -347,7 +362,7 @@ export const ArtifactRoutes = Layer.unwrap(
         Effect.annotateLogs({ token: shortToken(token), name, size: found.size }),
       );
       const fileHeaders = {
-        'content-disposition': `attachment; filename="${name}"`,
+        'content-disposition': attachmentOf(name),
         'x-content-type-options': 'nosniff',
         'content-security-policy': "sandbox; default-src 'none'",
       };

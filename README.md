@@ -282,7 +282,7 @@ jobs:
           aws-region: eu-west-2
       - run: ./build.sh
       - id: upload
-        uses: fishballapp/self-hosted-artifacts/upload@v0.7.0
+        uses: fishballapp/self-hosted-artifacts/upload@v0.8.0
         with:
           s3-bucket: YOUR-BUCKET
           s3-link-base: https://YOUR-BUCKET.s3.eu-west-2.amazonaws.com
@@ -335,7 +335,7 @@ A bucket whose name holds a dot doesn't match S3's TLS certificate when virtual-
 
 ```yaml
       - id: upload
-        uses: fishballapp/self-hosted-artifacts/upload@v0.7.0
+        uses: fishballapp/self-hosted-artifacts/upload@v0.8.0
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -437,7 +437,7 @@ jobs:
       - uses: actions/checkout@v6
       - run: ./build.sh
       - id: upload
-        uses: fishballapp/self-hosted-artifacts/upload@v0.7.0
+        uses: fishballapp/self-hosted-artifacts/upload@v0.8.0
         with:
           server-url: http://192.0.2.10:8420
           path: dist/
@@ -448,7 +448,7 @@ That uploads what's in `dist/` as one zip, `artifact.zip`. To upload one file as
 link ends in its own name, set `archive: false`:
 
 ```yaml
-      - uses: fishballapp/self-hosted-artifacts/upload@v0.7.0
+      - uses: fishballapp/self-hosted-artifacts/upload@v0.8.0
         with:
           server-url: http://192.0.2.10:8420
           path: dist/app.apk
@@ -543,7 +543,7 @@ File handling and retention match v7. What's left differs because the files go t
 | --- | --- | --- |
 | **Inputs** | | |
 | `path`, `if-no-files-found`, `include-hidden-files`, `compression-level` | | The same names, defaults and rules |
-| `name` | The artifact's name, default `artifact`, without `"`, `:`, `<`, `>`, `\|`, `*`, `?`, `\`, `/` | The same default, stored as `<name>.zip`. Stricter: it must start with a letter or digit, then letters, digits, `.`, `_` or `-`, so no spaces |
+| `name` | The artifact's name, default `artifact`, without `"`, `:`, `<`, `>`, `\|`, `*`, `?`, `\`, `/` | The same default and rule, stored as `<name>.zip`. Also refused: any control character, `##[`, `.` and `..` with or without `.zip`, and more than 255 bytes |
 | `retention-days` | 1 to 90, default 90; `0` means the default | The same by default; a server sets its own default and cap |
 | `archive` | Zips by default; `false` uploads one file as it is, under its own name | The same, and that file's name must pass the rule above too |
 | `overwrite` | Default `false`. Deletes an artifact of the same name, then uploads | The same default, but the old artifact goes only once the new one is stored, and an earlier attempt's is left alone |
@@ -561,7 +561,7 @@ File handling and retention match v7. What's left differs because the files go t
 | Names | One artifact per name in a run attempt | The same, and names differing only in case are two artifacts |
 | The same name and content again | Fails, unless `overwrite` | Succeeds with the artifact already there, so a retry is safe |
 | Zipping | Streams to GitHub | Writes a temp file first, so `RUNNER_TEMP` needs room for the zip |
-| Getting a file | `actions/download-artifact`, the run's page, the API | [The download action](#download), or `curl` or a browser with the link |
+| Getting a file | `actions/download-artifact`, the run's page, the API | [The download action](#download), or `curl` or a browser with the link the step prints |
 | Deleting early | The run's page or the API | [`delete` on the command line](#from-the-command-line), for that repository |
 
 ## Download
@@ -575,7 +575,7 @@ jobs:
       id-token: write # to prove to the server which repository this is
     steps:
       - id: download
-        uses: fishballapp/self-hosted-artifacts/download@v0.7.0
+        uses: fishballapp/self-hosted-artifacts/download@v0.8.0
         with:
           server-url: http://192.0.2.10:8420
           name: build
@@ -672,7 +672,7 @@ jobs:
       id-token: write # to prove to the server which repository this is
     steps:
       - id: merge
-        uses: fishballapp/self-hosted-artifacts/upload/merge@v0.7.0
+        uses: fishballapp/self-hosted-artifacts/upload/merge@v0.8.0
         with:
           server-url: http://192.0.2.10:8420
           name: all-builds
@@ -704,7 +704,7 @@ which is stored as `merged-artifacts.zip`.
 | `links` | Every link, by label, as one-line JSON. |
 | `expires-at` | When it expires, as an ISO instant. |
 
-- **It reads this run only,** each name's latest attempt, as `actions/download-artifact` lists it.
+- **It reads each name's latest attempt,** as `actions/download-artifact` lists it.
   Nothing matching the `pattern` fails the step, with `No artifacts found matching pattern '<pattern>'`.
 - **The merged artifact is never one of its own inputs.** A re-run's `*` would otherwise take in the
   attempt before's `<name>.zip`, and `delete-merged` would delete it. Another artifact of any other
@@ -713,7 +713,8 @@ which is stored as `merged-artifacts.zip`.
   folder, so the last wins a path they both hold. With `true`, each goes in a folder of its name, even
   when only one matches. A file uploaded with `archive: false` is a file `app.apk` in the root, or in
   `app.apk/app.apk`. Then `include-hidden-files` decides what the new zip takes, so with `false`, a
-  hidden file in an artifact is left out of the merged one.
+  hidden file in an artifact is left out of the merged one. So is an artifact whose name starts with a
+  `.`, which then stays where it is, whatever `delete-merged` says.
 - **Each artifact's digest is checked** as [the download action's](#download) `digest-mismatch: error`
   does. A mismatch fails the step with nothing uploaded and nothing deleted.
 - **Originals go last.** A failure at any step before the merged artifact is stored, a refused upload
@@ -739,7 +740,7 @@ server or bucket:
 | --- | --- | --- |
 | **Inputs** | | |
 | `name`, `pattern`, `separate-directories`, `retention-days`, `compression-level`, `delete-merged`, `include-hidden-files` | | The same names and defaults |
-| `name` | Without `"`, `:`, `<`, `>`, `\|`, `*`, `?`, `\`, `/` | Stored as `<name>.zip`, and stricter: see [Upload](#upload) |
+| `name` | Without `"`, `:`, `<`, `>`, `\|`, `*`, `?`, `\`, `/` | The same, stored as `<name>.zip`, with what [Upload](#upload) also refuses |
 | `server-url`, `audience` or `s3-bucket`, `s3-region`, `s3-endpoint`, `s3-link-base` | Not applicable | Where to read and write |
 | **Outputs** | | |
 | `artifact-id`, `artifact-url`, `artifact-digest` | A number, a URL that needs a GitHub login, SHA-256 in hex | A string, a link anyone can use, and the same digest |
@@ -759,7 +760,7 @@ server or bucket:
 ## From the command line
 
 The actions wrap commands that take the same inputs as flags, values included, and print the result
-as JSON. A server only accepts a GitHub OIDC token, so against one these work only inside a workflow's
+as JSON. A name starting with `-` needs its flag written `--name=-x`, as `--name -x` reads as a flag. A server only accepts a GitHub OIDC token, so against one these work only inside a workflow's
 job, with `id-token: write`. Against a bucket they work anywhere with the credentials: outside Actions,
 `--scope <repository ID>/<run ID>/<run attempt>`, each a number, says which run this is, and wins over
 the job's variables. Anything else they have to say goes to stderr.
@@ -829,7 +830,7 @@ the token. The body goes to the URL the first answers with, and needs none.
 
 | Parameter | Meaning |
 | --- | --- |
-| `name` | Required. Matches `^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$`; nothing is sanitised. |
+| `name` | Required, percent-encoded. 1 to 255 bytes, without `"`, `:`, `<`, `>`, `\|`, `*`, `?`, `\`, `/`, `##[` or a control character, and not `.` or `..`, with or without `.zip`; nothing is sanitised. |
 | `digest` | Required. The file's SHA-256, in 64 lowercase hex characters. |
 | `size` | Required. The file's size in bytes. |
 | `retention-days` | Days to keep the file. The server caps it. |
@@ -977,8 +978,8 @@ Each way to store draws the line in a different place. Read the one you use.
 - **Who can download:** anyone who has the link and can reach the server. There is no login: a link
   holds 256 random bits, so it can't be guessed, and it is meant to be shared. What keeps a file
   private is who can reach the server, so keep it on a network you trust. Plain `http` is readable by
-  anyone on the path, so use `https` for a link that crosses anything you don't control. The action
-  doesn't mask its outputs, so a step that uses a link prints it to the run's log.
+  anyone on the path, so use `https` for a link that crosses anything you don't control. The upload and
+  merge steps print their links to the run's log, and don't mask their outputs.
 - **What a file can do:** nothing in a browser. Downloads are `application/octet-stream`, as an
   attachment, with `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox;
   default-src 'none'`.
@@ -989,8 +990,8 @@ Each way to store draws the line in a different place. Read the one you use.
   holds a server's answers to the server's own rules too, so a name or ID that could lead out of
   the destination fails the step.
 - **What gets logged:** never the OIDC token or an upload's URL, and only a short prefix of a download
-  token or an upload's ID. Uploads log the repository, run, attempt, name, size and digest. The download action prints each artifact's
-  ID in the run's log, as the upload action's outputs print its links.
+  token or an upload's ID. Uploads log the repository, run, attempt, name, size and digest. In the run's log, the
+  download action prints each artifact's ID, and the upload and merge actions print its links.
 
 ### With a server in front of a bucket
 
@@ -1074,9 +1075,8 @@ token just as it does with a disk. What's different is where the bytes go:
 
 ## Not supported
 
-A web UI, `Range` requests, Windows runners, resuming a download, merging the
-artifacts of another run or repository, and a list of a run's earlier attempts where a later one holds
-the name, or, with a bucket, multipart uploads or a bucket that also holds other things.
+A web UI, Windows runners, and a list of a run's earlier attempts where a later one holds the name, or,
+with a bucket, multipart uploads or a bucket that also holds other things.
 
 ## License
 

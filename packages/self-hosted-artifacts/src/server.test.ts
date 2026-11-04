@@ -25,7 +25,9 @@ import * as PlatformError from 'effect/PlatformError';
 import * as Sink from 'effect/Sink';
 import * as Stream from 'effect/Stream';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { UNUSUAL_NAME } from './action-harness.ts';
 import type { Config } from './config.ts';
+import { uriEncode } from './protocol.ts';
 import { UPLOAD_TIMEOUT } from './store.ts';
 import { clockAt, startTestServer, type Verification, verifierAnswering } from './test-support.ts';
 
@@ -299,7 +301,6 @@ describe('download routing', () => {
     ['the wrong filename', '/<token>/other.apk'],
     ['a differently cased filename', '/<token>/NAME.APK'],
     ['a query string', '/<token>/name.apk?x=1'],
-    ['an encoded filename', '/<token>/name%2Eapk'],
     ['an extra segment', '/<token>/name.apk/more'],
     ['a short token', '/abc/name.apk'],
     ['a traversal', '/../../etc/passwd'],
@@ -315,6 +316,35 @@ describe('download routing', () => {
     const answer = await send('GET', path.replace('<token>', token));
     expect(answer.status).toBe(404);
     expect(JSON.parse(answer.body)).toEqual({ error: 'Not found' });
+  });
+
+  it.each([
+    ['a bad escape', 'name%ZZ.apk'],
+    ['half an escape', 'name.apk%E0%A4'],
+  ])('answers 404 for %s', async (_, segment) => {
+    await startServer();
+    const { token } = await uploaded('name.apk', randomBytes(8));
+    expect((await send('GET', `/${token}/${segment}`)).status).toBe(404);
+  });
+
+  it.each([
+    ['another way to write it', 'name%2Eapk', 'name.apk', 'attachment; filename="name.apk"'],
+    [
+      'an unusual name',
+      encodeURIComponent(UNUSUAL_NAME),
+      UNUSUAL_NAME,
+      `attachment; filename="a build [v1] (x+y) & z=1; 100_ #2 ~'__"; filename*=UTF-8''${uriEncode(UNUSUAL_NAME)}`,
+    ],
+  ])('finds %s, and names it for a browser', async (_, segment, name, disposition) => {
+    await startServer();
+    const content = randomBytes(8);
+    const { token, pathname } = await uploaded(encodeURIComponent(name), content);
+    expect(pathname).toBe(`/${token}/${uriEncode(name)}`);
+    for (const method of ['GET', 'HEAD'] as const) {
+      const answer = await send(method, `/${token}/${segment}`);
+      expect(answer.status).toBe(200);
+      expect(answer.headers['content-disposition']).toBe(disposition);
+    }
   });
 
   it('answers 404 for a token with its case changed, whatever the disk folds', async () => {
@@ -341,9 +371,11 @@ describe('upload refusals', () => {
     ['a traversal', '..%2F..%2Fetc%2Fpasswd'],
     ['a plain traversal', '../x'],
     ['a slash', 'a%2Fb'],
-    ['a leading dot', '.env'],
-    ['a space', 'a%20b.apk'],
+    ['the current folder', '.'],
+    ['the parent folder', '..'],
     ['a quote', 'a%22b.apk'],
+    ['a control character', 'a%01b.apk'],
+    ['a long name in few characters', '%C3%A9'.repeat(128)],
     ['a newline', 'a%0Ab.apk'],
     ['a long name', 'a'.repeat(256)],
     ['an empty name', ''],
@@ -351,7 +383,7 @@ describe('upload refusals', () => {
     await startServer();
     const answer = await upload(name, randomBytes(8));
     expect(answer.status).toBe(400);
-    expect(JSON.parse(answer.body).error).toMatch(/^name must match/);
+    expect(JSON.parse(answer.body).error).toMatch(/^name must be 1 to 255 bytes/);
     expect(await artifactsOnDisk()).toEqual([]);
   });
 
@@ -725,7 +757,7 @@ describe('an upload, step by step', () => {
       await startServer();
       const { id } = await sentBody();
       expect((await commit(id, 'a.apk', content, { headers: {} })).status).toBe(401);
-      expect((await commit(id, '.bad', content)).status).toBe(400);
+      expect((await commit(id, 'a%2Fbad', content)).status).toBe(400);
       expect(await tempsOnDisk()).toEqual([id]);
     });
 

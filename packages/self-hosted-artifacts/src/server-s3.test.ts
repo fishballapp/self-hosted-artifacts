@@ -10,7 +10,9 @@ import {
   type RunClaims,
   removeBundle,
   startRunner,
+  UNUSUAL_NAME,
 } from './action-harness.ts';
+import { attachmentOf, uriEncode } from './protocol.ts';
 import { encodeS3Path, presignS3Request } from './s3-sigv4.ts';
 
 // What only a server in front of a bucket does. What it shares with the other ways to store is in the
@@ -57,7 +59,7 @@ describe('a server in front of a bucket', () => {
   const authorized = async () => ({ Authorization: `Bearer ${await runner.signToken()}` });
 
   const declarationOf = (content: string, name: string, more = '') =>
-    `name=${name}&digest=${sha256(content)}&size=${Buffer.byteLength(content)}${more}`;
+    `name=${encodeURIComponent(name)}&digest=${sha256(content)}&size=${Buffer.byteLength(content)}${more}`;
 
   const create = async (content: string, { name = 'a.bin', more = '' } = {}) => {
     const response = await fetch(
@@ -87,7 +89,7 @@ describe('a server in front of a bucket', () => {
   };
 
   const linkOf = ({ id, name = 'a.bin' }: { id: string; name?: string }) =>
-    `${target.serverUrl}/${id}/${name}`;
+    `${target.serverUrl}/${id}/${uriEncode(name)}`;
 
   const dataKeyOf = ({ id, name = 'a.bin' }: { id: string; name?: string }) =>
     `artifacts/${id}/${name}`;
@@ -361,6 +363,19 @@ describe('a server in front of a bucket', () => {
       expect(read.status).toBe(200);
       expect(await read.text()).toBe('the build');
       expect(read.headers.get('content-disposition')).toBe('attachment; filename="a.bin"');
+    });
+
+    it('reaches the bucket for any name upstream takes', async () => {
+      const name = `${UNUSUAL_NAME}.bin`;
+      const artifact = await stored('the build', { name });
+      const answer = await fetch(linkOf(artifact), { redirect: 'manual' });
+      expect(answer.status).toBe(302);
+      const read = await fetch(answer.headers.get('location') ?? '', {
+        headers: { 'accept-encoding': 'identity' },
+      });
+      expect(read.status).toBe(200);
+      expect(await read.text()).toBe('the build');
+      expect(read.headers.get('content-disposition')).toBe(attachmentOf(name));
     });
 
     it('needs that URL: the bucket itself stays private', async () => {

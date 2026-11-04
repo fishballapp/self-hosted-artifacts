@@ -7,7 +7,7 @@ import * as Schema from 'effect/Schema';
 import type { ClientError } from './client-support.ts';
 import { ConfigError, type S3StoreConfig } from './config.ts';
 import { shortToken } from './log.ts';
-import { FILE_NAME, newArtifactId } from './protocol.ts';
+import { attachmentOf, isFileName, newArtifactId } from './protocol.ts';
 import {
   checksumOf,
   dataKeyOf,
@@ -216,7 +216,7 @@ export const s3StoreLayer = ({ bucket, region, endpoint }: S3StoreConfig) =>
         /** Two requests: the data's `HEAD` says which scope to look in, and the name decides. */
         findDownload: Effect.fn('S3Store.findDownload')(function* (id, name) {
           // A name reaches a key here, so it's held to the rule first, where a disk only compares it.
-          if (!FILE_NAME.test(name)) return { _tag: 'NotFound' } as const;
+          if (!isFileName(name)) return { _tag: 'NotFound' } as const;
           const key = dataKeyOf({ id, name });
           const head = yield* orFault(readDataHead(key));
           const scope = Option.flatMap(head, ({ scope: header }) => scopeFromHeader(header));
@@ -238,7 +238,7 @@ export const s3StoreLayer = ({ bucket, region, endpoint }: S3StoreConfig) =>
             location: yield* presign({
               method: 'GET',
               key,
-              query: { 'response-content-disposition': `attachment; filename="${name}"` },
+              query: { 'response-content-disposition': attachmentOf(name) },
               expiresInSeconds: DOWNLOAD_URL_SECONDS,
             }),
           } as const;

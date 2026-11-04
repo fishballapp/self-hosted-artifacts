@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import * as Redacted from 'effect/Redacted';
+import { unescapeXml } from './s3-bucket.ts';
 import {
   encodeS3Path,
   encodeS3Query,
@@ -40,7 +41,14 @@ const respondError = (
     .writeHead(status, { 'content-type': 'application/xml' })
     .end(errorXml(code, message, extra));
 
-const escapeXml = (text: string) => text.replaceAll('&', '&amp;').replaceAll('<', '&lt;');
+const escapeXml = (text: string) =>
+  text
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    // As MinIO does.
+    .replaceAll('"', '&#34;')
+    .replaceAll("'", '&#39;');
 
 const headerOf = (req: IncomingMessage, name: string) => {
   const value = req.headers[name];
@@ -387,7 +395,7 @@ export const rawS3Client = ({
     /** Every key under a prefix, for looking at what's left. */
     keys: async (prefix = '') => {
       const xml = await (await send('GET', '', { query: { 'list-type': '2', prefix } })).text();
-      return Array.from(xml.matchAll(/<Key>([^<]*)<\/Key>/gu), ([, key = '']) => key);
+      return Array.from(xml.matchAll(/<Key>([^<]*)<\/Key>/gu), ([, key = '']) => unescapeXml(key));
     },
   };
 };

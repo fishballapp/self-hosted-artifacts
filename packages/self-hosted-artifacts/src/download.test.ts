@@ -29,6 +29,7 @@ import {
   type Stored,
   startRunner,
   TARGET_KINDS,
+  UNUSUAL_NAME,
 } from './action-harness.ts';
 import { closeServer, listenOnLoopback } from './test-support.ts';
 import { zipFiles } from './zip.ts';
@@ -114,6 +115,35 @@ describe.each(TARGET_KINDS)('downloading, against %s', kind => {
       [BIN, command, ...requireTarget().flags(), ...args],
       requireTarget().env(),
     );
+
+  it('finds any name upstream takes, by name and in a folder, and deletes it by ID', async () => {
+    await startTarget();
+    const { id } = await storeZip(UNUSUAL_NAME, { 'a.txt': 'a' });
+    await storeZip('other', { 'b.txt': 'b' });
+
+    const byName = await runAction({ INPUT_NAME: UNUSUAL_NAME, INPUT_PATH: destination });
+    expect(byName.exitCode).toBe(0);
+    expect(await treeOf(destination)).toEqual({ 'a.txt': 'a' });
+
+    const everything = join(runner.rootDir, 'everything');
+    const all = await runAction({ INPUT_PATH: everything });
+    expect(all.exitCode).toBe(0);
+    expect(await treeOf(everything)).toEqual({
+      [`${UNUSUAL_NAME}/a.txt`]: 'a',
+      'other/b.txt': 'b',
+    });
+
+    const deleted = await runCli('delete', ['--artifact-id', id]);
+    expect(deleted.stderr).toBe('');
+    expect(deleted.exitCode).toBe(0);
+    expect(requireTarget().goneLinkStatuses).toContain(
+      (
+        await fetch(
+          requireTarget().reachable(requireTarget().linkOf({ id, name: `${UNUSUAL_NAME}.zip` })),
+        )
+      ).status,
+    );
+  });
 
   /** Every file below a directory, as `path: content`. */
   const treeOf = async (directory: string): Promise<Record<string, string>> => {
@@ -982,6 +1012,7 @@ syncBuiltinESMExports();`,
   describe.runIf(kind === 'server')('a server that misbehaves', () => {
     it.each([
       ['a name leading out', { name: '../../evil.zip' }],
+      ['a name that is the parent folder without its `.zip`', { name: '...zip' }],
       ['an ID with a path', { id: '../'.repeat(14).padEnd(43, 'a') }],
       ['a digest of the wrong shape', { digest: 'abc' }],
       ['a negative size', { size: -1 }],
@@ -997,6 +1028,27 @@ syncBuiltinESMExports();`,
       expect(exitCode).toBe(1);
       expect(stdout).toContain('answered with an unusable artifact list');
       expect(existsSync(destination)).toBe(false);
+    });
+
+    it('takes one at a time what a disk could fold into one folder', async () => {
+      const zip = zipSync({ 'result.txt': strToU8('x') });
+      const { artifacts } = fakeListing({ 'caf\u00e9.zip': zip, 'cafe\u0301.zip': zip });
+      let reading = 0;
+      let mostReading = 0;
+      serverUrl = await runner.useFakeServer(
+        createServer((req, res) => {
+          if (req.url?.startsWith('/artifacts')) return void res.end(JSON.stringify({ artifacts }));
+          reading += 1;
+          mostReading = Math.max(mostReading, reading);
+          setTimeout(() => {
+            reading -= 1;
+            res.end(zip);
+          }, 100);
+        }),
+      );
+      const { exitCode } = await runAction({ INPUT_PATH: destination });
+      expect(exitCode).toBe(0);
+      expect(mostReading).toBe(1);
     });
 
     it('is cut off once it sends more than it listed, and not retried', async () => {

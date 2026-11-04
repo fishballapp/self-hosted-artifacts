@@ -9,8 +9,8 @@ import * as Option from 'effect/Option';
 import { ClientError } from './client-support.ts';
 import {
   BAD_RETENTION,
-  FILE_NAME,
   FILE_NAME_MESSAGE,
+  isFileName,
   isHttpBase,
   NAME_TAKEN,
   newArtifactId,
@@ -31,6 +31,7 @@ import {
   SCOPE_HEADER,
   scopeHeaderOf,
 } from './s3-bucket.ts';
+import { encodeS3Path } from './s3-sigv4.ts';
 import type { Target } from './target.ts';
 import { isOk, type ListedArtifact, streamBodyToFile } from './transport.ts';
 
@@ -159,7 +160,7 @@ export const makeS3Target = Effect.fnUntraced(function* ({
   });
 
   const describeStored = ({ id, name, expiresAt }: ArtifactFile) => {
-    const artifactUrl = `${linkBase}/${dataKeyOf({ id, name })}`;
+    const artifactUrl = `${linkBase}/${encodeS3Path(dataKeyOf({ id, name }))}`;
     return { id, artifactUrl, links: { [LINK_LABEL]: artifactUrl }, expiresAt };
   };
 
@@ -199,7 +200,7 @@ export const makeS3Target = Effect.fnUntraced(function* ({
     ready: Effect.asVoid(connection),
 
     send: Effect.fnUntraced(function* ({ file, name, digest, overwrite, retentionDays }) {
-      if (!FILE_NAME.test(name)) return yield* new ClientError({ message: FILE_NAME_MESSAGE });
+      if (!isFileName(name)) return yield* new ClientError({ message: FILE_NAME_MESSAGE });
       if (retentionDays < 0) return yield* new ClientError({ message: BAD_RETENTION });
       const { scope, repositoryName } = yield* connection;
 

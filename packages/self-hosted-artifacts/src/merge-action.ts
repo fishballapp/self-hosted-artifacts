@@ -1,7 +1,7 @@
 import * as Config from 'effect/Config';
 import * as Effect from 'effect/Effect';
 import * as FileSystem from 'effect/FileSystem';
-import { inputOr, provideTarget, runAction, warnInWorkflow } from './action-support.ts';
+import { inputOr, logLinks, provideTarget, runAction, warnInWorkflow } from './action-support.ts';
 import { MERGE_DEFAULTS, merge } from './merge.ts';
 
 const main = Effect.gen(function* () {
@@ -28,6 +28,7 @@ const main = Effect.gen(function* () {
         ].join('\n'),
         { flag: 'a' },
       );
+      yield* logLinks(links);
     }),
   });
 });

@@ -14,7 +14,7 @@ import * as Redacted from 'effect/Redacted';
 import * as Schema from 'effect/Schema';
 import * as Stream from 'effect/Stream';
 import { ClientError } from './client-support.ts';
-import { RUN_ID } from './protocol.ts';
+import { isFileName, RUN_ID } from './protocol.ts';
 import { encodeS3Path, encodeS3Query, type S3Credentials, signS3Request } from './s3-sigv4.ts';
 import type { RunScope } from './store-contract.ts';
 import {
@@ -140,13 +140,26 @@ class CommitConflictError extends Schema.TaggedError<CommitConflictError>()(
   {},
 ) {}
 
-const unescapeXml = (text: string) =>
-  text
-    .replaceAll('&lt;', '<')
-    .replaceAll('&gt;', '>')
-    .replaceAll('&quot;', '"')
-    .replaceAll('&apos;', "'")
-    .replaceAll('&amp;', '&');
+const XML_ENTITIES: Readonly<Record<string, string>> = {
+  lt: '<',
+  gt: '>',
+  quot: '"',
+  apos: "'",
+  amp: '&',
+};
+
+const MAX_CODE_POINT = 0x10ffff;
+
+/** By name or by number, each store having its own way: MinIO writes `'` as `&#39;`. */
+export const unescapeXml = (text: string) =>
+  text.replaceAll(
+    /&(?:#([0-9]+)|#[xX]([0-9A-Fa-f]+)|(lt|gt|quot|apos|amp));/gu,
+    (match, decimal?: string, hex?: string, named?: string) => {
+      if (named !== undefined) return XML_ENTITIES[named] ?? match;
+      const codePoint = hex === undefined ? Number(decimal) : Number.parseInt(hex, 16);
+      return codePoint <= MAX_CODE_POINT ? String.fromCodePoint(codePoint) : match;
+    },
+  );
 
 const elementOf = (xml: string, name: string) =>
   new RegExp(`<${name}>([^<]*)</${name}>`, 'u').exec(xml)?.[1];
@@ -309,8 +322,7 @@ export const makeS3Bucket = ({
     const xml = yield* response.text.pipe(Effect.mapError(unavailableFrom));
     const next = elementOf(xml, 'NextContinuationToken');
     return {
-      // Every key this reads back was written here, with nothing in it that XML would escape.
-      keys: Array.from(xml.matchAll(/<Key>([^<]*)<\/Key>/gu), ([, key = '']) => key),
+      keys: Array.from(xml.matchAll(/<Key>([^<]*)<\/Key>/gu), ([, key = '']) => unescapeXml(key)),
       next:
         elementOf(xml, 'IsTruncated') === 'true' && next !== undefined
           ? Option.some(unescapeXml(next))
@@ -512,6 +524,7 @@ export const makeS3Bucket = ({
     const [dataKey] = keys;
     if (dataKey === undefined) return Option.none();
     const name = dataKey.slice(`artifacts/${id}/`.length);
+    if (!isFileName(name)) return Option.none();
 
     const head = yield* readDataHead(dataKey);
     const scope = Option.flatMap(head, ({ scope: header }) => scopeFromHeader(header));

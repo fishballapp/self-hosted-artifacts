@@ -23,6 +23,7 @@ import { type Config, type S3StoreConfig, ServerConfig } from './config.ts';
 import { TokenVerifier } from './oidc.ts';
 import { makeS3Target } from './s3-client.ts';
 import { FAKE_ACCESS_KEY_ID, FAKE_SECRET_ACCESS_KEY, rawS3Client, startFakeS3 } from './s3-fake.ts';
+import { encodeS3Path } from './s3-sigv4.ts';
 import {
   closeServer,
   listenOnLoopback,
@@ -105,6 +106,9 @@ export const CURRENT_RUN: RunClaims = {
  * Every way to store runs through the same scenarios wherever they should behave the same: a server
  * with a disk, a job with a bucket's keys, and a server in front of a bucket.
  */
+/** All that upstream's rule lets through, which each place a name goes has to carry. */
+export const UNUSUAL_NAME = "a build [v1] (x+y) & z=1; 100% #2 ~'你好";
+
 export const TARGET_KINDS = ['server', 's3', 'server-s3'] as const;
 export type TargetKind = (typeof TARGET_KINDS)[number];
 
@@ -336,7 +340,7 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
     const post = async (name: string, body: Blob, run: Partial<RunClaims>) => {
       const hash = createHash('sha256');
       for await (const chunk of body.stream()) hash.update(chunk);
-      const declaration = `name=${name}&digest=${hash.digest('hex')}&size=${body.size}`;
+      const declaration = `name=${encodeURIComponent(name)}&digest=${hash.digest('hex')}&size=${body.size}`;
       claims = { ...CURRENT_RUN, ...run };
       const created = await fetch(`${url}/uploads?${declaration}`, {
         method: 'POST',
@@ -376,7 +380,8 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
         claims = CURRENT_RUN;
         return ((await response.json()) as { artifacts: Stored[] }).artifacts;
       },
-      linkOf: ({ id, name }: { id: string; name: string }) => `${realUrl}/${id}/${name}`,
+      linkOf: ({ id, name }: { id: string; name: string }) =>
+        `${realUrl}/${id}/${encodeURIComponent(name)}`,
       /** A link from an output: its base is one a runner can't reach, so the path goes to the server. */
       reachable: (link: string) => `${realUrl}${new URL(link).pathname}`,
       goneLinkStatuses: [404],
@@ -573,7 +578,8 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
         asJob(target => target.list({ repository: '', runId: '' }), run).then(listed =>
           listed.map(artifact => ({ ...artifact, links: { ...artifact.links } })),
         ),
-      linkOf: (artifact: { id: string; name: string }) => `${linkBase}/${dataKeyOf(artifact)}`,
+      linkOf: (artifact: { id: string; name: string }) =>
+        `${linkBase}/${encodeS3Path(dataKeyOf(artifact))}`,
       reachable: (link: string) => link,
       // With no permission to list, AWS won't say whether a key exists. MinIO and R2 do.
       goneLinkStatuses: [403, 404],

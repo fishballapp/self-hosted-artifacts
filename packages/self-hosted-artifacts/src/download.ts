@@ -145,11 +145,12 @@ export const placeArtifacts = Effect.fnUntraced(function* ({
     );
   }
 
-  // By lower case, for a disk that folds it: `Build.zip` and `build.zip` are two artifacts, one folder.
+  // As a disk may fold them: `Build.zip` and `build.zip` are two artifacts, one folder, and so are
+  // the two ways to write `café`.
   const isSharingFolders =
     isOneFolder ||
-    new Set(artifacts.map(artifact => artifactNameOf(artifact).toLowerCase())).size <
-      artifacts.length;
+    new Set(artifacts.map(artifact => artifactNameOf(artifact).normalize('NFC').toLowerCase()))
+      .size < artifacts.length;
   return yield* Effect.forEach(
     artifacts,
     Effect.fnUntraced(function* (artifact) {
