@@ -50,7 +50,7 @@ const jwkOf = async (key: CryptoKey, kid: string) => ({
 });
 
 const CONFIG = {
-  storeDir: '/srv/artifacts',
+  store: { kind: 'disk' as const, dir: '/srv/artifacts', minFreeBytes: 0 },
   oidcAudience: 'self-hosted-artifacts',
   oidcRepositoryOwnerId: '42',
   linkBases: { home: 'http://192.0.2.1:8420' },
@@ -58,7 +58,6 @@ const CONFIG = {
   port: 0,
   defaultRetentionDays: 7,
   maxRetentionDays: 30,
-  minFreeBytes: 0,
   maxFileBytes: 1024,
 };
 
@@ -250,7 +249,7 @@ describe('TokenVerifier', () => {
     expect(fetches).toBe(2);
   });
 
-  it('limits refetches with a cooldown, and fetches once for concurrent tokens', async () => {
+  it('limits refetches with a cooldown', async () => {
     let now = NOW;
     let fetches = 0;
     const jwks = { keys: [await jwkOf(keys.publicKey, 'key-1')] };
@@ -263,7 +262,7 @@ describe('TokenVerifier', () => {
     });
     const unknown = await signRs256(keys.privateKey, { alg: 'RS256', kid: 'mystery' }, GOOD_CLAIMS);
 
-    await Promise.all([verify(unknown), verify(unknown), verify(unknown)]);
+    await verify(unknown);
     expect(fetches).toBe(1);
 
     await verify(unknown);
@@ -273,6 +272,27 @@ describe('TokenVerifier', () => {
 
     now = now.add({ seconds: 2 });
     await verify(unknown);
+    expect(fetches).toBe(2);
+  });
+
+  it('never makes a token wait on the fetch of another, which a Worker would cancel as hung', async () => {
+    const released = Promise.withResolvers<void>();
+    const jwks = { keys: [await jwkOf(keys.publicKey, 'key-1')] };
+    let fetches = 0;
+    const verify = verifierFor({
+      jwks: async () => {
+        fetches += 1;
+        // The first fetch doesn't end until the second has answered.
+        if (fetches === 1) await released.promise;
+        return jwks;
+      },
+    });
+    const token = await signRs256(keys.privateKey, { alg: 'RS256', kid: 'key-1' }, GOOD_CLAIMS);
+
+    const first = verify(token);
+    await expect(verify(token)).resolves.toMatchObject({ kind: 'verified' });
+    released.resolve();
+    await expect(first).resolves.toMatchObject({ kind: 'verified' });
     expect(fetches).toBe(2);
   });
 
@@ -316,7 +336,8 @@ describe('TokenVerifier', () => {
     });
     const unknown = await signRs256(keys.privateKey, { alg: 'RS256', kid: 'mystery' }, GOOD_CLAIMS);
 
-    await Promise.all([verify(unknown), verify(unknown), verify(unknown)]);
+    await verify(unknown);
+    await verify(unknown);
     expect(fetches).toBe(1);
   });
 

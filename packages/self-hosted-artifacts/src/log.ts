@@ -4,7 +4,7 @@ export type Log = (line: string) => void;
 
 export const shortToken = (token: string): string => `${token.slice(0, 8)}…`;
 
-const codeOf = (error: unknown): string | undefined =>
+export const codeOf = (error: unknown): string | undefined =>
   Predicate.hasProperty(error, 'code') && Predicate.isString(error.code) ? error.code : undefined;
 
 /** A system error's message holds its file path, and a path in the store holds a download token. */

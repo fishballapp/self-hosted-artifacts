@@ -7,7 +7,7 @@ import * as Effect from 'effect/Effect';
 import { parseConfig, readConfigFile } from './config.ts';
 
 const GOOD_SETTINGS = {
-  storeDir: '/srv/artifacts',
+  store: { kind: 'disk', dir: '/srv/artifacts' },
   oidcAudience: 'self-hosted-artifacts',
   oidcRepositoryOwnerId: 42,
   linkBases: { home: 'http://192.0.2.1:8420', public: 'https://files.example/' },
@@ -19,7 +19,7 @@ describe('parseConfig', () => {
   it.effect('fills in the defaults and trims a base URL', () =>
     Effect.gen(function* () {
       expect(yield* parse(GOOD_SETTINGS)).toEqual({
-        storeDir: '/srv/artifacts',
+        store: { kind: 'disk', dir: '/srv/artifacts', minFreeBytes: 20 * 1024 ** 3 },
         oidcAudience: 'self-hosted-artifacts',
         oidcRepositoryOwnerId: '42',
         linkBases: { home: 'http://192.0.2.1:8420', public: 'https://files.example' },
@@ -27,8 +27,22 @@ describe('parseConfig', () => {
         port: 8420,
         defaultRetentionDays: 90,
         maxRetentionDays: 90,
-        minFreeBytes: 20 * 1024 ** 3,
         maxFileBytes: 2 * 1024 ** 3,
+      });
+    }),
+  );
+
+  it.effect('reads a bucket, with an endpoint or without', () =>
+    Effect.gen(function* () {
+      const bucket = { kind: 's3', bucket: 'builds', region: 'auto' };
+      expect((yield* parse({ ...GOOD_SETTINGS, store: bucket })).store).toEqual({
+        ...bucket,
+        endpoint: '',
+      });
+      const endpoint = 'https://acct.r2.cloudflarestorage.com';
+      expect((yield* parse({ ...GOOD_SETTINGS, store: { ...bucket, endpoint } })).store).toEqual({
+        ...bucket,
+        endpoint,
       });
     }),
   );
@@ -41,7 +55,7 @@ describe('parseConfig', () => {
         port: 9000,
         defaultRetentionDays: 1,
         maxRetentionDays: 2,
-        minFreeGiB: 0,
+        store: { kind: 'disk', dir: '/srv/artifacts', minFreeGiB: 0 },
         maxFileGiB: 0.5,
       });
       expect(config).toMatchObject({
@@ -49,13 +63,13 @@ describe('parseConfig', () => {
         port: 9000,
         defaultRetentionDays: 1,
         maxRetentionDays: 2,
-        minFreeBytes: 0,
+        store: { minFreeBytes: 0 },
         maxFileBytes: 512 * 1024 ** 2,
       });
     }),
   );
 
-  it.effect.each(['storeDir', 'oidcAudience', 'oidcRepositoryOwnerId', 'linkBases'])(
+  it.effect.each(['store', 'oidcAudience', 'oidcRepositoryOwnerId', 'linkBases'])(
     'fails when %s is missing, naming it',
     name =>
       Effect.gen(function* () {
@@ -65,8 +79,26 @@ describe('parseConfig', () => {
   );
 
   it.effect.each<[string, unknown]>([
-    ['storeDir', 'relative/path'],
-    ['storeDir', 3],
+    ['store', '/srv/artifacts'],
+    ['store', { kind: 'disk' }],
+    ['store', { dir: '/srv/artifacts' }],
+    ['store', { kind: 'tape', dir: '/srv/artifacts' }],
+    ['store', { kind: 'disk', dir: 'relative/path' }],
+    ['store', { kind: 'disk', dir: 3 }],
+    ['store', { kind: 'disk', dir: '/srv/artifacts', minFreeGiB: -1 }],
+    ['store', { kind: 'disk', dir: '/srv/artifacts', minFreeGiB: '20' }],
+    ['store', { kind: 'disk', dir: '/srv/artifacts', minFreeGiB: 1e300 }],
+    ['store', { kind: 'disk', dir: '/srv/artifacts', minFree: 20 }],
+    ['store', { kind: 's3', region: 'auto' }],
+    ['store', { kind: 's3', bucket: 'builds' }],
+    ['store', { kind: 's3', bucket: 'a/b', region: 'auto' }],
+    ['store', { kind: 's3', bucket: 'builds', region: 'a b' }],
+    ['store', { kind: 's3', bucket: 'builds', region: 'auto', endpoint: 'not a url' }],
+    ['store', { kind: 's3', bucket: 'builds', region: 'auto', endpoint: 'https://a.example?x=1' }],
+    ['store', { kind: 's3', bucket: 'builds', region: 'auto', dir: '/srv/artifacts' }],
+    // Keys come from the environment, and nothing in the file is secret.
+    ['store', { kind: 's3', bucket: 'builds', region: 'auto', accessKeyId: 'a' }],
+    ['store', { kind: 's3', bucket: 'builds', region: 'auto', secretAccessKey: 'a' }],
     ['oidcAudience', ''],
     ['oidcRepositoryOwnerId', 'fishballapp'],
     ['oidcRepositoryOwnerId', '42'],
@@ -89,15 +121,19 @@ describe('parseConfig', () => {
     ['port', 1.5],
     ['defaultRetentionDays', 0],
     ['maxRetentionDays', -1],
-    ['minFreeGiB', -1],
-    ['minFreeGiB', '20'],
     ['maxFileGiB', 0],
     ['maxFileGiB', 1e-12],
     ['maxFileGiB', 1e300],
-    ['minFreeGiB', 1e300],
   ])('fails when %s is %j, naming it', ([name, value]) =>
     Effect.gen(function* () {
       const error = yield* Effect.flip(parse({ ...GOOD_SETTINGS, [name]: value }));
+      expect(error.message).toContain(`["${name}"]`);
+    }),
+  );
+
+  it.effect.each(['storeDir', 'minFreeGiB'])('fails on %s, which `store` replaced', name =>
+    Effect.gen(function* () {
+      const error = yield* Effect.flip(parse({ ...GOOD_SETTINGS, [name]: '/srv/artifacts' }));
       expect(error.message).toContain(`["${name}"]`);
     }),
   );
@@ -130,7 +166,9 @@ describe('readConfigFile', () => {
   it.effect('reads a config from a file', () =>
     withFile(JSON.stringify(GOOD_SETTINGS), path =>
       Effect.gen(function* () {
-        expect(yield* readConfigFile(path)).toMatchObject({ storeDir: '/srv/artifacts' });
+        expect(yield* readConfigFile(path)).toMatchObject({
+          store: { dir: '/srv/artifacts' },
+        });
       }),
     ).pipe(Effect.provide(NodeServices.layer)),
   );

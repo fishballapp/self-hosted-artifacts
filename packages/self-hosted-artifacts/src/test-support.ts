@@ -3,16 +3,21 @@ import type { AddressInfo } from 'node:net';
 import * as NodeHttpServer from '@effect/platform-node/NodeHttpServer';
 import * as NodeServices from '@effect/platform-node/NodeServices';
 import * as Clock from 'effect/Clock';
+import * as ConfigProvider from 'effect/ConfigProvider';
 import * as Effect from 'effect/Effect';
 import type * as FileSystem from 'effect/FileSystem';
+import * as FetchHttpClient from 'effect/http/FetchHttpClient';
+import * as HttpClient from 'effect/http/HttpClient';
 import * as Layer from 'effect/Layer';
 import * as Logger from 'effect/Logger';
 import * as ManagedRuntime from 'effect/ManagedRuntime';
 import type * as Path from 'effect/Path';
-import { type Config, ServerConfig } from './config.ts';
+import { type Config, type S3StoreConfig, ServerConfig } from './config.ts';
+import { ArtifactServer, BucketArtifactServer, makeNodeServer } from './node-server.ts';
 import { SigningKeysUnavailableError, TokenRejectedError, TokenVerifier } from './oidc.ts';
-import { ArtifactServer, makeNodeServer } from './server.ts';
-import { type RunScope, Store } from './store.ts';
+import { s3StoreLayer } from './s3-store.ts';
+import { DiskStore } from './store.ts';
+import type { RunScope } from './store-contract.ts';
 
 export type Verification =
   | { kind: 'verified'; repository: string; scope: RunScope }
@@ -83,6 +88,7 @@ export const startTestServer = async ({
   onLog?: (line: string) => void;
   storeServices?: Layer.Layer<FileSystem.FileSystem | Path.Path>;
 }) => {
+  if (config.store.kind !== 'disk') throw new Error('startTestServer is for a disk');
   let nodeServer: Server | undefined;
   const makeServer = () => {
     nodeServer = makeNodeServer();
@@ -97,20 +103,80 @@ export const startTestServer = async ({
         Layer.mergeAll(
           configLayer,
           verifier,
-          Store.layer.pipe(Layer.provide(configLayer), Layer.provide(storeServices)),
+          DiskStore.layerWithStore(config.store).pipe(Layer.provide(storeServices)),
         ),
       ),
       Layer.provideMerge(clock),
       Layer.provideMerge(capturedLogs),
     ),
   );
-  const store = await runtime.runPromise(Effect.service(Store));
+  const store = await runtime.runPromise(Effect.service(DiskStore));
   if (nodeServer === undefined) throw new Error('The server did not start');
   const server = nodeServer;
   return {
     server,
     store,
     run: <A, E>(effect: Effect.Effect<A, E>) => runtime.runPromise(effect),
+    port: (server.address() as AddressInfo).port,
+    stop: async () => {
+      server.closeAllConnections();
+      await runtime.dispose();
+    },
+  };
+};
+
+/** `startTestServer`, for a server in front of a bucket: its keys come in as they would from the environment. */
+export const startBucketTestServer = async ({
+  config,
+  store,
+  verifier,
+  credentials,
+  clock = Layer.empty,
+  onLog = () => undefined,
+}: {
+  config: Config;
+  store: S3StoreConfig;
+  verifier: Layer.Layer<TokenVerifier>;
+  credentials: Readonly<Record<string, string>>;
+  clock?: Layer.Layer<never>;
+  onLog?: (line: string) => void;
+}) => {
+  let nodeServer: Server | undefined;
+  const runtime = ManagedRuntime.make(
+    BucketArtifactServer.pipe(
+      Layer.provide(
+        NodeHttpServer.layerServer(
+          () => {
+            nodeServer = makeNodeServer();
+            return nodeServer;
+          },
+          { host: '127.0.0.1', port: 0 },
+        ),
+      ),
+      Layer.provideMerge(
+        Layer.mergeAll(
+          Layer.succeed(ServerConfig, config),
+          verifier,
+          s3StoreLayer(store).pipe(
+            Layer.provide(
+              Layer.mergeAll(
+                // Fresh, or it's the one a test's verifier was given, whose `fetch` answers with keys.
+                Layer.fresh(FetchHttpClient.layer),
+                Layer.succeed(HttpClient.TracerPropagationEnabled, false),
+                ConfigProvider.layer(ConfigProvider.fromUnknown(credentials)),
+              ),
+            ),
+          ),
+        ),
+      ),
+      Layer.provideMerge(clock),
+      Layer.provideMerge(Logger.layer([Logger.map(Logger.formatLogFmt, onLog)])),
+    ),
+  );
+  await runtime.runPromise(Effect.void);
+  if (nodeServer === undefined) throw new Error('The server did not start');
+  const server = nodeServer;
+  return {
     port: (server.address() as AddressInfo).port,
     stop: async () => {
       server.closeAllConnections();

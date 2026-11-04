@@ -1,8 +1,6 @@
-import { createServer, type Server } from 'node:http';
-import * as NodeHttpServerRequest from '@effect/platform-node/NodeHttpServerRequest';
 import * as Arr from 'effect/Array';
 import * as Cause from 'effect/Cause';
-import * as Duration from 'effect/Duration';
+import * as Context from 'effect/Context';
 import * as Effect from 'effect/Effect';
 import * as Exit from 'effect/Exit';
 import * as HttpRouter from 'effect/http/HttpRouter';
@@ -26,18 +24,27 @@ import {
   RUN_ID,
   SHA_256,
 } from './protocol.ts';
-import { type ArtifactMeta, Store, UPLOAD_TIMEOUT, UploadFailedError } from './store.ts';
+import { type ArtifactMeta, Store, type UploadDeclaration } from './store-contract.ts';
+
+// The routes every store shares, which also run under a Worker's web handler. So this imports nothing
+// of Node's, even through what it imports: `server-portability.test.ts` holds that.
 
 const ARTIFACTS_URL = /^\/artifacts(?:\?(.*))?$/;
 const ARTIFACT_URL = /^\/artifacts\/([A-Za-z0-9_-]{43})$/;
+const UPLOADS_URL = /^\/uploads(?:\?(.*))?$/;
+const COMMIT_URL = /^\/uploads\/([A-Za-z0-9_-]{43})\/commit(?:\?(.*))?$/;
 const DOWNLOAD_URL = /^\/([A-Za-z0-9_-]{43})\/([^/?#]+)$/;
-const UNREAD_BODY_GRACE = Duration.seconds(5);
-// A client that stops reading or sending gets cut off, so a stalled download can't keep an expired
-// file's blocks on disk after its sweep. Long enough for a phone to return from the background. With
-// a write pending, Node restarts this timer, so a stalled download goes at two or three times this.
-const IDLE_TIMEOUT = Duration.minutes(5);
 
-const respondJson = (status: number, body: unknown) =>
+/** What only the platform under the routes can do. */
+export class ResponseBreaker extends Context.Service<
+  ResponseBreaker,
+  {
+    /** Breaks the connection of a response whose body failed after its headers had gone. */
+    readonly breakResponse: (request: HttpServerRequest.HttpServerRequest) => Effect.Effect<void>;
+  }
+>()('self-hosted-artifacts/ResponseBreaker') {}
+
+export const respondJson = (status: number, body: unknown) =>
   HttpServerResponse.jsonUnsafe(body, { status });
 
 const notFound = respondJson(404, { error: 'Not found' });
@@ -61,50 +68,27 @@ const parseRetentionDays = (
   return Math.min(Number(value), maxRetentionDays);
 };
 
-/** The Node server under the routes, with the timeouts `NodeHttpServer` has no option for. */
-export const makeNodeServer = (idleTimeoutMs = Duration.toMillis(IDLE_TIMEOUT)): Server => {
-  const server = createServer();
-  server.requestTimeout = Duration.toMillis(UPLOAD_TIMEOUT);
-  server.timeout = idleTimeoutMs;
-  return server;
-};
+/** The one place a fault becomes an answer, and the reason it reaches the log holds no path. */
+export const answeringFaults = <E, R>(
+  handler: Effect.Effect<HttpServerResponse.HttpServerResponse, E, R>,
+) =>
+  handler.pipe(
+    Effect.catchCauseIf(
+      cause => !Cause.hasInterruptsOnly(cause),
+      cause =>
+        Effect.logError('request failed').pipe(
+          Effect.annotateLogs({ reason: describeError(Cause.squash(cause)) }),
+          Effect.as(respondJson(500, { error: 'Internal error' })),
+        ),
+    ),
+  );
 
 export const ArtifactRoutes = Layer.unwrap(
   Effect.gen(function* () {
     const config = yield* ServerConfig;
     const store = yield* Store;
     const verifier = yield* TokenVerifier;
-    const scope = yield* Effect.scope;
-
-    /**
-     * Answers an upload whose body is still unread. Node discards what arrives next, so the
-     * connection stays open long enough for the client to read the answer: closing on unread bytes
-     * can reset the connection and lose it. A client still sending after the grace period gets cut
-     * off.
-     */
-    const answerUnread = Effect.fnUntraced(function* (
-      request: HttpServerRequest.HttpServerRequest,
-      status: number,
-      body: unknown,
-    ) {
-      const source = NodeHttpServerRequest.toIncomingMessage(request);
-      yield* Effect.sleep(UNREAD_BODY_GRACE).pipe(
-        Effect.andThen(Effect.sync(() => source.destroy())),
-        Effect.forkIn(scope),
-      );
-      return respondJson(status, body);
-    });
-
-    const refuseAndLog = (
-      request: HttpServerRequest.HttpServerRequest,
-      status: number,
-      message: string,
-      reason = message,
-    ) =>
-      Effect.logInfo('upload refused').pipe(
-        Effect.annotateLogs({ status, reason }),
-        Effect.andThen(answerUnread(request, status, { error: message })),
-      );
+    const breaker = yield* ResponseBreaker;
 
     /** Every route but a download starts here, and only the claims it answers with decide scope. */
     const authenticate = Effect.fnUntraced(function* (
@@ -142,144 +126,127 @@ export const ArtifactRoutes = Layer.unwrap(
       name,
       size,
       digest,
-      expiresAt: expiresAt.toString(),
+      expiresAt,
       links: Object.fromEntries(
         Object.entries(config.linkBases).map(([label, base]) => [label, `${base}/${id}/${name}`]),
       ),
     });
 
-    const upload = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
-      const uploadMatch = ARTIFACTS_URL.exec(request.url);
-      if (uploadMatch === null) return notFound;
-
-      const verification = yield* authenticate(request).pipe(Effect.result);
-      if (verification._tag === 'Failure') {
-        const { status, message, reason } = verification.failure;
-        return yield* refuseAndLog(request, status, message, reason);
-      }
-
-      const params = new URLSearchParams(uploadMatch[1] ?? '');
+    /** What `POST /uploads` and its commit both say. Only the claims say whose it is. */
+    const parseDeclaration = Effect.fnUntraced(function* (query: string) {
+      const params = new URLSearchParams(query);
       const name = params.get('name');
-      if (name === null || !FILE_NAME.test(name)) {
-        return yield* refuseAndLog(request, 400, FILE_NAME_MESSAGE);
-      }
+      if (name === null || !FILE_NAME.test(name)) return yield* refusal(400, FILE_NAME_MESSAGE);
       const retentionDays = parseRetentionDays(params.get('retention-days'), config);
-      if (retentionDays === undefined) {
-        return yield* refuseAndLog(request, 400, BAD_RETENTION);
-      }
-      const digest = params.get('digest') ?? undefined;
-      if (digest !== undefined && !SHA_256.test(digest)) {
-        return yield* refuseAndLog(
-          request,
-          400,
-          'digest must be a SHA-256 in 64 lowercase hex characters',
-        );
+      if (retentionDays === undefined) return yield* refusal(400, BAD_RETENTION);
+      const digest = params.get('digest');
+      if (digest === null || !SHA_256.test(digest)) {
+        return yield* refusal(400, 'digest must be a SHA-256 in 64 lowercase hex characters');
       }
       const overwriteParam = params.get('overwrite') ?? 'false';
       if (overwriteParam !== 'true' && overwriteParam !== 'false') {
-        return yield* refuseAndLog(request, 400, 'overwrite must be true or false');
+        return yield* refusal(400, 'overwrite must be true or false');
       }
-      const overwrite = overwriteParam === 'true';
-      const contentLength = request.headers['content-length'];
-      if (contentLength === undefined) {
-        return yield* refuseAndLog(request, 411, 'Content-Length is required');
+      const sizeParam = params.get('size');
+      if (sizeParam === null || !/^(?:0|[1-9][0-9]*)$/u.test(sizeParam)) {
+        return yield* refusal(400, 'size must be a whole number of bytes');
       }
-      const size = Number(contentLength);
+      const size = Number(sizeParam);
       if (size > config.maxFileBytes) {
-        return yield* refuseAndLog(
-          request,
-          413,
-          `File is over the limit of ${config.maxFileBytes} bytes`,
-        );
+        return yield* refusal(413, `File is over the limit of ${config.maxFileBytes} bytes`);
       }
-      if (!(yield* store.isPresent)) {
-        return yield* refuseAndLog(request, 503, 'The store is missing');
-      }
-      const { repository, scope: runScope } = verification.success;
-      const uploadLog = { repository, name, size, ...runScope };
-      // With the digest, a retried upload or a refusal needs none of the body.
-      const held = yield* store.findByName({ scope: runScope, name });
-      if (digest !== undefined && Option.isSome(held)) {
-        if (held.value.digest === digest) {
-          yield* Effect.logInfo('upload already stored').pipe(
-            Effect.annotateLogs({
-              ...uploadLog,
-              token: shortToken(held.value.id),
-              digest: held.value.digest,
-              expiresAt: held.value.expiresAt.toString(),
-            }),
-          );
-          return yield* answerUnread(request, 200, describeArtifact(held.value));
-        }
-        if (!overwrite) {
-          return yield* refuseAndLog(request, 409, NAME_TAKEN, 'name taken').pipe(
-            Effect.annotateLogs(uploadLog),
-          );
-        }
-      }
-      if ((yield* store.freeBytes) - size < config.minFreeBytes) {
-        return yield* refuseAndLog(request, 507, 'Not enough free space on the server');
-      }
-
-      return yield* store
-        .put({
-          repository,
-          scope: runScope,
-          name,
-          size,
-          digest,
-          overwrite,
-          retentionDays,
-          body: request.stream.pipe(
-            Stream.mapError(error => new UploadFailedError({ reason: describeError(error) })),
-          ),
-        })
-        .pipe(
-          Effect.tap(({ artifact, isNew }) =>
-            Effect.logInfo(isNew ? 'upload' : 'upload already stored').pipe(
-              Effect.annotateLogs({
-                ...uploadLog,
-                token: shortToken(artifact.id),
-                digest: artifact.digest,
-                expiresAt: artifact.expiresAt.toString(),
-              }),
-            ),
-          ),
-          Effect.map(({ artifact, isNew }) =>
-            respondJson(isNew ? 201 : 200, describeArtifact(artifact)),
-          ),
-          // In a finalizer, as a failed write breaks the connection, which interrupts this fiber
-          // too, and nothing after that would run.
-          Effect.onError(cause => {
-            const failure = Cause.squash(cause);
-            const reason = (() => {
-              if (failure instanceof UploadFailedError) return failure.reason;
-              return Cause.hasInterruptsOnly(cause) ? 'connection closed' : undefined;
-            })();
-            if (reason === undefined) return Effect.void;
-            return Effect.logInfo('upload stopped').pipe(
-              Effect.annotateLogs({ ...uploadLog, reason }),
-            );
-          }),
-          Effect.catchTags({
-            UploadFailedError: () => answerUnread(request, 500, { error: 'Upload failed' }),
-            ArtifactExistsError: () =>
-              Effect.logInfo('upload refused').pipe(
-                Effect.annotateLogs({ ...uploadLog, status: 409, reason: 'name taken' }),
-                Effect.as(respondJson(409, { error: NAME_TAKEN })),
-              ),
-            DigestMismatchError: ({ expected, actual }) =>
-              Effect.logInfo('upload refused').pipe(
-                Effect.annotateLogs({ ...uploadLog, status: 422, expected, actual }),
-                Effect.as(
-                  respondJson(422, {
-                    error: `The body's SHA-256 is ${actual}, not the digest sent, ${expected}. Did the file change while it was uploading?`,
-                  }),
-                ),
-              ),
-          }),
-        );
+      return { name, size, digest, overwrite: overwriteParam === 'true', retentionDays };
     });
+
+    const uploadLogOf = (
+      repository: string,
+      { name, size, scope }: Pick<UploadDeclaration, 'name' | 'size' | 'scope'>,
+    ) => ({ repository, name, size, ...scope });
+
+    const logStored = (
+      message: string,
+      uploadLog: ReturnType<typeof uploadLogOf>,
+      artifact: ArtifactMeta,
+    ) =>
+      Effect.logInfo(message).pipe(
+        Effect.annotateLogs({
+          ...uploadLog,
+          token: shortToken(artifact.id),
+          digest: artifact.digest,
+          expiresAt: artifact.expiresAt,
+        }),
+      );
+
+    const refuseNameTaken = (uploadLog: ReturnType<typeof uploadLogOf>) =>
+      Effect.logInfo('upload refused').pipe(
+        Effect.annotateLogs({ ...uploadLog, status: 409, reason: 'name taken' }),
+        Effect.as(respondJson(409, { error: NAME_TAKEN })),
+      );
+
+    /** With what a job declares, a retry or a refusal needs none of the body. */
+    const createUpload = Effect.fnUntraced(function* (
+      request: HttpServerRequest.HttpServerRequest,
+    ) {
+      const uploadsMatch = UPLOADS_URL.exec(request.url);
+      if (uploadsMatch === null) return notFound;
+
+      const { repository, scope: runScope } = yield* authenticate(request);
+      const declaration = yield* parseDeclaration(uploadsMatch[1] ?? '');
+      if (!(yield* store.isPresent)) return yield* refusal(503, 'The store is missing');
+      const { name, digest, overwrite } = declaration;
+      const uploadLog = uploadLogOf(repository, { ...declaration, scope: runScope });
+
+      const held = yield* store.findByName({ scope: runScope, name });
+      if (Option.isSome(held)) {
+        if (held.value.digest === digest) {
+          yield* logStored('upload already stored', uploadLog, held.value);
+          return respondJson(200, describeArtifact(held.value));
+        }
+        if (!overwrite) return yield* refuseNameTaken(uploadLog);
+      }
+      const upload = yield* store
+        .create({ ...declaration, scope: runScope })
+        .pipe(
+          Effect.catchTag('NotEnoughSpaceError', () =>
+            Effect.fail(refusal(507, 'Not enough free space on the server')),
+          ),
+        );
+      yield* Effect.logInfo('upload started').pipe(
+        Effect.annotateLogs({ ...uploadLog, token: shortToken(upload.id) }),
+      );
+      return respondJson(201, { upload });
+    }, answeringRefusals('upload'));
+
+    const commitUpload = Effect.fnUntraced(function* (
+      request: HttpServerRequest.HttpServerRequest,
+    ) {
+      const [, id, query] = COMMIT_URL.exec(request.url) ?? [];
+      if (id === undefined) return notFound;
+
+      const { repository, scope: runScope } = yield* authenticate(request);
+      const declaration = yield* parseDeclaration(query ?? '');
+      if (!(yield* store.isPresent)) return yield* refusal(503, 'The store is missing');
+      const uploadLog = uploadLogOf(repository, { ...declaration, scope: runScope });
+
+      return yield* store.commit({ ...declaration, id, repository, scope: runScope }).pipe(
+        Effect.tap(({ artifact, isNew }) =>
+          logStored(isNew ? 'upload' : 'upload already stored', uploadLog, artifact),
+        ),
+        Effect.map(({ artifact, isNew }) =>
+          respondJson(isNew ? 201 : 200, describeArtifact(artifact)),
+        ),
+        Effect.catchTags({
+          ArtifactExistsError: () => refuseNameTaken(uploadLog),
+          UploadNotFoundError: () =>
+            Effect.fail(
+              refusal(
+                404,
+                "This upload is not there to commit: its body never arrived, it has expired, or it is another run's",
+              ),
+            ),
+        }),
+      );
+    }, answeringRefusals('upload'));
 
     const describeListed = (artifact: ArtifactMeta) => ({
       ...describeArtifact(artifact),
@@ -318,17 +285,8 @@ export const ArtifactRoutes = Layer.unwrap(
       if (Option.isNone(repositoryId)) return respondJson(200, { artifacts: [] });
       const run = { repositoryId: repositoryId.value, runId };
 
-      const artifacts = yield* (() => {
-        if (names.length === 0) {
-          return Effect.map(store.listLatest(run), found =>
-            ids.length === 0 ? found : found.filter(({ id }) => ids.includes(id)),
-          );
-        }
-        return Effect.map(
-          Effect.forEach(names, name => store.findLatest({ ...run, name }), { concurrency: 1 }),
-          Arr.getSomes,
-        );
-      })();
+      const found = yield* store.listLatest({ ...run, names });
+      const artifacts = ids.length === 0 ? found : found.filter(({ id }) => ids.includes(id));
       yield* Effect.logInfo('list').pipe(
         Effect.annotateLogs({ repository: ownRepository, ...run, count: artifacts.length }),
       );
@@ -368,7 +326,7 @@ export const ArtifactRoutes = Layer.unwrap(
     const stopDownload = (request: HttpServerRequest.HttpServerRequest, token: string) =>
       Effect.fnUntraced(function* (exit: Exit.Exit<unknown, unknown>) {
         if (Exit.isSuccess(exit)) return;
-        NodeHttpServerRequest.toServerResponse(request).destroy();
+        yield* breaker.breakResponse(request);
         const reason = Cause.hasInterruptsOnly(exit.cause)
           ? 'connection closed'
           : describeError(Cause.squash(exit.cause));
@@ -382,21 +340,41 @@ export const ArtifactRoutes = Layer.unwrap(
       const isRead = request.method === 'GET' || request.method === 'HEAD';
       if (token === undefined || name === undefined || !isRead) return notFound;
 
-      const artifact = yield* store.find(token, name);
-      if (Option.isNone(artifact)) return notFound;
-      const { size, data } = artifact.value;
+      const found = yield* store.findDownload(token, name);
+      if (found._tag === 'NotFound') return notFound;
 
       yield* Effect.logInfo(request.method).pipe(
-        Effect.annotateLogs({ token: shortToken(token), name, size }),
+        Effect.annotateLogs({ token: shortToken(token), name, size: found.size }),
       );
-      return HttpServerResponse.stream(data.pipe(Stream.onExit(stopDownload(request, token))), {
-        contentLength: size,
-        contentType: 'application/octet-stream',
-        headers: {
-          'content-disposition': `attachment; filename="${name}"`,
-          'x-content-type-options': 'nosniff',
-          'content-security-policy': "sandbox; default-src 'none'",
-        },
+      const fileHeaders = {
+        'content-disposition': `attachment; filename="${name}"`,
+        'x-content-type-options': 'nosniff',
+        'content-security-policy': "sandbox; default-src 'none'",
+      };
+      if (found._tag === 'Stream') {
+        return HttpServerResponse.stream(
+          found.data.pipe(Stream.onExit(stopDownload(request, token))),
+          {
+            contentLength: found.size,
+            contentType: 'application/octet-stream',
+            headers: fileHeaders,
+          },
+        );
+      }
+      // Answered here, as a store needn't take a `HEAD` at a URL with a signature in it: R2 doesn't.
+      if (request.method === 'HEAD') {
+        return HttpServerResponse.empty({
+          status: 200,
+          headers: {
+            ...fileHeaders,
+            'content-length': String(found.size),
+            'content-type': 'application/octet-stream',
+          },
+        });
+      }
+      return HttpServerResponse.redirect(found.location, {
+        status: 302,
+        headers: { 'cache-control': 'no-store' },
       });
     });
 
@@ -406,28 +384,15 @@ export const ArtifactRoutes = Layer.unwrap(
         : respondJson(503, { error: 'The store is missing' });
     });
 
-    /** The one place a fault becomes an answer, and the reason it reaches the log holds no path. */
-    const answeringFaults = <E>(handler: Effect.Effect<HttpServerResponse.HttpServerResponse, E>) =>
-      handler.pipe(
-        Effect.catchCauseIf(
-          cause => !Cause.hasInterruptsOnly(cause),
-          cause =>
-            Effect.logError('request failed').pipe(
-              Effect.annotateLogs({ reason: describeError(Cause.squash(cause)) }),
-              Effect.as(respondJson(500, { error: 'Internal error' })),
-            ),
-        ),
-      );
-
     return HttpRouter.addAll([
       HttpRouter.route('GET', '/healthz', answeringFaults(healthz)),
-      HttpRouter.route('POST', '/artifacts', request => answeringFaults(upload(request))),
+      HttpRouter.route('POST', '/uploads', request => answeringFaults(createUpload(request))),
+      HttpRouter.route('POST', '/uploads/:id/commit', request =>
+        answeringFaults(commitUpload(request)),
+      ),
       HttpRouter.route('GET', '/artifacts', request => answeringFaults(list(request))),
       HttpRouter.route('DELETE', '/artifacts/*', request => answeringFaults(remove(request))),
       HttpRouter.route('*', '*', request => answeringFaults(download(request))),
     ]);
   }),
 );
-
-/** Effect's request logger is off: it logs the URL, which holds a full download token. */
-export const ArtifactServer = HttpRouter.serve(ArtifactRoutes, { disableLogger: true });

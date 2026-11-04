@@ -13,6 +13,7 @@ import * as Schedule from 'effect/Schedule';
 import * as Schema from 'effect/Schema';
 import * as Stream from 'effect/Stream';
 import { ClientError } from './client-support.ts';
+import { codeOf } from './log.ts';
 import { ARTIFACT_ID, FILE_NAME, SHA_256 } from './protocol.ts';
 
 // What both targets need of HTTP: the retries, a request that doesn't hold its body in memory, a body
@@ -63,24 +64,60 @@ export const unavailableFrom = ({ reason }: HttpClientError.HttpClientError) =>
   });
 
 /**
+ * For a request whose URL is a credential. An `HttpClientError`'s message holds the URL, and what a
+ * cause says is up to whatever failed, so all that's kept of it is a system error's code.
+ */
+const unavailableScrubbed =
+  (what: string) =>
+  ({ reason }: HttpClientError.HttpClientError) => {
+    const cause = 'cause' in reason ? reason.cause : undefined;
+    const code = codeOf(cause) ?? (Predicate.isError(cause) ? codeOf(cause.cause) : undefined);
+    return new UnavailableError({ message: code === undefined ? what : `${what}: ${code}` });
+  };
+
+export const unavailableWithoutUrl = unavailableScrubbed('The upload failed');
+
+/** For a download that a redirect may have sent to a URL with a signature in it. */
+export const downloadUnavailable = unavailableScrubbed('The download failed');
+
+/**
  * Without both, `fetch` keeps a whole upload's body in memory to replay it on a redirect. A runner
- * has no reason to follow one to anywhere else, so every request here refuses them.
+ * has no reason to follow one to anywhere else, so every request with a body refuses them.
  */
 const REQUEST_INIT = { redirect: 'error', window: null } as const;
 
-export const executeRequest = (
-  client: HttpClient.HttpClient,
-  request: HttpClientRequest.HttpClientRequest,
-) =>
-  client
-    .execute(request)
-    .pipe(
-      Effect.provideService(FetchHttpClient.RequestInit, REQUEST_INIT),
-      Effect.mapError(unavailableFrom),
-    );
+const executeWith =
+  (
+    init: RequestInit,
+    toUnavailable: (error: HttpClientError.HttpClientError) => UnavailableError,
+  ) =>
+  (client: HttpClient.HttpClient, request: HttpClientRequest.HttpClientRequest) =>
+    client
+      .execute(request)
+      .pipe(
+        Effect.provideService(FetchHttpClient.RequestInit, init),
+        Effect.mapError(toUnavailable),
+      );
+
+export const executeRequest = executeWith(REQUEST_INIT, unavailableFrom);
+
+/** `executeRequest`, for a URL that must not reach a message. */
+export const executeWithoutUrl = executeWith(REQUEST_INIT, unavailableWithoutUrl);
+
+/**
+ * The one request that goes where it's sent: a server in front of a bucket answers a link with a
+ * redirect. It has no body to hold, and where it ends up holds a signature.
+ */
+export const executeDownload = executeWith(
+  { redirect: 'follow', window: null },
+  downloadUnavailable,
+);
 
 /** A network error or a 5xx might pass; any other refusal fails at once with its message. */
-export const withRetries = <A, R>(attempt: Effect.Effect<A, ClientError | UnavailableError, R>) =>
+export const withRetries = <A, R>(
+  attempt: Effect.Effect<A, ClientError | UnavailableError, R>,
+  note: (message: string) => Effect.Effect<void> = Console.error,
+) =>
   attempt.pipe(
     Effect.retry({
       while: Predicate.isTagged('UnavailableError'),
@@ -89,7 +126,7 @@ export const withRetries = <A, R>(attempt: Effect.Effect<A, ClientError | Unavai
         // A schedule sees what `while` is about to stop, too, which isn't being retried.
         Schedule.tap(({ attempt: failed, duration, input }) =>
           Predicate.isTagged(input, 'UnavailableError')
-            ? Console.error(
+            ? note(
                 // A line of the target's choosing could otherwise start a workflow command.
                 `Attempt ${failed} failed (${input.message.replaceAll(/[\r\n]+/gu, ' ')}), retrying in ${Duration.toSeconds(duration)}s`,
               )
@@ -106,16 +143,18 @@ export const streamBodyToFile = Effect.fnUntraced(function* ({
   response,
   artifact: { name, size },
   target,
+  toUnavailable = unavailableFrom,
 }: {
   fs: FileSystem.FileSystem;
   response: HttpClientResponse.HttpClientResponse;
   artifact: ListedArtifact;
   target: string;
+  toUnavailable?: (error: HttpClientError.HttpClientError) => UnavailableError;
 }) {
   const hash = createHash('sha256');
   let received = 0;
   yield* response.stream.pipe(
-    Stream.mapError(unavailableFrom),
+    Stream.mapError(toUnavailable),
     Stream.tap(chunk => {
       received += chunk.length;
       if (received > size) {

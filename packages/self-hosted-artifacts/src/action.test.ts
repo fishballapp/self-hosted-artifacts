@@ -2,7 +2,13 @@ import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdir, readdir, readFile, rm, symlink, truncate, writeFile } from 'node:fs/promises';
-import { createServer, type Server } from 'node:http';
+import {
+  createServer,
+  type IncomingHttpHeaders,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from 'node:http';
 import { dirname, join } from 'node:path';
 import { unzipSync } from 'fflate';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -21,6 +27,14 @@ import {
 import { closeServer, listenOnLoopback, verifierAnswering } from './test-support.ts';
 
 let ACTION: string;
+const UPLOAD_ID = 'U'.repeat(43);
+const STORED = { id: UPLOAD_ID, links: { home: 'http://x/a' }, expiresAt: 'x' };
+
+type UploadStep = (req: IncomingMessage, res: ServerResponse) => unknown;
+
+const answerJson = (res: ServerResponse, status: number, body: unknown) =>
+  res.writeHead(status, { 'Content-Type': 'application/json' }).end(JSON.stringify(body));
+
 // CI sets this to a Node 24 binary, as that is what the runner runs the action on.
 const ACTION_NODE = process.env.ACTION_NODE ?? process.execPath;
 
@@ -69,7 +83,7 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
 
   /** Only a server has tokens to count. */
   const expectTokenRequests = (count: number) => {
-    if (kind === 'server') expect(runner.tokenRequests).toHaveLength(count);
+    if (kind !== 's3') expect(runner.tokenRequests).toHaveLength(count);
   };
 
   /** Spawned as the runner does, so the in-process servers keep answering while it runs. */
@@ -128,9 +142,10 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
     expect(stdout).not.toContain('::error::');
     expect(exitCode).toBe(0);
 
-    if (kind === 'server') {
-      // The audience joins a query string the URL already has, with the runner's bearer token.
-      expect(runner.tokenRequests).toHaveLength(1);
+    if (kind !== 's3') {
+      // One to start and one to commit, so a long upload can't outlive its token. The audience joins
+      // a query string the URL already has, with the runner's bearer token.
+      expect(runner.tokenRequests).toHaveLength(2);
       expect(runner.tokenRequests[0]?.url.searchParams.get('api-version')).toBe('2.0');
       expect(runner.tokenRequests[0]?.url.searchParams.get('audience')).toBe(AUDIENCE);
       expect(runner.tokenRequests[0]?.authorization).toBe(`Bearer ${REQUEST_TOKEN}`);
@@ -138,7 +153,7 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
 
     const outputs = await readOutputs();
     const links = JSON.parse(outputs.links ?? '') as Record<string, string>;
-    expect(Object.keys(links)).toEqual(kind === 'server' ? ['home', 'tailscale'] : ['s3']);
+    expect(Object.keys(links)).toEqual(kind === 's3' ? ['s3'] : ['home', 'tailscale']);
     const [firstLink = ''] = Object.values(links);
     expect(outputs['artifact-url']).toBe(firstLink);
     expect(firstLink).toMatch(/\/liuk-preview\.apk$/);
@@ -581,7 +596,7 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
   });
 
   // The test server's are 7 and 30 days, and a bucket's are always 90.
-  const [defaultHours, maximumHours] = kind === 'server' ? [168, 720] : [2160, 2160];
+  const [defaultHours, maximumHours] = kind === 's3' ? [2160, 2160] : [168, 720];
   it.each([
     ['unset', {}, defaultHours],
     ['0', { 'INPUT_RETENTION-DAYS': '0' }, defaultHours],
@@ -630,22 +645,13 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
     'keeps the zip across retries, zipping once, then removes it',
     async () => {
       const bodies: Buffer[] = [];
-      const artifactServer = createServer(async (req, res) => {
-        if (req.method !== 'POST') return void res.writeHead(404).end();
-        bodies.push(Buffer.concat(await Array.fromAsync(req)));
-        const isFirst = bodies.length === 1;
-        res
-          .writeHead(isFirst ? 500 : 201, { 'Content-Type': 'application/json' })
-          .end(
-            JSON.stringify(
-              isFirst
-                ? { error: 'try again' }
-                : { id: 'an-id', links: { home: 'http://x/a' }, expiresAt: 'x' },
-            ),
-          );
-        return undefined;
+      await useUploadServer({
+        put: async (req, res) => {
+          bodies.push(Buffer.concat(await Array.fromAsync(req)));
+          if (bodies.length > 1) return void res.writeHead(200).end();
+          return void answerJson(res, 500, { error: 'try again' });
+        },
       });
-      await useFakeServer(artifactServer);
       await writeFiles({ 'a.txt': 'a' });
 
       const { exitCode, stderr } = await runAction({ INPUT_PATH: 'a.txt' });
@@ -696,8 +702,8 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
 
       expect(second.exitCode).toBe(1);
       expect(second.stdout).toMatch(/^::error::An artifact with this name already exists/m);
-      // A refusal the server means is not retried.
-      expectTokenRequests(2);
+      // Two for the first upload, and a refusal the server means is not retried.
+      expectTokenRequests(3);
       await expect(readFile(outputPath, 'utf8')).rejects.toThrow(/ENOENT/);
       expect(await statusOfLink(first.outputs['artifact-url'])).toBe(200);
     });
@@ -806,7 +812,10 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
       expect(exitCode).toBe(0);
       expect(uploads).toBe(2);
       const outputs = await readOutputs();
-      expect(await artifactsStored()).toEqual([outputs['artifact-id']]);
+      const stored = await artifactsStored();
+      expect(stored).toContain(outputs['artifact-id']);
+      // A server in front of a bucket can't tell a body arrived, so the first waits for the lifecycle rule.
+      expect(stored).toHaveLength(kind === 'server-s3' ? 2 : 1);
       expect(Buffer.from(await downloadOutput(outputs['artifact-url'])).toString()).toBe(
         'the build',
       );
@@ -815,7 +824,13 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
     it.runIf(kind === 'server')(
       'fails when the file changes between its digest and its upload',
       async () => {
-        await startFakeServer([{ status: 422, body: { error: "The body's SHA-256 is not that" } }]);
+        await useUploadServer({
+          put: async (req, res) => {
+            req.resume();
+            await once(req, 'end');
+            answerJson(res, 422, { error: "The body's SHA-256 is not that" });
+          },
+        });
         await writeFiles({ 'app.bin': 'x' });
         const { exitCode, stdout } = await runAction({ INPUT_PATH: 'app.bin' });
         expect(exitCode).toBe(1);
@@ -824,29 +839,347 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
       },
     );
 
-    it.runIf(kind === 'server')('sends the digest and, only when set, overwrite', async () => {
-      const requested: URL[] = [];
-      const artifactServer = createServer((req, res) => {
-        if (req.method !== 'POST') return void res.writeHead(404).end();
-        requested.push(new URL(req.url ?? '', 'http://localhost'));
-        req.resume();
-        req.on('end', () => {
-          res
-            .writeHead(201, { 'Content-Type': 'application/json' })
-            .end(JSON.stringify({ id: 'an-id', links: { home: 'http://x/a' }, expiresAt: 'x' }));
+    it.runIf(kind === 'server')(
+      'declares the digest and size and, only when set, overwrite',
+      async () => {
+        const { creates, commits } = await useUploadServer();
+        await writeFiles({ 'app.bin': 'x' });
+        const digest = createHash('sha256').update('x').digest('hex');
+
+        expect((await uploadFile('x')).exitCode).toBe(0);
+        expect((await uploadFile('x', { INPUT_OVERWRITE: 'true' })).exitCode).toBe(0);
+
+        expect(creates[0]?.searchParams.get('digest')).toBe(digest);
+        expect(creates[0]?.searchParams.get('size')).toBe('1');
+        expect(creates[0]?.searchParams.has('overwrite')).toBe(false);
+        expect(creates[1]?.searchParams.get('overwrite')).toBe('true');
+        // The commit says the same again.
+        expect(commits.map(({ search }) => search)).toEqual(creates.map(({ search }) => search));
+      },
+    );
+
+    it.runIf(kind === 'server')(
+      'needs neither the body nor a commit for what is stored',
+      async () => {
+        const active = await startTarget();
+        const seen: string[] = [];
+        await active.interpose(({ method, url }) => {
+          seen.push(`${method} ${url?.split('?')[0]?.replace(/[A-Za-z0-9_-]{43}/u, '<id>')}`);
+          return undefined;
         });
-        return undefined;
+        const first = await uploadFile('the build');
+        expect(seen).toEqual(['POST /uploads', 'PUT /uploads/<id>', 'POST /uploads/<id>/commit']);
+        seen.length = 0;
+
+        const second = await uploadFile('the build');
+
+        expect(second.exitCode).toBe(0);
+        expect(second.outputs).toEqual(first.outputs);
+        expect(seen).toEqual(['POST /uploads']);
+      },
+    );
+
+    it.runIf(kind === 'server')('survives losing the answer to a commit that landed', async () => {
+      const active = await startTarget();
+      const seen: string[] = [];
+      await active.interpose(({ method, url = '' }) => {
+        const route = `${method} ${url.split('?')[0]?.replace(/[A-Za-z0-9_-]{43}/u, '<id>')}`;
+        seen.push(route);
+        return route === 'POST /uploads/<id>/commit' ? 'lose-answer' : undefined;
       });
-      await useFakeServer(artifactServer);
+
+      const result = await uploadFile('the build');
+
+      expect(result.stderr).toContain('Attempt 1 failed (The upload failed');
+      expect(result.exitCode).toBe(0);
+      // The next attempt's first step finds the digest stored, and that's all it takes.
+      expect(seen).toEqual([
+        'POST /uploads',
+        'PUT /uploads/<id>',
+        'POST /uploads/<id>/commit',
+        'POST /uploads',
+      ]);
+      expect(await artifactsStored()).toEqual([result.outputs['artifact-id']]);
+      expect(Buffer.from(await downloadOutput(result.outputs['artifact-url'])).toString()).toBe(
+        'the build',
+      );
+      expect(await readdir(join(runner.storeDir, 'tmp'))).toEqual([]);
+    });
+  });
+
+  /**
+   * A server a test wrote, taking uploads as the real one does, with the steps the test cares about
+   * its own. A probe of a loopback port asks for neither of these, so it uses up nothing.
+   */
+  const useUploadServer = async ({
+    create = (_req, res) =>
+      answerJson(res, 201, {
+        upload: { id: UPLOAD_ID, url: `/uploads/${UPLOAD_ID}`, headers: {} },
+      }),
+    put = (req, res) => {
+      req.resume();
+      req.on('end', () => res.writeHead(200).end());
+    },
+    commit = (_req, res) => answerJson(res, 201, STORED),
+  }: {
+    create?: UploadStep;
+    put?: UploadStep;
+    commit?: UploadStep;
+  } = {}) => {
+    const creates: URL[] = [];
+    const commits: URL[] = [];
+    const puts: { url: string; headers: IncomingHttpHeaders }[] = [];
+    await useFakeServer(
+      createServer((req, res) => {
+        const url = new URL(req.url ?? '', 'http://localhost');
+        if (req.method === 'POST' && url.pathname.endsWith('/commit')) {
+          commits.push(url);
+          return void commit(req, res);
+        }
+        if (req.method === 'POST') {
+          creates.push(url);
+          return void create(req, res);
+        }
+        if (req.method === 'PUT') {
+          puts.push({ url: req.url ?? '', headers: req.headers });
+          return void put(req, res);
+        }
+        return void res.writeHead(404).end();
+      }),
+    );
+    return { creates, commits, puts };
+  };
+
+  it.runIf(kind === 'server')(
+    'sends the body with exactly the headers given, and no token',
+    async () => {
+      const headers = {
+        'content-type': 'application/x-signed',
+        'content-disposition': 'attachment; filename="app.bin"',
+        'content-length': '1',
+        'x-amz-checksum-sha256': 'abc=',
+      };
+      const { puts } = await useUploadServer({
+        create: (_req, res) =>
+          answerJson(res, 201, {
+            upload: { id: UPLOAD_ID, url: `/uploads/${UPLOAD_ID}`, headers },
+          }),
+      });
       await writeFiles({ 'app.bin': 'x' });
-      const digest = createHash('sha256').update('x').digest('hex');
 
-      expect((await uploadFile('x')).exitCode).toBe(0);
-      expect((await uploadFile('x', { INPUT_OVERWRITE: 'true' })).exitCode).toBe(0);
+      expect((await runAction({ INPUT_PATH: 'app.bin', INPUT_ARCHIVE: 'false' })).exitCode).toBe(0);
 
-      expect(requested[0]?.searchParams.get('digest')).toBe(digest);
-      expect(requested[0]?.searchParams.has('overwrite')).toBe(false);
-      expect(requested[1]?.searchParams.get('overwrite')).toBe('true');
+      expect(puts).toHaveLength(1);
+      expect(puts[0]?.headers).toMatchObject(headers);
+      expect(puts[0]?.headers).not.toHaveProperty('authorization');
+      expect(runner.tokenRequests).toHaveLength(2);
+    },
+  );
+
+  it.runIf(kind === 'server')('sends no content type it was not given', async () => {
+    const { puts } = await useUploadServer();
+    await writeFiles({ 'app.bin': 'x' });
+    expect((await runAction({ INPUT_PATH: 'app.bin', INPUT_ARCHIVE: 'false' })).exitCode).toBe(0);
+    expect(puts[0]?.headers).not.toHaveProperty('content-type');
+    expect(puts[0]?.headers['content-length']).toBe('1');
+  });
+
+  it.runIf(kind === 'server')('sends an empty file with a length of nothing', async () => {
+    const { puts } = await useUploadServer();
+    await writeFiles({ 'empty.bin': '' });
+    expect((await runAction({ INPUT_PATH: 'empty.bin', INPUT_ARCHIVE: 'false' })).exitCode).toBe(0);
+    expect(puts[0]?.headers['content-length']).toBe('0');
+  });
+
+  it.runIf(kind === 'server')('takes an absolute URL as it is, query and all', async () => {
+    const signed = `/elsewhere/${UPLOAD_ID}?X-Amz-Signature=a%2Fb%2Bc&X-Amz-Credential=k%2F20261103%2Fauto`;
+    const { puts } = await useUploadServer({
+      create: (req, res) =>
+        answerJson(res, 201, {
+          upload: { id: UPLOAD_ID, url: `http://${req.headers.host}${signed}`, headers: {} },
+        }),
+    });
+    await writeFiles({ 'app.bin': 'x' });
+    expect((await runAction({ INPUT_PATH: 'app.bin', INPUT_ARCHIVE: 'false' })).exitCode).toBe(0);
+    expect(puts[0]?.url).toBe(signed);
+  });
+
+  it.runIf(kind === 'server')(
+    'resolves a path against server-url, keeping any path of its own',
+    async () => {
+      const { creates, commits, puts } = await useUploadServer();
+      await writeFiles({ 'app.bin': 'x' });
+
+      const { exitCode } = await runAction({
+        INPUT_PATH: 'app.bin',
+        INPUT_ARCHIVE: 'false',
+        'INPUT_SERVER-URL': `${serverUrl}/behind/a/proxy/`,
+      });
+
+      expect(exitCode).toBe(0);
+      expect(creates[0]?.pathname).toBe('/behind/a/proxy/uploads');
+      expect(puts[0]?.url).toBe(`/behind/a/proxy/uploads/${UPLOAD_ID}`);
+      expect(commits[0]?.pathname).toBe(`/behind/a/proxy/uploads/${UPLOAD_ID}/commit`);
+    },
+  );
+
+  it.runIf(kind === 'server')('reaches the server by server-url, and no link base', async () => {
+    // The target's link bases are ones a runner can't reach, so any use of them would fail.
+    await startTarget();
+    await writeFiles({ 'app.bin': 'x' });
+    const { exitCode } = await runAction({ INPUT_PATH: 'app.bin', INPUT_ARCHIVE: 'false' });
+    expect(exitCode).toBe(0);
+    expect((await readOutputs())['artifact-url']).toMatch(/^http:\/\/127\.0\.0\.1:1\//u);
+  });
+
+  describe.runIf(kind === 'server')('an upload URL, which is a credential', () => {
+    const SIGNATURE = 'X-Amz-Signature=this-must-not-be-seen';
+
+    const expectUnseen = async (result: { stdout: string; stderr: string }) => {
+      const outputs = await readFile(outputPath, 'utf8').catch(() => '');
+      for (const seen of [result.stdout, result.stderr, outputs]) {
+        expect(seen).not.toContain(UPLOAD_ID);
+        expect(seen).not.toContain(SIGNATURE);
+      }
+    };
+
+    const run = async () => {
+      await writeFiles({ 'app.bin': 'x' });
+      return runAction({ INPUT_PATH: 'app.bin', INPUT_ARCHIVE: 'false' });
+    };
+
+    it.each<[string, UploadStep]>([
+      ['the connection is cut', req => void req.socket.destroy()],
+      ['a 5xx answers it', (_req, res) => answerJson(res, 502, { error: 'bad gateway' })],
+      ['a 5xx with no message answers it', (_req, res) => void res.writeHead(503).end('<html>')],
+    ])('stays out of everything when %s', { timeout: 20_000 }, async (_, put) => {
+      await useUploadServer({
+        create: (_req, res) =>
+          answerJson(res, 201, {
+            upload: { id: UPLOAD_ID, url: `/uploads/${UPLOAD_ID}?${SIGNATURE}`, headers: {} },
+          }),
+        put,
+      });
+
+      const result = await run();
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain('Attempt 3 failed');
+      expect(result.stdout).toContain('::error::');
+      await expectUnseen(result);
+    });
+
+    it('stays out of everything when nothing listens there', { timeout: 20_000 }, async () => {
+      const nothing = createServer();
+      const closed = await listenOnLoopback(nothing);
+      await closeServer(nothing);
+      await useUploadServer({
+        create: (_req, res) =>
+          answerJson(res, 201, {
+            upload: {
+              id: UPLOAD_ID,
+              url: `${closed}/uploads/${UPLOAD_ID}?${SIGNATURE}`,
+              headers: {},
+            },
+          }),
+      });
+
+      const result = await run();
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toMatch(/^::error::The upload failed: ECONNREFUSED/m);
+      await expectUnseen(result);
+    });
+
+    it('stays out of everything when a redirect answers it', { timeout: 20_000 }, async () => {
+      await useUploadServer({
+        create: (_req, res) =>
+          answerJson(res, 201, {
+            upload: { id: UPLOAD_ID, url: `/uploads/${UPLOAD_ID}?${SIGNATURE}`, headers: {} },
+          }),
+        put: (_req, res) => void res.writeHead(307, { Location: '/elsewhere' }).end(),
+      });
+
+      const result = await run();
+
+      expect(result.exitCode).toBe(1);
+      await expectUnseen(result);
+    });
+
+    it('stays out of everything when it is not a URL at all', async () => {
+      await useUploadServer({
+        create: (_req, res) =>
+          answerJson(res, 201, {
+            upload: { id: UPLOAD_ID, url: `http://[${UPLOAD_ID}?${SIGNATURE}`, headers: {} },
+          }),
+      });
+
+      const result = await run();
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stdout).toContain('answered without a usable upload');
+      await expectUnseen(result);
+    });
+
+    it('stays out of everything when the commit fails', { timeout: 20_000 }, async () => {
+      await useUploadServer({ commit: req => void req.socket.destroy() });
+
+      const result = await run();
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain('Attempt 3 failed (The upload failed');
+      await expectUnseen(result);
+    });
+
+    it('stays out of everything when a commit is cut short', { timeout: 20_000 }, async () => {
+      await useUploadServer({
+        commit: (_req, res) => {
+          res
+            .writeHead(201, { 'Content-Type': 'application/json', 'Content-Length': 100 })
+            .write('{', () => res.destroy());
+        },
+      });
+
+      const result = await run();
+
+      expect(result.exitCode).toBe(1);
+      await expectUnseen(result);
+    });
+
+    it('stays off stdout on the command line too', { timeout: 20_000 }, async () => {
+      await useUploadServer({
+        create: (_req, res) =>
+          answerJson(res, 201, {
+            upload: { id: UPLOAD_ID, url: `/uploads/${UPLOAD_ID}?${SIGNATURE}`, headers: {} },
+          }),
+        put: req => void req.socket.destroy(),
+      });
+      await writeFiles({ 'app.bin': 'x' });
+
+      const result = await new Promise<{ stdout: string; stderr: string; exitCode: number }>(
+        resolve => {
+          execFile(
+            process.execPath,
+            [
+              new URL('./bin.ts', import.meta.url).pathname,
+              'upload',
+              '--server-url',
+              serverUrl,
+              '--audience',
+              AUDIENCE,
+              '--path',
+              'app.bin',
+              '--archive',
+              'false',
+            ],
+            { cwd: workDir, env: runner.runnerEnv },
+            (error, stdout, stderr) => resolve({ exitCode: exitCodeOf(error), stdout, stderr }),
+          );
+        },
+      );
+
+      expect(result.exitCode).toBe(1);
+      await expectUnseen(result);
     });
   });
 
@@ -943,7 +1276,8 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
     const { exitCode, stderr } = await runAction({ INPUT_PATH: path });
     expect(stderr).toContain('Attempt 1 failed (GitHub signing keys are unavailable)');
     expect(exitCode).toBe(0);
-    expectTokenRequests(2);
+    // Two for the attempt that failed and the one that started over, and one for its commit.
+    expectTokenRequests(3);
   });
 
   const startFakeServer = async (answers: { status: number; body: unknown }[]) => {
@@ -979,7 +1313,7 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
       { id: 'an-id', links: { home: 'http://x/a' }, expiresAt: 'x\nowned=1' },
     ],
   ])('refuses an answer with %s, writing no outputs', async (_, body) => {
-    await startFakeServer([{ status: 201, body }]);
+    await startFakeServer([{ status: 200, body }]);
     const path = join(rootDir, 'a.bin');
     await writeFile(path, 'x');
     const { exitCode, stdout } = await runAction({ INPUT_PATH: path });
@@ -987,6 +1321,36 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
     expect(stdout).toMatch(/^::error::.* answered without a usable link/m);
     await expect(readFile(outputPath, 'utf8')).rejects.toThrow(/ENOENT/);
   });
+
+  it.runIf(kind === 'server').each([
+    ['no upload', {}],
+    ['no ID', { upload: { url: '/uploads/x', headers: {} } }],
+    ['an ID that could lead elsewhere', { upload: { id: '../..', url: '/x', headers: {} } }],
+    ['no URL', { upload: { id: UPLOAD_ID, headers: {} } }],
+    ['no headers', { upload: { id: UPLOAD_ID, url: '/x' } }],
+    ['a line break in a header', { upload: { id: UPLOAD_ID, url: '/x', headers: { a: 'b\nc' } } }],
+  ])('refuses a new upload with %s, sending nothing', async (_, body) => {
+    const { puts } = await useUploadServer({ create: (_req, res) => answerJson(res, 201, body) });
+    await writeFiles({ 'a.bin': 'x' });
+    const { exitCode, stdout } = await runAction({ INPUT_PATH: 'a.bin' });
+    expect(exitCode).toBe(1);
+    expect(stdout).toMatch(/^::error::.* answered without a usable upload/m);
+    expect(puts).toEqual([]);
+  });
+
+  it.runIf(kind === 'server')(
+    'refuses a commit answered with no usable link, writing no outputs',
+    async () => {
+      await useUploadServer({
+        commit: (_req, res) => answerJson(res, 201, { id: 'an-id', links: {}, expiresAt: 'x' }),
+      });
+      await writeFiles({ 'a.bin': 'x' });
+      const { exitCode, stdout } = await runAction({ INPUT_PATH: 'a.bin' });
+      expect(exitCode).toBe(1);
+      expect(stdout).toMatch(/^::error::.* answered without a usable link/m);
+      await expect(readFile(outputPath, 'utf8')).rejects.toThrow(/ENOENT/);
+    },
+  );
 
   it.runIf(kind === 'server')(
     'retries an answer cut short, which a stored upload may have been',
@@ -1004,7 +1368,7 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
           posts += 1;
           const headers = { 'Content-Type': 'application/json', 'Content-Length': stored.length };
           if (posts > 1) return void res.writeHead(200, headers).end(stored);
-          res.writeHead(201, headers).write(stored.slice(0, 5), () => res.destroy());
+          res.writeHead(200, headers).write(stored.slice(0, 5), () => res.destroy());
           return undefined;
         });
         return undefined;
@@ -1025,7 +1389,7 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
     async () => {
       await startFakeServer([
         { status: 500, body: { error: 'boom\n::warning::injected' } },
-        { status: 201, body: { id: 'an-id', links: { home: 'http://x/a' }, expiresAt: 'x' } },
+        { status: 200, body: { id: 'an-id', links: { home: 'http://x/a' }, expiresAt: 'x' } },
       ]);
       const path = join(rootDir, 'a.bin');
       await writeFile(path, 'x');

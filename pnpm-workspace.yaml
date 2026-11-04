@@ -10,6 +10,8 @@ overrides:
 allowBuilds:
   "@biomejs/biome": true
   esbuild: true
+  sharp: false
+  workerd: true
 catalog:
   "@biomejs/biome": ^2.5.13
   "@effect/platform-node": 4.0.0
@@ -19,6 +21,7 @@ catalog:
   "@types/yazl": ^3.3.1
   effect: 4.0.0
   fflate: ^0.8.3
+  miniflare: 5.20260911.1-alpha
   minimatch: ^10.2.6
   repojj: ^2026.7.29
   tsdown: ^0.23.0

@@ -10,9 +10,8 @@ import * as Option from 'effect/Option';
 import * as Predicate from 'effect/Predicate';
 import * as Ref from 'effect/Ref';
 import * as Schema from 'effect/Schema';
-import * as Semaphore from 'effect/Semaphore';
 import { ServerConfig } from './config.ts';
-import { RunNumberSchema, type RunScope } from './store.ts';
+import { RunNumberSchema, type RunScope } from './store-contract.ts';
 
 const ISSUER = 'https://token.actions.githubusercontent.com';
 const RSA = { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' } as const;
@@ -133,8 +132,6 @@ export class TokenVerifier extends Context.Service<
       const client = (yield* HttpClient.HttpClient).pipe(HttpClient.filterStatusOk);
       const keys = yield* Ref.make(new Map<string, CryptoKey>());
       const lastFetch = yield* Ref.make(Option.none<{ atMs: number; isOk: boolean }>());
-      // One fetch at a time: those waiting then see its result and sit out the cooldown.
-      const fetching = yield* Semaphore.make(1);
 
       const fetchKeys = client
         .get(`${ISSUER}/.well-known/jwks`)
@@ -144,22 +141,22 @@ export class TokenVerifier extends Context.Service<
           Effect.timeout(JWKS_FETCH_TIMEOUT),
         );
 
-      const refreshKeys = fetching.withPermit(
-        Effect.gen(function* () {
-          const nowMs = yield* Clock.currentTimeMillis;
-          const isCoolingDown = Option.exists(
-            yield* Ref.get(lastFetch),
-            ({ atMs, isOk }) =>
-              nowMs - atMs < (isOk ? REFETCH_COOLDOWN_MS : REFETCH_COOLDOWN_AFTER_FAILURE_MS),
-          );
-          if (isCoolingDown) return;
-          const fetched = yield* Effect.option(fetchKeys);
-          // From when the fetch ended: one that timed out has otherwise already sat out its cooldown.
-          const atMs = yield* Clock.currentTimeMillis;
-          yield* Ref.set(lastFetch, Option.some({ atMs, isOk: Option.isSome(fetched) }));
-          if (Option.isSome(fetched)) yield* Ref.set(keys, fetched.value);
-        }),
-      );
+      // Each request fetches for itself, as a request waiting on another's fetch is cancelled as hung
+      // on a Worker. So tokens that arrive together may each fetch, until one's fetch starts the cooldown.
+      const refreshKeys = Effect.gen(function* () {
+        const nowMs = yield* Clock.currentTimeMillis;
+        const isCoolingDown = Option.exists(
+          yield* Ref.get(lastFetch),
+          ({ atMs, isOk }) =>
+            nowMs - atMs < (isOk ? REFETCH_COOLDOWN_MS : REFETCH_COOLDOWN_AFTER_FAILURE_MS),
+        );
+        if (isCoolingDown) return;
+        const fetched = yield* Effect.option(fetchKeys);
+        // From when the fetch ended: one that timed out has otherwise already sat out its cooldown.
+        const atMs = yield* Clock.currentTimeMillis;
+        yield* Ref.set(lastFetch, Option.some({ atMs, isOk: Option.isSome(fetched) }));
+        if (Option.isSome(fetched)) yield* Ref.set(keys, fetched.value);
+      });
 
       const reject = (reason: string) => Effect.fail(new TokenRejectedError({ reason }));
 

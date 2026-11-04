@@ -1,8 +1,9 @@
 # self-hosted-artifacts
 
 **Keep your GitHub Actions artifacts on a disk or in a bucket you own.** GitHub Actions that upload,
-download and merge artifacts, against either a small file server or S3 and anything S3-compatible,
-with no server at all.
+download and merge artifacts, against a small file server, which keeps them on its disk or in S3 or
+anything S3-compatible, and which can be a Cloudflare Worker, or against the bucket itself, with no server
+at all.
 
 GitHub's artifacts cap private storage at 500 MB on the free plan, which a few app builds fill, and
 `actions/upload-artifact` can't target your own storage. These actions take the same inputs by the
@@ -10,28 +11,31 @@ same rules as `actions/upload-artifact`, `actions/upload-artifact/merge` and
 `actions/download-artifact`, so moving to them means changing the `uses:` lines and saying where
 artifacts go.
 
-| | [A server](#run-the-server) | [A bucket](#use-a-bucket) |
-| --- | --- | --- |
-| **You run** | A process on a machine with a disk | Nothing |
-| **Say where with** | `server-url` | `s3-bucket`, `s3-link-base`, a region, and `s3-endpoint` off AWS |
-| **What proves who a job is** | The workflow's OIDC token, with `id-token: write`, so no secrets | The bucket's credentials, in the job's environment |
-| **Which repositories** | Private ones of one owner | Any job with the credentials |
-| **Who can read a link** | Anyone who has it and can reach the server | Anyone who has it, from anywhere |
-| **Expired files** | Swept hourly | Removed at the next upload, and by a lifecycle rule you add |
+| | [A server with a disk](#run-the-server) | [A server in front of a bucket](#a-server-in-front-of-a-bucket) | [A bucket alone](#use-a-bucket) |
+| --- | --- | --- | --- |
+| **Choose it when** | You have a machine with room, on a network you trust | You want a bucket's storage, with the bucket private and no keys in your jobs | You'd rather run nothing, and can give jobs the keys and make the bucket public |
+| **You run** | A process on a machine with a disk | A small process with no disk, or [a Cloudflare Worker](#run-it-on-a-cloudflare-worker) | Nothing |
+| **Say where with** | `server-url` | `server-url` | `s3-bucket`, `s3-link-base`, a region, and `s3-endpoint` off AWS |
+| **What proves who a job is** | The workflow's OIDC token, with `id-token: write`, so no secrets | The same | The bucket's credentials, in the job's environment |
+| **Which repositories** | Private ones of one owner | The same | Any job with the credentials |
+| **Who can read a link** | Anyone who has it and can reach the server | Anyone who has it and can reach the server and the bucket | Anyone who has it, from anywhere |
+| **Where the bytes go** | Through the server | Straight to and from the bucket | Straight to and from the bucket |
+| **Expired files** | Swept hourly | Links stop at once, and a lifecycle rule you add removes them | Removed at the next upload, and by a lifecycle rule you add |
 
 - **No dependencies.** The server installs from npm as one package, and the actions run as they are.
 - **No account to download.** Each upload also answers with an unguessable link that works with
-  `curl` or a browser, and expires by itself.
+  `curl -L` or a browser, and expires by itself.
 
 It's a young project, below 1.0: see [Versions](#versions) and [Not supported](#not-supported).
 
 ## Run the server
 
-Needs Node 26 and an existing directory to store files in. Write a config file:
+Needs Node 26, and an existing directory to store files in, or [a bucket](#a-server-in-front-of-a-bucket).
+Write a config file:
 
 ```json
 {
-  "storeDir": "/srv/artifacts",
+  "store": { "kind": "disk", "dir": "/srv/artifacts" },
   "oidcAudience": "self-hosted-artifacts",
   "oidcRepositoryOwnerId": 123456,
   "linkBases": { "home": "http://192.0.2.10:8420" }
@@ -52,7 +56,7 @@ For a long-running service, install a pinned version rather than downloading at 
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `storeDir` | required | Where files live, as an absolute path. Must already exist: see below. |
+| `store` | required | Where files live: see below. |
 | `oidcAudience` | required | The token audience to accept. The action's `audience` must match. |
 | `oidcRepositoryOwnerId` | required | The numeric ID of the user or organisation whose repositories may use the server. |
 | `linkBases` | required | Object of label to base URL, `http` or `https`, with no query or fragment. Each upload answers with one link per label. |
@@ -60,13 +64,19 @@ For a long-running service, install a pinned version rather than downloading at 
 | `port` | `8420` | Port to listen on. |
 | `defaultRetentionDays` | `90` | Days to keep a file when the upload doesn't say. |
 | `maxRetentionDays` | `90` | The cap. A larger request is clamped, and the real expiry comes back. |
-| `minFreeGiB` | `20` | Refuse an upload that would leave less free space than this. |
 | `maxFileGiB` | `2` | The largest file accepted. |
 
 A missing, malformed or unknown setting stops the server at startup with a message naming it. Nothing
 in the file is secret.
 
-**The server never creates `storeDir`**, so files can't land on the wrong disk while a volume is
+`store` says which kind of store, and what that kind needs. For `"kind": "disk"`:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `dir` | required | Where files live, as an absolute path. Must already exist: see below. |
+| `minFreeGiB` | `20` | Refuse an upload that would leave less free space than this. |
+
+**The server never creates `dir`**, so files can't land on the wrong disk while a volume is
 unmounted. On macOS, a directory at a volume's mount path would also send the real disk elsewhere
 when it mounts. While the store is missing, uploads, listing and deleting get `503`, links `404` and
 `/healthz` `503`, and everything recovers by itself when it returns, with no restart. The server only
@@ -78,13 +88,163 @@ a hard link to its artifact's metadata, and uploads and deletes take turns insid
 Links come only from `linkBases`, never from `Host` or `X-Forwarded-*`, so the links in a response
 can't be steered by the request.
 
-Logs go to stdout in logfmt. Expired files and abandoned uploads are swept at startup and hourly.
+Logs go to stdout in logfmt. With a disk, expired files and abandoned uploads are swept at startup and
+hourly.
+
+### A server in front of a bucket
+
+The server checks each job's OIDC token and holds the bucket's keys, and the bytes go straight to and
+from the bucket through URLs with a signature in them. The bucket stays fully private, and no job holds a key. The
+actions, their inputs and the [HTTP API](#http-api) are the same as with a disk, and `server-url` is
+still all a job says.
+
+```json
+{
+  "store": {
+    "kind": "s3",
+    "bucket": "YOUR-BUCKET",
+    "region": "auto",
+    "endpoint": "https://<ACCOUNT_ID>.r2.cloudflarestorage.com"
+  },
+  "oidcAudience": "self-hosted-artifacts",
+  "oidcRepositoryOwnerId": 123456,
+  "linkBases": { "home": "https://files.example.com" }
+}
+```
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `bucket` | required | The bucket. |
+| `region` | required | The bucket's region. On R2, `auto`. |
+| `endpoint` | AWS | The endpoint of anything else that speaks S3, such as R2 or MinIO. Requests then use path-style addressing, and without it virtual-hosted. |
+
+The keys are the standard variables, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and, with temporary
+ones, `AWS_SESSION_TOKEN`, and never in the file. Without them, the server stops at startup saying so.
+Temporary keys sign URLs that stop working when they expire, and the server reads them only at startup.
+Nothing else is checked at startup or per request, so `/healthz` is always `200` here, and a bucket that
+fails answers `500`, with the reason in the server's log.
+
+Set up the bucket, used for this alone, and with versioning off:
+
+1. **Keep it private.** A new bucket is, on AWS and R2, so there's no policy to add and nothing public to
+   turn on. On R2, leave its custom domains and `r2.dev` URL off.
+2. **Add one lifecycle rule across the bucket, at the longest retention you use:** `maxRetentionDays`, 90
+   by default. This is what removes files, as nothing else does: see below. On AWS,
+
+   ```bash
+   aws s3api put-bucket-lifecycle-configuration --bucket YOUR-BUCKET --lifecycle-configuration \
+     '{"Rules":[{"ID":"artifacts","Status":"Enabled","Filter":{},"Expiration":{"Days":90}}]}'
+   ```
+
+   and on R2, an [object lifecycle rule](https://developers.cloudflare.com/r2/buckets/object-lifecycles/)
+   that deletes objects after that many days.
+3. **Give the server keys for this bucket alone, that read, write, delete and list its objects.** On AWS,
+   `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on the bucket's objects, and `s3:ListBucket` on the
+   bucket, without which a missing object reads as `403` and every first upload is a `500`. On R2, an API
+   token with **Object Read & Write** on this bucket.
+
+The store has to honour conditional writes and a checksum, as AWS, R2 and MinIO do: see
+[what's been tried](#whats-been-tried).
+
+**A link redirects,** with a `302` to a URL on the bucket that works for 5 minutes. So `curl` needs `-L`:
+without it, `curl -fO` saves an empty file and succeeds. Browsers and the download action follow it by
+themselves. A `HEAD` is answered by the server, with no redirect. The bucket's endpoint has to be reachable
+from wherever a link is used, as well as the server: see [the security model](#with-a-server-in-front-of-a-bucket).
+
+**Expiry is checked on each click.** There's no sweep: an expired, deleted or replaced artifact's link
+answers `404` at once, and its name is free again. An expired file stays in the bucket until the lifecycle
+rule removes it, as does what a crash or a lost answer leaves. Without the rule, those stay and you pay to
+store them.
+
+What each costs in requests to the bucket:
+
+| | Requests | R2's classes |
+| --- | --- | --- |
+| A link, `GET` or `HEAD` | Two: `HEAD` of the file, `GET` of its name. A `GET`'s redirect then reads the file | Two class B, and a third for the read |
+| Starting an upload | One `GET` | One class B |
+| Sending the body | One `PUT`, from the job | One class A |
+| Committing | `HEAD`, `PUT` of the repository's record, `GET` and `PUT` of the name, and a `DELETE` of what it replaced | Two class A, two class B |
+| Listing a run | One `LIST` per thousand names, and a `GET` for each name in each attempt | One class A per page, one class B each |
+| Deleting by ID | `LIST`, `HEAD`, `GET`, and two `DELETE`s | One class A, two class B |
+
+### Run it on a Cloudflare Worker
+
+The same server in front of a bucket, with no machine. So everything above holds, from setting up the bucket to
+what a link does, and a job still says only `server-url`. The tests run its published bundle in `workerd`, Cloudflare's runtime, and it has
+been [run for real](#whats-been-tried), on R2, with the actions and a real token.
+
+```bash
+npm install self-hosted-artifacts
+```
+
+Your whole Worker is one line, in `worker.js`:
+
+```js
+export { default } from 'self-hosted-artifacts/worker';
+```
+
+`wrangler.jsonc` holds what would be the config file, as `SELF_HOSTED_ARTIFACTS_CONFIG`, an object or a string of JSON:
+
+```jsonc
+{
+  "name": "artifacts",
+  "main": "worker.js",
+  // This date or later: it's what turns on `nodejs_compat`, which the Worker needs.
+  "compatibility_date": "2026-08-04",
+  "observability": {
+    "enabled": true,
+    // Cloudflare's own line for each request is noise here: the server logs what matters.
+    "logs": { "invocation_logs": false }
+  },
+  "vars": {
+    "SELF_HOSTED_ARTIFACTS_CONFIG": {
+      "store": {
+        "kind": "s3",
+        "bucket": "YOUR-BUCKET",
+        "region": "auto",
+        "endpoint": "https://<ACCOUNT_ID>.r2.cloudflarestorage.com"
+      },
+      "oidcAudience": "self-hosted-artifacts",
+      "oidcRepositoryOwnerId": 123456,
+      "linkBases": { "home": "https://artifacts.<YOUR-SUBDOMAIN>.workers.dev" }
+    }
+  }
+}
+```
+
+[Set up the bucket as above](#a-server-in-front-of-a-bucket). Its keys are the Worker's secrets, with
+`AWS_SESSION_TOKEN` too for temporary ones. R2's binding can't sign a URL, so on R2 these are still an API token's S3
+keys:
+
+```bash
+npx wrangler secret put AWS_ACCESS_KEY_ID
+npx wrangler secret put AWS_SECRET_ACCESS_KEY
+npx wrangler deploy
+```
+
+`wrangler deploy` prints the Worker's URL, which is what `linkBases` and `server-url` take. Or use a custom domain,
+and if you restrict who can reach it, add `"workers_dev": false`, as the `workers.dev` URL otherwise stays public.
+
+- **A bucket only.** With a `"disk"` store there's nothing for it to keep files on. There's no sweep to run either, as
+  expiry is checked at each click and the lifecycle rule removes the files.
+- **`host` and `port` are ignored,** so one config means the same to `serve` and a Worker.
+- **Something wrong doesn't stop a deploy,** as a Worker can't refuse to start. A bad config or missing keys answer
+  every request with a `500` saying what's wrong, naming settings and variables and never a value, and log the
+  same. So check `/healthz` once it's deployed, which answers `200` once the config is valid and the keys are there, without
+  trying them.
+- **Downloads stop if the Worker is down,** as each link goes through it, though the bytes don't.
+- **On the Free plan a request makes at most 50 to the bucket,** which a run's list reaches at about 48 names, counting
+  each name once per attempt that holds it, so a re-run reaches it at about half that, and
+  merging lists first. Paid allows thousands.
+- **Logs are JSON lines on `console`,** for Workers Logs. They hold what a server's do: see
+  [the security model](#with-a-server-in-front-of-a-bucket).
 
 ## Use a bucket
 
 Give each step `s3-bucket` rather than `server-url`, and the rest of this README holds: the same
 inputs, names, attempts, retries and digests. Exactly one of the two, or the step fails. Nothing
-needs to run, and the server has no part in it.
+needs to run, and the server has no part in it. For a bucket that stays private, with no keys in jobs,
+run [a server in front of it](#a-server-in-front-of-a-bucket).
 
 | Input | Default | Meaning |
 | --- | --- | --- |
@@ -122,12 +282,12 @@ jobs:
           aws-region: eu-west-2
       - run: ./build.sh
       - id: upload
-        uses: fishballapp/self-hosted-artifacts/upload@v0.6.0
+        uses: fishballapp/self-hosted-artifacts/upload@v0.7.0
         with:
           s3-bucket: YOUR-BUCKET
           s3-link-base: https://YOUR-BUCKET.s3.eu-west-2.amazonaws.com
           path: dist/
-      - run: curl -fO "${{ steps.upload.outputs.artifact-url }}"
+      - run: curl -fLO "${{ steps.upload.outputs.artifact-url }}"
 ```
 
 A link is an anonymous read, so this bucket has to allow them, on those keys and nothing else. Use a
@@ -175,7 +335,7 @@ A bucket whose name holds a dot doesn't match S3's TLS certificate when virtual-
 
 ```yaml
       - id: upload
-        uses: fishballapp/self-hosted-artifacts/upload@v0.6.0
+        uses: fishballapp/self-hosted-artifacts/upload@v0.7.0
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -189,16 +349,22 @@ A bucket whose name holds a dot doesn't match S3's TLS certificate when virtual-
 
 R2 has no bucket policy that could open one prefix: public access is the whole bucket. An artifact's
 metadata sits in that bucket under a key that can be worked out from a repository's ID, a run's ID and
-the artifact's name, and it holds the artifact's ID, which is its link. So on R2 the rule below **is**
-what keeps `runs/` and `repositories/` from being read, and it needs a custom domain.
+the artifact's name, and it holds the artifact's ID, which is its link. So someone who knows or can guess
+all of those can read that artifact's link: see [the security model](#with-a-bucket). Nothing can be
+listed.
 
-1. Connect a [custom domain](https://developers.cloudflare.com/r2/buckets/public-buckets/) to the bucket,
-   and leave the `r2.dev` URL off, which no rule can cover. `s3-link-base` is that domain.
-2. Add a WAF custom rule on the domain's zone that blocks everything else, with the expression
-   `(http.host eq "files.example.com" and not starts_with(http.request.uri.path, "/artifacts/"))`.
-3. Add a cache rule on that host that bypasses the cache. Cloudflare caches `.zip`, `.apk` and other
-   file types by default, so a deleted or replaced artifact's link would otherwise keep working for
-   up to two hours.
+1. Make the bucket public. `s3-link-base` is the URL you choose.
+   - **A [custom domain](https://developers.cloudflare.com/r2/buckets/public-buckets/) is recommended for
+     real use.** Leave the `r2.dev` URL off, as it stays public whatever you do with the domain.
+   - **An `r2.dev` URL is fine for trying it out or light use.** It's rate-limited, and takes no WAF or
+     cache rule, so steps 2 and 3 don't apply: a deleted link stops at once.
+2. With a custom domain, add a cache rule on that host that bypasses the cache. Cloudflare caches `.zip`,
+   `.apk` and other file types by default, so a deleted or replaced artifact's link would otherwise keep
+   working for up to two hours.
+3. Optionally, with a custom domain, add a WAF custom rule on the domain's zone with the expression
+   `(http.host eq "files.example.com" and not starts_with(http.request.uri.path, "/artifacts/"))`. It blocks
+   reading the metadata, which is worth it for a bucket holding private repositories' artifacts. For
+   sensitive ones, [run a server in front](#a-server-in-front-of-a-bucket) instead.
 4. Add one [object lifecycle rule](https://developers.cloudflare.com/r2/buckets/object-lifecycles/)
    across the bucket that deletes objects after your longest retention, 90 days at most.
 
@@ -245,7 +411,18 @@ R2, with [the setup above](#on-r2) on a custom domain:
   still worked. An encoded `..%2f` passes the rule, and R2 reads it as a literal key: `404`.
 - **The cache rule:** without it, a deleted `.zip` link kept answering `200` from the cache. With it, `404`.
 
-The lifecycle rule hasn't been seen to remove anything, and AWS is still from its docs, not from a run.
+- **A server in front, on a Worker:** the [smoke workflow](../../.github/workflows/self-hosted-artifacts-smoke.yml)
+  passed against a real Worker and private R2 bucket with a real GitHub token: upload, a taken name refused, download,
+  merge, list, delete, a link's `302`, a `HEAD`'s `content-length`, the digest checked through the redirect. It was
+  installed from the package as this README says. Anonymous reads at the bucket answer `400`.
+- **On `r2.dev`:** a link answers `200` with nothing cached, and `404` straight after a delete. Metadata is readable
+  there, as [accepted](#on-r2).
+- **Signed URLs on R2:** a `PUT` with the wrong length, a missing or changed signed header, or the wrong checksum is
+  refused, as is an expired URL.
+
+The lifecycle rule hasn't been seen to remove anything. A server on Node in front of a bucket has run against MinIO
+and the fake, not R2. The Worker ran on a paid account, so the Free plan's limits weren't reached or measured. AWS is
+still from its docs, not from a run.
 
 ## Upload
 
@@ -260,18 +437,18 @@ jobs:
       - uses: actions/checkout@v6
       - run: ./build.sh
       - id: upload
-        uses: fishballapp/self-hosted-artifacts/upload@v0.6.0
+        uses: fishballapp/self-hosted-artifacts/upload@v0.7.0
         with:
           server-url: http://192.0.2.10:8420
           path: dist/
-      - run: curl -fO "${{ steps.upload.outputs.artifact-url }}"
+      - run: curl -fLO "${{ steps.upload.outputs.artifact-url }}"
 ```
 
 That uploads what's in `dist/` as one zip, `artifact.zip`. To upload one file as it is, so that its
 link ends in its own name, set `archive: false`:
 
 ```yaml
-      - uses: fishballapp/self-hosted-artifacts/upload@v0.6.0
+      - uses: fishballapp/self-hosted-artifacts/upload@v0.7.0
         with:
           server-url: http://192.0.2.10:8420
           path: dist/app.apk
@@ -377,7 +554,7 @@ File handling and retention match v7. What's left differs because the files go t
 | `artifact-digest` | SHA-256 in hex | The same, checked as the file is stored |
 | `links`, `expires-at` | No | Every link by label, and when the file expires |
 | **Behaviour** | | |
-| Where files go | GitHub, against your plan's storage quota | A disk you own, 2 GiB per upload by default, or a bucket, under 4 GiB per upload |
+| Where files go | GitHub, against your plan's storage quota | A disk or a bucket you own, behind a server, 2 GiB per upload by default, or a bucket alone, under 4 GiB per upload |
 | Which repositories | Any | With a server, private ones of one owner, as public repositories' artifacts are free on GitHub. With a bucket, any job with the credentials |
 | Runners | Any | Linux and macOS. `path` isn't read the Windows way |
 | Job permission | None to add | With a server, `id-token: write`. With a bucket, credentials in the environment |
@@ -398,7 +575,7 @@ jobs:
       id-token: write # to prove to the server which repository this is
     steps:
       - id: download
-        uses: fishballapp/self-hosted-artifacts/download@v0.6.0
+        uses: fishballapp/self-hosted-artifacts/download@v0.7.0
         with:
           server-url: http://192.0.2.10:8420
           name: build
@@ -408,7 +585,7 @@ jobs:
 
 | Input | Default | Meaning |
 | --- | --- | --- |
-| `server-url` | | The server's base URL, as the runner reaches it. Files come from here, not from a link's base, which may be one only people can reach. Redirects are not followed. Give this or [`s3-bucket` and what goes with it](#use-a-bucket). |
+| `server-url` | | The server's base URL, as the runner reaches it. Files come from here, not from a link's base, which may be one only people can reach. A file's redirect is followed, as a server in front of a bucket answers with one, and no other is. Give this or [`s3-bucket` and what goes with it](#use-a-bucket). |
 | `name` | every artifact | The artifact to download. `build` finds the zip `build.zip`; failing that, a file of exactly that name, such as `app.apk`, which is how one uploaded with `archive: false` is named. Fails if there is neither. |
 | `artifact-ids` | | The IDs to download, comma-separated, from an upload's `artifact-id` output. Can't go with `name`. Fails if none is found, and warns about any that isn't. |
 | `path` | `$GITHUB_WORKSPACE` | Where they go. It can start with `~`, and is made if it isn't there. |
@@ -495,13 +672,13 @@ jobs:
       id-token: write # to prove to the server which repository this is
     steps:
       - id: merge
-        uses: fishballapp/self-hosted-artifacts/upload/merge@v0.6.0
+        uses: fishballapp/self-hosted-artifacts/upload/merge@v0.7.0
         with:
           server-url: http://192.0.2.10:8420
           name: all-builds
           pattern: build-*
           delete-merged: true
-      - run: curl -fO "${{ steps.merge.outputs.artifact-url }}"
+      - run: curl -fLO "${{ steps.merge.outputs.artifact-url }}"
 ```
 
 With no inputs but where artifacts are, every artifact of the run becomes one called `merged-artifacts`,
@@ -509,7 +686,7 @@ which is stored as `merged-artifacts.zip`.
 
 | Input | Default | Meaning |
 | --- | --- | --- |
-| `server-url` | | The server's base URL, as the runner reaches it. Redirects are not followed. Give this or [`s3-bucket` and what goes with it](#use-a-bucket). |
+| `server-url` | | The server's base URL, as the runner reaches it. A file's redirect is followed, as a server in front of a bucket answers with one, and no other is. Give this or [`s3-bucket` and what goes with it](#use-a-bucket). |
 | `name` | `merged-artifacts` | The name of the merged artifact, stored as `<name>.zip`. It must pass the [name rule](#http-api) with `.zip` added. |
 | `pattern` | `*` | A glob the artifacts' names must match, without their `.zip`, as in [the download action](#download). |
 | `separate-directories` | `false` | Whether each artifact goes in a folder of its name in the merged zip, rather than all in the root. |
@@ -634,23 +811,73 @@ the action's version to pin, and what it holds is read by every later action of 
 
 ## HTTP API
 
-This is the server's. A bucket has its own layout: see [One artifact, in the bucket](#one-artifact-in-the-bucket).
+This is the server's. A bucket alone has its own layout: see [One artifact, in the bucket](#one-artifact-in-the-bucket), which a
+server in front of a bucket also keeps.
 
-Every route but a file's and `/healthz` takes `Authorization: Bearer <OIDC token>`, checked first:
+It's the same for either store, but for where a body goes and what a link answers. Every route but a
+file's and `/healthz` takes `Authorization: Bearer <OIDC token>`, checked first:
 `401` if it's rejected, whose reason is in the server's log, and `503` if GitHub's signing keys can't
 be fetched. Failures answer `{ "error": "<message>" }`. While the store is missing, these routes
 answer `503` too.
 
 ### Storing a file
 
-`POST /artifacts?name=<filename>` with `Content-Length` and the raw bytes as the body. Auth is checked
-before any of the body is read. Optional parameters:
+Three requests, whichever store it is: declare the upload, send the body, commit. The first and last take
+the token. The body goes to the URL the first answers with, and needs none.
+
+**1. `POST /uploads?name=<filename>&digest=<sha-256>&size=<bytes>`**, with no body.
 
 | Parameter | Meaning |
 | --- | --- |
+| `name` | Required. Matches `^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$`; nothing is sanitised. |
+| `digest` | Required. The file's SHA-256, in 64 lowercase hex characters. |
+| `size` | Required. The file's size in bytes. |
 | `retention-days` | Days to keep the file. The server caps it. |
-| `digest` | The body's SHA-256, in 64 lowercase hex characters. The server checks it while storing. If the name is already held, it can answer without reading the body. |
 | `overwrite` | `true` to replace an artifact the run attempt holds under this name. |
+
+If the run attempt already holds this name with this content, that's the end of it: `200` with the
+artifact, as below, unchanged, whatever `overwrite` says. Otherwise `201`, and where to send the body:
+
+```json
+{
+  "upload": {
+    "id": "<token>",
+    "url": "/uploads/<token>",
+    "headers": { "content-type": "application/octet-stream" }
+  }
+}
+```
+
+| Status | Meaning |
+| --- | --- |
+| `200` | Already stored. |
+| `201` | Send the body. |
+| `400` | Bad name, retention, digest, size or overwrite. |
+| `409` | The run attempt already holds this name with other content, and `overwrite` isn't `true`. |
+| `413` | Over `maxFileGiB`. |
+| `507` | The upload would cross `minFreeGiB`. Only with a disk. A `PUT` can answer this too. |
+
+**2. `PUT <url>`**, with exactly those `headers` and the file as the body, and no token. A `url` that's a
+path is resolved against the base URL the client reaches the server by, as a runner may not reach any
+of `linkBases`, and a link never comes from `Host`. An absolute one is used as it is.
+
+From a disk, `url` is a path on the server, which answers:
+
+| Status | Meaning |
+| --- | --- |
+| `200` | The body is in place. Another `PUT` replaces it. |
+| `400` | `Content-Length` isn't the `size` declared. |
+| `404` | No such upload: unknown, over an hour old, already committed, or refused for its digest. |
+| `422` | The body doesn't match `digest`. Nothing is kept, and the upload is over. |
+| `500` | The body wasn't stored. |
+
+With a bucket, `url` is absolute, `headers` include what's signed, and the `PUT` goes to the bucket. `fetch` sets
+`Content-Length` from the body, which is signed too. The bucket answers in its own way: `200`, or `403` for the
+wrong length, a changed or missing header, or a URL over an hour old, and `400` for the wrong checksum. Another
+`PUT` of the same bytes replaces it.
+
+**3. `POST /uploads/<id>/commit`**, with a token minted for it, and the same parameters as the first.
+The upload's ID becomes the artifact's.
 
 ```json
 {
@@ -665,15 +892,14 @@ before any of the body is read. Optional parameters:
 
 | Status | Meaning |
 | --- | --- |
-| `200` | The run attempt already holds this name with this content. The answer is that artifact, unchanged, whatever `overwrite` says. |
+| `200` | Already there, with this content: this upload committed before, or another that got there first. The answer is that artifact. |
 | `201` | Stored. |
-| `400` | Bad name, retention, digest or overwrite. A name matches `^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$`; nothing is sanitised. |
-| `409` | The run attempt already holds this name with other content, and `overwrite` isn't `true`. |
-| `411` | No `Content-Length`. |
-| `413` | Over `maxFileGiB`. |
-| `422` | The body doesn't match `digest`, and nothing was stored. |
-| `500` | The upload failed, and it can't be downloaded. |
-| `507` | The upload would cross `minFreeGiB`. |
+| `400` | Bad name, retention, digest, size or overwrite. |
+| `404` | Nothing to commit: the body never arrived, the upload was swept, it declared something else (on a bucket, a different name or size), or it belongs to another repository, run or attempt. |
+| `409` | The name was taken meanwhile, with other content, and `overwrite` isn't `true`. The upload is over. |
+
+A client that loses any answer can start again from the first request. If the commit landed, that
+answers `200`, as the digest is stored, so a lost answer costs nothing but the retry.
 
 ### Listing a run
 
@@ -685,7 +911,7 @@ other's. Optional parameters:
 | --- | --- |
 | `repository` | `owner/name`, in any case. Defaults to the token's. A repository that has never uploaded holds nothing. |
 | `run-id` | Defaults to the token's run. |
-| `name` | Repeatable. Only these exact stored names, each looked up directly. |
+| `name` | Repeatable. Only these exact stored names. |
 | `id` | Repeatable, and not with `name`. Only these IDs, among what the repository and run hold. |
 
 ```json
@@ -717,14 +943,16 @@ replaced.
 
 ### Everything else
 
-`GET` or `HEAD /<token>/<filename>` serves the file, and needs no token. Anything else is `404`: `/`,
-`/<token>`, the wrong filename, an expired file, and any query string.
+`GET` or `HEAD /<token>/<filename>` serves the file, and needs no token. With a bucket, a `GET` answers `302`
+to a URL on the bucket that works for 5 minutes, with `Cache-Control: no-store`, and a `HEAD` answers `200` with
+the file's headers. Anything else is `404`: `/`, `/<token>`, the wrong filename, an expired file, and any
+query string.
 
-`GET /healthz` is `200` when the store is there and `503` when it isn't.
+`GET /healthz` is `200` when the store is there and `503` when it isn't. A bucket isn't asked, so it's `200`.
 
 ## Security model
 
-The two targets draw the line in different places. Read the one you use.
+Each way to store draws the line in a different place. Read the one you use.
 
 ### With a server
 
@@ -732,6 +960,13 @@ The two targets draw the line in different places. Read the one you use.
   The token must be signed by GitHub with RS256 and carry the right issuer, audience, owner ID and
   `repository_visibility: private`, within its validity. Every request is checked, including from
   localhost. Any private repository of that owner qualifies; there is no per-repository list.
+- **Who can send a body:** anyone with an upload's URL, as a `PUT` takes no token, so the URL is a
+  capability. It holds 256 random bits, and is given only to a job that passed the check above. It works
+  for an hour from when it's made, and until its upload is committed. It's bound to what was declared: the
+  size, the digest and, through them, the bytes, so all it can write is that one file, which still takes
+  a token of the same repository, run and attempt to become an artifact. Sent several times at once, each copy takes
+  room until it ends, and each is checked against `minFreeGiB` as it starts. Unlike a link, it's a
+  credential, so neither the client nor the server prints it, and the server logs only a short prefix.
 - **Who can list:** a workflow that passes the same check, for any private repository of that owner.
   One owner is the trust boundary, and what a list gives is links, which aren't credentials anyway.
 - **Who can replace an artifact:** only a job of the same repository, run and attempt. Those come from
@@ -753,9 +988,39 @@ The two targets draw the line in different places. Read the one you use.
 - **What a zip can do to a runner:** nothing outside its folder. See [Download](#download). The client
   holds a server's answers to the server's own rules too, so a name or ID that could lead out of
   the destination fails the step.
-- **What gets logged:** never the OIDC token, and only a short prefix of a download token. Uploads
-  log the repository, run, attempt, name, size and digest. The download action prints each artifact's
+- **What gets logged:** never the OIDC token or an upload's URL, and only a short prefix of a download
+  token or an upload's ID. Uploads log the repository, run, attempt, name, size and digest. The download action prints each artifact's
   ID in the run's log, as the upload action's outputs print its links.
+
+### With a server in front of a bucket
+
+What's above holds for who can upload, list, replace and delete, as the server decides those from the verified
+token just as it does with a disk. What's different is where the bytes go:
+
+- **No job holds a key, and the bucket stays private.** Only the server has the keys. Without a URL it
+  signed, the bucket answers nothing to anyone, so metadata can't be read and nothing can be listed.
+- **Who can send a body:** anyone with an upload's URL, for an hour, as a capability. It holds a signature,
+  and is given only to a job that passed the check. It's bound to that key, the length, the checksum and the
+  run, so all it can write is that one file, which still takes a token of the same repository, run and attempt to
+  become an artifact. Unlike a link, it's a credential, so neither the client nor the server prints it.
+- **Who can download:** anyone who has the link and can reach the server, which then gives them a URL on the
+  bucket for 5 minutes. **So what keeps a file private is the link alone**, and who can reach the server: once the
+  redirect is followed, that URL works from anywhere, and the bytes never come through your network. A
+  deleted, expired or replaced artifact's link stops at the next click, with its data gone or not. A URL
+  already given out can finish its 5 minutes, unless the data has gone.
+- **What a redirect shows:** whoever follows a link sees the access key's ID and the bucket's endpoint and name in
+  the URL, and the repository's ID, run and attempt in `x-amz-meta-run-scope`. A session token is in that URL too, if
+  you use one, so prefer long-lived keys limited to this bucket. The secret stays on the server.
+- **What a file can do:** it's served as `application/octet-stream`, as an attachment, by the bucket. S3 can't add the
+  server's `X-Content-Type-Options` and `Content-Security-Policy` headers, and a browser that ignored the attachment
+  would meet it on the bucket's origin, which holds nothing else.
+- **What the keys can do:** everything in the bucket. The server is what holds a job to its own repository, so
+  protect it and its environment as you would the bucket.
+- **What gets logged:** never a credential, the OIDC token or a URL with a signature in it, and only a short prefix
+  of a download token or an upload's ID, in a failure's key too. On a Worker, Cloudflare adds each request's URL to its
+  lines, and was seen to show a token in a path, and a digest, as `REDACTED`. A query's other values, such as `name`, stay.
+- **On a Worker, a misconfigured server says so to anyone,** as nothing else can tell whoever deployed it. Its `500`
+  names settings and variables, never a value.
 
 ### With a bucket
 
@@ -773,9 +1038,12 @@ The two targets draw the line in different places. Read the one you use.
 - **What's public:** on AWS, exactly `artifacts/*`, by [the policy above](#on-aws): anonymous `GetObject`,
   no listing, and neither `runs/` nor `repositories/`. A link's answer on AWS shows its repository's ID, run
   and attempt, in `x-amz-meta-run-scope`. On R2 the whole bucket is public unless
-  [the WAF rule above](#on-r2) stops it. Without that rule, anyone who knows or guesses a repository's ID,
-  a run's ID and an artifact's name can read its metadata, and with it its link. So guard that rule as
-  you would the credentials.
+  [the WAF rule above](#on-r2) stops it. Without that rule, someone who knows the bucket's domain, a repository's
+  name, a run's ID and an artifact's name can read that artifact's link, as the repository's ID can be read from
+  `repositories/<sha256(owner/repo)>`. Nothing can be listed, but run IDs aren't random. That makes guessing a
+  targeted attack of millions of requests against a repository already known, for one artifact, with no rate limit
+  on a custom domain. If that matters to you, add the rule, or for anything sensitive,
+  [run a server in front](#a-server-in-front-of-a-bucket).
 - **Who can list:** only someone with the credentials. Clients read with signed requests.
 - **An expired link:** can keep working until the next upload or the lifecycle rule removes it. See
   [Expiry](#expiry-with-a-bucket). A deleted or replaced artifact's link stops as its data goes, which
@@ -791,15 +1059,16 @@ The two targets draw the line in different places. Read the one you use.
 
 ## Limits
 
-- With a server, 2 GiB per file by default, checked from `Content-Length` and counted while streaming.
-  A zip counts as one file.
+- With a server, 2 GiB per file by default, checked from the size declared and counted while streaming, or
+  with a bucket, signed into the upload's URL. A zip counts as one file.
 - Under 4 GiB per upload from the action or the command, whatever the target allows: Node's `fetch`
   can't send more with the right length. Files in a zip can be larger, as long as the zip isn't. A bucket
-  takes one `PUT` for it, with no multipart.
+  takes one `PUT` for it, with no multipart, whether a server is in front of it or not.
 - 90 days' retention at most by default, and always with a bucket.
-- One hour for a request to a server, enough for 2 GiB at about 5 Mbit/s. A slower upload is cut off.
+- One hour for a request to a server, enough for 2 GiB at about 5 Mbit/s. A slower upload is cut off. An
+  upload's URL takes a `PUT` for an hour after it's made. A link's URL on a bucket starts a download for 5 minutes.
 - A run's list is answered in one response from a server, with no pages. A bucket's is read in pages,
-  with one read per artifact.
+  with one read per artifact, by the server if there's one in front of it.
 - Five minutes idle on a server: a client that stops reading or sending is cut off, downloads included. A stalled
   download is cut off after 10 to 15 minutes, as Node restarts the timer while a write is pending.
 
@@ -807,8 +1076,7 @@ The two targets draw the line in different places. Read the one you use.
 
 A web UI, `Range` requests, Windows runners, resuming a download, merging the
 artifacts of another run or repository, and a list of a run's earlier attempts where a later one holds
-the name, or, with a bucket, multipart uploads, requests with OIDC of their own, or a bucket that also
-holds other things.
+the name, or, with a bucket, multipart uploads or a bucket that also holds other things.
 
 ## License
 

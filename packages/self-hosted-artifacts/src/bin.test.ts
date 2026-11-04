@@ -84,7 +84,7 @@ describe('self-hosted-artifacts', () => {
     await writeFile(
       configPath,
       JSON.stringify({
-        storeDir: dir,
+        store: { kind: 'disk', dir },
         oidcAudience: 'self-hosted-artifacts',
         oidcRepositoryOwnerId: 42,
         linkBases: { home: 'http://192.0.2.1:8420' },
@@ -114,6 +114,90 @@ describe('self-hosted-artifacts', () => {
       await rm(dir, { recursive: true, force: true });
     }
   };
+
+  describe('with a bucket as the store', () => {
+    /** The config file, against an endpoint nothing answers: startup must not need the bucket. */
+    const writeBucketConfig = async (dir: string) => {
+      const configPath = join(dir, 'config.json');
+      await writeFile(
+        configPath,
+        JSON.stringify({
+          store: { kind: 's3', bucket: 'builds', region: 'auto', endpoint: 'http://127.0.0.1:1' },
+          oidcAudience: 'self-hosted-artifacts',
+          oidcRepositoryOwnerId: 42,
+          linkBases: { home: 'http://192.0.2.1:8420' },
+          host: '127.0.0.1',
+          port: 0,
+        }),
+      );
+      return configPath;
+    };
+
+    it.each<[string, Record<string, string>]>([
+      ['neither key', {}],
+      ['no secret', { AWS_ACCESS_KEY_ID: 'visible-only-if-printed' }],
+      ['no key ID', { AWS_SECRET_ACCESS_KEY: 'visible-only-if-printed' }],
+      [
+        'an empty secret',
+        { AWS_ACCESS_KEY_ID: 'visible-only-if-printed', AWS_SECRET_ACCESS_KEY: '' },
+      ],
+    ])('stops at startup with %s, naming the variables and no value', async (_, env) => {
+      const dir = await mkdtemp(join(tmpdir(), 'self-hosted-artifacts-bin-'));
+      try {
+        const failure = await promisify(execFile)(
+          process.execPath,
+          [BIN, 'serve', '--config', await writeBucketConfig(dir)],
+          { env: { PATH: process.env.PATH, ...env } },
+        ).then(
+          () => undefined,
+          (error: { code: number; stdout: string; stderr: string }) => error,
+        );
+        expect(failure?.code).toBe(1);
+        expect(failure?.stderr).toContain('No S3 credentials');
+        expect(failure?.stderr).toContain('AWS_ACCESS_KEY_ID');
+        expect(failure?.stderr).toContain('AWS_SECRET_ACCESS_KEY');
+        expect(`${failure?.stdout}${failure?.stderr}`).not.toContain('visible-only-if-printed');
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('starts without asking the bucket anything, and has no sweep', async () => {
+      const dir = await mkdtemp(join(tmpdir(), 'self-hosted-artifacts-bin-'));
+      const child = spawn(
+        process.execPath,
+        [BIN, 'serve', '--config', await writeBucketConfig(dir)],
+        {
+          stdio: ['ignore', 'pipe', 'inherit'],
+          env: {
+            PATH: process.env.PATH,
+            AWS_ACCESS_KEY_ID: 'a',
+            AWS_SECRET_ACCESS_KEY: 'b',
+          },
+          timeout: 25_000,
+          killSignal: 'SIGKILL',
+        },
+      );
+      try {
+        const logged: string[] = [];
+        const port = await new Promise<string>((resolve, reject) => {
+          child.once('exit', code => reject(new Error(`bin exited with ${code}`)));
+          child.stdout.setEncoding('utf8').on('data', (text: string) => {
+            logged.push(text);
+            const match = /Listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(text);
+            if (match?.[1] !== undefined) resolve(match[1]);
+          });
+        });
+        child.removeAllListeners('exit');
+        expect((await fetch(`http://127.0.0.1:${port}/healthz`)).status).toBe(200);
+        expect(logged.join('')).not.toContain('sweep');
+      } finally {
+        child.removeAllListeners('exit');
+        child.kill('SIGKILL');
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  });
 
   it('runs from a config file and answers /healthz', () =>
     withRunningServer(async ({ port }) => {

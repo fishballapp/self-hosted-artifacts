@@ -19,11 +19,16 @@ import * as HttpClient from 'effect/http/HttpClient';
 import * as Layer from 'effect/Layer';
 import * as Redacted from 'effect/Redacted';
 import { build, type UserConfig } from 'tsdown';
-import { type Config, ServerConfig } from './config.ts';
+import { type Config, type S3StoreConfig, ServerConfig } from './config.ts';
 import { TokenVerifier } from './oidc.ts';
 import { makeS3Target } from './s3-client.ts';
 import { FAKE_ACCESS_KEY_ID, FAKE_SECRET_ACCESS_KEY, rawS3Client, startFakeS3 } from './s3-fake.ts';
-import { closeServer, listenOnLoopback, startTestServer } from './test-support.ts';
+import {
+  closeServer,
+  listenOnLoopback,
+  startBucketTestServer,
+  startTestServer,
+} from './test-support.ts';
 
 /**
  * One bundle rather than the whole package, as test files run side by side and a build cleans its
@@ -52,7 +57,7 @@ process.on('exit', () => {
  * Builds an action into a folder of its own, and answers with the file. Test files run in parallel, and
  * a build empties its folder first, so sharing one would pull a bundle out from under another file's step.
  */
-export const buildBundle = async (config: UserConfig) => {
+export const buildBundle = async (config: UserConfig, file = 'action.mjs') => {
   const outDir = await mkdtemp(join(tmpdir(), 'self-hosted-artifacts-bundle-'));
   await build({
     ...config,
@@ -61,7 +66,7 @@ export const buildBundle = async (config: UserConfig) => {
     cwd: new URL('..', import.meta.url).pathname,
     logLevel: 'silent',
   });
-  return join(outDir, 'action.mjs');
+  return join(outDir, file);
 };
 
 export const removeBundle = (bundle: string) =>
@@ -96,8 +101,11 @@ export const CURRENT_RUN: RunClaims = {
   run_attempt: '1',
 };
 
-/** Both targets run through the same scenarios wherever they should behave the same. */
-export const TARGET_KINDS = ['server', 's3'] as const;
+/**
+ * Every way to store runs through the same scenarios wherever they should behave the same: a server
+ * with a disk, a job with a bucket's keys, and a server in front of a bucket.
+ */
+export const TARGET_KINDS = ['server', 's3', 'server-s3'] as const;
 export type TargetKind = (typeof TARGET_KINDS)[number];
 
 export type Stored = {
@@ -213,12 +221,9 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
     GITHUB_RUN_ATTEMPT: claims.run_attempt,
   });
 
-  const startArtifactServer = async (
-    overrides: Partial<Config> = {},
-    verifier?: Layer.Layer<TokenVerifier>,
-  ) => {
-    const config = {
-      storeDir,
+  const serverConfig = (overrides: Partial<Config> = {}) =>
+    ({
+      store: { kind: 'disk', dir: storeDir, minFreeBytes: 0 },
       oidcAudience: AUDIENCE,
       oidcRepositoryOwnerId: '42',
       // A runner can't reach these, so a client that fetched by link would fail.
@@ -227,23 +232,48 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
       port: 0,
       defaultRetentionDays: 7,
       maxRetentionDays: 30,
-      minFreeBytes: 0,
       maxFileBytes: 1024 ** 3,
       ...overrides,
-    };
+    }) satisfies Config;
+
+  const verifierOf = (config: Config) =>
+    TokenVerifier.layer.pipe(
+      Layer.provide(Layer.succeed(ServerConfig, config)),
+      Layer.provide(FetchHttpClient.layer),
+      Layer.provide(
+        Layer.succeed(FetchHttpClient.Fetch, async () => Response.json({ keys: [jwk] })),
+      ),
+    );
+
+  const startArtifactServer = async (
+    overrides: Partial<Config> = {},
+    verifier?: Layer.Layer<TokenVerifier>,
+  ) => {
+    const config = serverConfig(overrides);
     const testServer = await startTestServer({
       config,
-      verifier:
-        verifier ??
-        TokenVerifier.layer.pipe(
-          Layer.provide(Layer.succeed(ServerConfig, config)),
-          Layer.provide(FetchHttpClient.layer),
-          Layer.provide(
-            Layer.succeed(FetchHttpClient.Fetch, async () => Response.json({ keys: [jwk] })),
-          ),
-        ),
+      verifier: verifier ?? verifierOf(config),
     });
     stopArtifactServer = testServer.stop;
+    return `http://127.0.0.1:${testServer.port}`;
+  };
+
+  /** What the server wrote to its log, for a test to read for what must not be there. */
+  const serverLog: string[] = [];
+
+  const startBucketServer = async (
+    store: S3StoreConfig,
+    credentials: Readonly<Record<string, string>>,
+  ) => {
+    const config = serverConfig({ store });
+    const testServer = await startBucketTestServer({
+      config,
+      store,
+      verifier: verifierOf(config),
+      credentials,
+      onLog: line => serverLog.push(line),
+    });
+    stops.push(testServer.stop);
     return `http://127.0.0.1:${testServer.port}`;
   };
 
@@ -262,6 +292,8 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
   }) => {
     const backend = new URL(origin);
     const proxy = createServer((req, res) => {
+      // As on a fake server: a probe of a loopback port asks for `/`, and no client does.
+      if (req.url === '/') return void res.writeHead(404).end();
       const interception = intercept(req);
       if (interception === 'hang') return void req.resume();
       if (interception !== undefined && interception !== 'lose-answer') {
@@ -293,32 +325,48 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
     return listenOnLoopback(proxy);
   };
 
-  const startServerTarget = async (
-    overrides: Partial<Config> = {},
-    verifier?: Layer.Layer<TokenVerifier>,
+  /** What's the same of a server whichever store it has: the routes, as a job and a person use them. */
+  const serverRoutes = (
+    realUrl: string,
+    onInterpose: (intercept: (request: IncomingMessage) => Interception) => void,
   ) => {
-    let url = await startArtifactServer(overrides, verifier);
-    const realUrl = url;
+    let url = realUrl;
     const authorized = async () => ({ Authorization: `Bearer ${await signToken()}` });
-    const post = async (name: string, body: BodyInit, run: Partial<RunClaims>) => {
+    /** The three steps a job takes, each token minted as it would be. */
+    const post = async (name: string, body: Blob, run: Partial<RunClaims>) => {
+      const hash = createHash('sha256');
+      for await (const chunk of body.stream()) hash.update(chunk);
+      const declaration = `name=${name}&digest=${hash.digest('hex')}&size=${body.size}`;
       claims = { ...CURRENT_RUN, ...run };
-      const response = await fetch(`${url}/artifacts?name=${name}`, {
+      const created = await fetch(`${url}/uploads?${declaration}`, {
         method: 'POST',
         headers: await authorized(),
+      });
+      if (created.status !== 201) throw new Error(`Storing ${name}: ${created.status}`);
+      const { upload } = (await created.json()) as {
+        upload: { id: string; url: string; headers: Record<string, string> };
+      };
+      const sent = await fetch(new URL(upload.url, url), {
+        method: 'PUT',
+        headers: upload.headers,
         body,
       });
+      if (!sent.ok) throw new Error(`Sending ${name}: ${sent.status}`);
+      const committed = await fetch(`${url}/uploads/${upload.id}/commit?${declaration}`, {
+        method: 'POST',
+        headers: await authorized(),
+      });
       claims = CURRENT_RUN;
-      if (response.status !== 201) throw new Error(`Storing ${name}: ${response.status}`);
-      return (await response.json()) as Stored;
+      if (committed.status !== 201) throw new Error(`Committing ${name}: ${committed.status}`);
+      return (await committed.json()) as Stored;
     };
     return {
-      kind: 'server' as const,
       inputs: () => ({ 'INPUT_SERVER-URL': url, INPUT_AUDIENCE: AUDIENCE }),
       flags: () => ['--server-url', url, '--audience', AUDIENCE],
       env: () => ({}),
       /** Straight to the real server, as the job that uploaded would, with a real token. */
       store: (name: string, content: Uint8Array, run: Partial<RunClaims> = {}) =>
-        post(name, new Uint8Array(content), run),
+        post(name, new Blob([new Uint8Array(content)]), run),
       /** Sent from disk, as the real upload is: the test's own memory stays out of it. */
       storeFromDisk: async (name: string, path: string) => post(name, await openAsBlob(path), {}),
       /** What the run holds, latest attempt of each name. */
@@ -332,12 +380,9 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
       /** A link from an output: its base is one a runner can't reach, so the path goes to the server. */
       reachable: (link: string) => `${realUrl}${new URL(link).pathname}`,
       goneLinkStatuses: [404],
-      /** Replaces what's stored behind its digest's back. */
-      replaceBytes: ({ id }: Stored, bytes: Uint8Array) =>
-        writeFile(join(storeDir, 'artifacts', id, 'data'), bytes),
-      readBytes: ({ id }: Stored) => readFile(join(storeDir, 'artifacts', id, 'data')),
       /** From here on, a step goes through a proxy. */
       interpose: async (intercept: (request: IncomingMessage) => Interception) => {
+        onInterpose(intercept);
         url = await startProxy({
           origin: realUrl,
           intercept,
@@ -345,16 +390,30 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
         });
       },
       removeProxy: () => {
+        onInterpose(() => undefined);
         url = realUrl;
       },
-      isUpload: ({ method, url: path }: IncomingMessage) =>
-        method === 'POST' && path?.startsWith('/artifacts') === true,
       isDeleteOf:
         ({ id }: { id: string }) =>
         ({ method, url: path }: IncomingMessage) =>
           method === 'DELETE' && path?.endsWith(id) === true,
     };
   };
+
+  const startServerTarget = async (
+    overrides: Partial<Config> = {},
+    verifier?: Layer.Layer<TokenVerifier>,
+  ) => ({
+    ...serverRoutes(await startArtifactServer(overrides, verifier), () => undefined),
+    kind: 'server' as const,
+    /** Replaces what's stored behind its digest's back. */
+    replaceBytes: ({ id }: Stored, bytes: Uint8Array) =>
+      writeFile(join(storeDir, 'artifacts', id, 'data'), bytes),
+    readBytes: ({ id }: Stored) => readFile(join(storeDir, 'artifacts', id, 'data')),
+    // The request that carries the body.
+    isUpload: ({ method, url: path }: IncomingMessage) =>
+      method === 'PUT' && path?.startsWith('/uploads/') === true,
+  });
 
   /** The store's own answer to a link, for a bucket no anonymous read can reach here. */
   const startSigningProxy = async (raw: ReturnType<typeof rawS3Client>) => {
@@ -373,8 +432,9 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
     return listenOnLoopback(proxy);
   };
 
-  const startS3Target = async () => {
-    const fake = REAL_S3 === undefined ? await startFakeS3() : undefined;
+  /** A bucket of its own, on a fake or a real store. Only a public one gets the README's policy. */
+  const startBucket = async ({ isPublic }: { isPublic: boolean }) => {
+    const fake = REAL_S3 === undefined ? await startFakeS3({ isPublic }) : undefined;
     if (fake !== undefined) stops.push(fake.stop);
     const realEndpoint = REAL_S3?.endpoint ?? fake?.endpoint ?? '';
     const accessKeyId = REAL_S3?.accessKeyId ?? FAKE_ACCESS_KEY_ID;
@@ -386,10 +446,6 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
       credentials: { accessKeyId, secretAccessKey: Redacted.make(secretAccessKey) },
       region: S3_REGION,
     });
-    const linkBase =
-      REAL_S3?.hasBucketPolicies === false
-        ? await startSigningProxy(raw)
-        : `${realEndpoint}/${bucket}`;
     if (REAL_S3 !== undefined) {
       const created = await raw.send('PUT', '');
       if (!created.ok) throw new Error(`Creating ${bucket}: ${await created.text()}`);
@@ -397,7 +453,7 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
         await Promise.all((await raw.keys()).map(key => raw.send('DELETE', key)));
         await raw.send('DELETE', '');
       });
-      if (REAL_S3.hasBucketPolicies) {
+      if (isPublic && REAL_S3.hasBucketPolicies) {
         const policy = await raw.send('PUT', '', {
           query: { policy: '' },
           body: await readmeBucketPolicy(bucket),
@@ -405,11 +461,25 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
         if (!policy.ok) throw new Error(`The README's policy: ${await policy.text()}`);
       }
     }
-    let endpoint = realEndpoint;
     const env = () => ({
       AWS_ACCESS_KEY_ID: accessKeyId,
       AWS_SECRET_ACCESS_KEY: secretAccessKey,
     });
+    return { fake, realEndpoint, bucket, raw, env };
+  };
+
+  const dataKeyOf = ({ id, name }: { id: string; name: string }) => `artifacts/${id}/${name}`;
+
+  const s3ErrorBody = (message: string) =>
+    `<Error><Code>Refused</Code><Message>${message}</Message></Error>`;
+
+  const startS3Target = async () => {
+    const { fake, realEndpoint, bucket, raw, env } = await startBucket({ isPublic: true });
+    const linkBase =
+      REAL_S3?.hasBucketPolicies === false
+        ? await startSigningProxy(raw)
+        : `${realEndpoint}/${bucket}`;
+    let endpoint = realEndpoint;
     /** The client itself, in this process, to store what a step will find. */
     const asJob = <A, E>(
       use: (target: Effect.Success<ReturnType<typeof makeS3Target>>) => Effect.Effect<A, E>,
@@ -463,7 +533,6 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
       );
       return { id, name, digest, size: content.length, expiresAt, links: { ...links } };
     };
-    const dataKeyOf = ({ id, name }: { id: string; name: string }) => `artifacts/${id}/${name}`;
     return {
       kind: 's3' as const,
       bucket,
@@ -520,7 +589,7 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
         endpoint = await startProxy({
           origin: realEndpoint,
           intercept,
-          answerBody: message => `<Error><Code>Refused</Code><Message>${message}</Message></Error>`,
+          answerBody: s3ErrorBody,
         });
       },
       removeProxy: () => {
@@ -537,6 +606,63 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
     };
   };
 
+  /**
+   * A server in front of a private bucket. A proxy sits in front of each, as the server signs the host
+   * it's given and a store holds a request to that, so the proxy can't arrive later. Only a store that
+   * checks the host against itself, as R2 does, goes without one.
+   */
+  const startServerS3Target = async ({ sessionToken }: { sessionToken?: string } = {}) => {
+    const { fake, realEndpoint, bucket, raw, env } = await startBucket({ isPublic: false });
+    let interceptBucket: (request: IncomingMessage) => Interception = () => undefined;
+    const endpoint =
+      REAL_S3?.hasBucketPolicies === false
+        ? realEndpoint
+        : await startProxy({
+            origin: realEndpoint,
+            intercept: request => interceptBucket(request),
+            answerBody: s3ErrorBody,
+          });
+    const url = await startBucketServer(
+      { kind: 's3', bucket, region: S3_REGION, endpoint },
+      { ...env(), ...(sessionToken === undefined ? {} : { AWS_SESSION_TOKEN: sessionToken }) },
+    );
+    return {
+      ...serverRoutes(url, intercept => {
+        interceptBucket = intercept;
+      }),
+      kind: 'server-s3' as const,
+      serverUrl: url,
+      /** What the server signs with, to forge what it wouldn't sign. */
+      signing: {
+        host: new URL(endpoint).host,
+        region: S3_REGION,
+        credentials: {
+          accessKeyId: env().AWS_ACCESS_KEY_ID,
+          secretAccessKey: Redacted.make(env().AWS_SECRET_ACCESS_KEY),
+        },
+      },
+      bucket,
+      raw,
+      fake,
+      serverLog,
+      replaceBytes: async (artifact: Stored, bytes: Uint8Array) => {
+        const key = dataKeyOf(artifact);
+        const head = await raw.send('HEAD', key);
+        const scope = head.headers.get('x-amz-meta-run-scope') ?? '';
+        const response = await raw.send('PUT', key, {
+          headers: { 'x-amz-meta-run-scope': scope },
+          body: new Uint8Array(bytes),
+        });
+        if (!response.ok) throw new Error(`Replacing ${artifact.name}: ${response.status}`);
+      },
+      readBytes: async (artifact: Stored) =>
+        Buffer.from(await (await raw.send('GET', dataKeyOf(artifact))).arrayBuffer()),
+      // The body goes to the bucket, past the server.
+      isUpload: ({ method, url: path }: IncomingMessage) =>
+        method === 'PUT' && path?.includes('/artifacts/') === true,
+    };
+  };
+
   return {
     rootDir,
     workDir,
@@ -549,8 +675,12 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
     startArtifactServer,
     startServerTarget,
     startS3Target,
+    startServerS3Target,
     /** The target a suite runs against, by its kind. */
-    startTarget: (kind: TargetKind) => (kind === 'server' ? startServerTarget() : startS3Target()),
+    startTarget: (kind: TargetKind) => {
+      if (kind === 'server') return startServerTarget();
+      return kind === 's3' ? startS3Target() : startServerS3Target();
+    },
     /** Which run the next token is for. */
     actAs: (run: Partial<RunClaims>) => {
       claims = { ...CURRENT_RUN, ...run };

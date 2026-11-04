@@ -13,7 +13,7 @@ import {
   removeBundle,
   startRunner,
 } from './action-harness.ts';
-import { s3AddressOf } from './s3-client.ts';
+import { s3AddressOf } from './s3-bucket.ts';
 
 // What only a bucket does. What it shares with a server is in the suites that run against both.
 

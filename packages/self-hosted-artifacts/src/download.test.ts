@@ -13,7 +13,7 @@ import {
   truncate,
   writeFile,
 } from 'node:fs/promises';
-import { createServer } from 'node:http';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { join } from 'node:path';
 import * as NodeServices from '@effect/platform-node/NodeServices';
 import * as Effect from 'effect/Effect';
@@ -30,6 +30,7 @@ import {
   startRunner,
   TARGET_KINDS,
 } from './action-harness.ts';
+import { closeServer, listenOnLoopback } from './test-support.ts';
 import { zipFiles } from './zip.ts';
 
 let ACTION: string;
@@ -1078,17 +1079,158 @@ syncBuiltinESMExports();`,
       expect(exitCode).toBe(1);
       expect(stdout).toContain('Not found');
     });
-
-    it('does not follow a redirect', { timeout: 20_000 }, async () => {
-      serverUrl = await runner.useFakeServer(
-        createServer((_req, res) => {
-          res.writeHead(302, { Location: 'http://127.0.0.1:1/elsewhere' }).end();
-        }),
-      );
-      const { exitCode } = await runAction({ INPUT_PATH: destination });
-      expect(exitCode).toBe(1);
-    });
   });
+
+  describe.runIf(kind === 'server')(
+    'a server that redirects, as one in front of a bucket does',
+    () => {
+      const SIGNATURE = 'X-Amz-Signature=this-must-not-be-seen';
+      const content = strToU8('the bytes');
+
+      const redirectTargets: Server[] = [];
+      afterEach(async () => {
+        await Promise.all(redirectTargets.splice(0).map(closeServer));
+      });
+
+      /** A listing from one server, and the file from wherever `bucket` answers. */
+      const useRedirectingServer = async (bucket: Server) => {
+        const bucketUrl = await listenOnLoopback(bucket);
+        redirectTargets.push(bucket);
+        const { artifacts, json } = fakeListing({ 'app.bin': content });
+        const [artifact] = artifacts;
+        serverUrl = await runner.useFakeServer(
+          createServer((req, res) => {
+            if (req.url?.startsWith('/artifacts')) {
+              return void res.writeHead(200, { 'content-type': 'application/json' }).end(json);
+            }
+            return void res.writeHead(302, { Location: `${bucketUrl}/key?${SIGNATURE}` }).end();
+          }),
+        );
+        return artifact;
+      };
+
+      const expectUnseen = async ({ stdout, stderr }: { stdout: string; stderr: string }) => {
+        const outputs = await readFile(runner.outputPath, 'utf8').catch(() => '');
+        for (const seen of [stdout, stderr, outputs]) expect(seen).not.toContain(SIGNATURE);
+      };
+
+      const fromBucket = (answer: (req: IncomingMessage, res: ServerResponse) => void) =>
+        useRedirectingServer(
+          createServer((req, res) => {
+            // Anything on the machine probing loopback ports asks for `/`, and must not count.
+            if (req.url === '/') return void res.writeHead(404).end();
+            return answer(req, res);
+          }),
+        );
+
+      it('follows it, sending no token, asking for no compression, and checks what came', async () => {
+        const requests: IncomingMessage[] = [];
+        await fromBucket((req, res) => {
+          requests.push(req);
+          res.writeHead(200, { 'content-length': content.length }).end(content);
+        });
+
+        const result = await runAction({ INPUT_NAME: 'app.bin', INPUT_PATH: destination });
+
+        expect(result.exitCode).toBe(0);
+        expect(await readFile(join(destination, 'app.bin'))).toEqual(Buffer.from(content));
+        expect(requests).toHaveLength(1);
+        expect(requests[0]?.url).toBe(`/key?${SIGNATURE}`);
+        expect(requests[0]?.headers['accept-encoding']).toBe('identity');
+        expect(requests[0]?.headers).not.toHaveProperty('authorization');
+        await expectUnseen(result);
+      });
+
+      it('fails on the wrong digest from there, unpacking nothing', async () => {
+        await fromBucket((_req, res) => void res.writeHead(200).end(strToU8('the bites')));
+        const result = await runAction({ INPUT_NAME: 'app.bin', INPUT_PATH: destination });
+        expect(result.exitCode).toBe(1);
+        expect(result.stdout).toContain('app.bin');
+        expect(existsSync(join(destination, 'app.bin'))).toBe(false);
+        await expectUnseen(result);
+      });
+
+      it('fails on the wrong size from there, longer than it was listed at', async () => {
+        await fromBucket(
+          (_req, res) => void res.writeHead(200).end(strToU8('the bytes, and more')),
+        );
+        const result = await runAction({ INPUT_NAME: 'app.bin', INPUT_PATH: destination });
+        expect(result.exitCode).toBe(1);
+        expect(result.stdout).toContain('longer than');
+        await expectUnseen(result);
+      });
+
+      it('keeps the signature and what a bucket says out of everything, on a refusal', async () => {
+        await fromBucket(
+          (_req, res) =>
+            void res
+              .writeHead(403, { 'content-type': 'application/xml' })
+              .end(
+                `<Error><Code>SignatureDoesNotMatch</Code><Message>${SIGNATURE}</Message><AWSAccessKeyId>THE-KEY-ID</AWSAccessKeyId></Error>`,
+              ),
+        );
+        const result = await runAction({ INPUT_NAME: 'app.bin', INPUT_PATH: destination });
+        expect(result.exitCode).toBe(1);
+        expect(result.stdout).toContain('HTTP 403: SignatureDoesNotMatch');
+        expect(`${result.stdout}${result.stderr}`).not.toContain('THE-KEY-ID');
+        await expectUnseen(result);
+      });
+
+      it.each<[string, (req: IncomingMessage, res: ServerResponse) => void, RegExp]>([
+        ['a 5xx', (_req, res) => void res.writeHead(503).end('<html>'), /HTTP 503/u],
+        ['a cut connection', req => void req.socket.destroy(), /The download failed/u],
+        [
+          'a body cut short',
+          (_req, res) => {
+            res.writeHead(200, { 'content-length': content.length }).write('the');
+            setTimeout(() => res.destroy(), 10);
+          },
+          /The download failed/u,
+        ],
+        [
+          'a redirect that never ends',
+          (_req, res) => void res.writeHead(302, { Location: `/key?${SIGNATURE}` }).end(),
+          /The download failed/u,
+        ],
+      ])(
+        'retries %s, and keeps the signature out of everything',
+        { timeout: 20_000 },
+        async (_, answer, message) => {
+          let requests = 0;
+          await fromBucket((req, res) => {
+            requests += 1;
+            answer(req, res);
+          });
+          const result = await runAction({ INPUT_NAME: 'app.bin', INPUT_PATH: destination });
+          expect(result.exitCode).toBe(1);
+          expect(result.stderr).toContain('Attempt 1 failed');
+          expect(result.stdout).toMatch(message);
+          expect(requests).toBeGreaterThan(1);
+          await expectUnseen(result);
+        },
+      );
+
+      it('keeps it out when nothing answers there', { timeout: 20_000 }, async () => {
+        const { json } = fakeListing({ 'app.bin': content });
+        // Port 1 is one `fetch` won't even try, so this asks for one that really refuses.
+        const gone = createServer();
+        const goneUrl = await listenOnLoopback(gone);
+        await closeServer(gone);
+        serverUrl = await runner.useFakeServer(
+          createServer((req, res) => {
+            if (req.url?.startsWith('/artifacts')) {
+              return void res.writeHead(200, { 'content-type': 'application/json' }).end(json);
+            }
+            return void res.writeHead(302, { Location: `${goneUrl}/key?${SIGNATURE}` }).end();
+          }),
+        );
+        const result = await runAction({ INPUT_NAME: 'app.bin', INPUT_PATH: destination });
+        expect(result.exitCode).toBe(1);
+        expect(result.stdout).toMatch(/^::error::.*The download failed: ECONNREFUSED/m);
+        await expectUnseen(result);
+      });
+    },
+  );
 
   it.runIf(kind === 'server')('removes the temp file when the runner stops the step', async () => {
     const { promise: requested, resolve: onRequest } = Promise.withResolvers<void>();

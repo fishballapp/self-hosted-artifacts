@@ -17,12 +17,13 @@ import * as Logger from 'effect/Logger';
 import packageJson from '../package.json' with { type: 'json' };
 import { deleteArtifact, list } from './artifacts.ts';
 import { type ClientError, DEFAULT_AUDIENCE } from './client-support.ts';
-import { ServerConfig } from './config.ts';
+import { type DiskStoreConfig, type S3StoreConfig, ServerConfig } from './config.ts';
 import { DOWNLOAD_DEFAULTS, download } from './download.ts';
 import { MERGE_DEFAULTS, merge } from './merge.ts';
+import { ArtifactServer, BucketArtifactServer, makeNodeServer } from './node-server.ts';
 import { TokenVerifier } from './oidc.ts';
-import { ArtifactServer, makeNodeServer } from './server.ts';
-import { Store, StoreSweeps } from './store.ts';
+import { s3StoreLayer } from './s3-store.ts';
+import { DiskStore, StoreSweeps } from './store.ts';
 import { type TargetInputs, targetLayer } from './target.ts';
 import { UPLOAD_DEFAULTS, upload } from './upload.ts';
 
@@ -40,16 +41,29 @@ const NodeServer = Layer.unwrap(
   }),
 );
 
-const Main = Layer.mergeAll(ArtifactServer, StoreSweeps).pipe(
+// No trace headers on requests to GitHub or a bucket: neither has any use for them.
+const OutgoingRequests = Layer.mergeAll(
+  FetchHttpClient.layer,
+  Layer.succeed(HttpClient.TracerPropagationEnabled, false),
+);
+
+const DiskServer = (store: DiskStoreConfig) =>
+  Layer.mergeAll(ArtifactServer, StoreSweeps).pipe(Layer.provide(DiskStore.layerWithStore(store)));
+
+const BucketServer = (store: S3StoreConfig) =>
+  BucketArtifactServer.pipe(Layer.provide(s3StoreLayer(store)), Layer.provide(OutgoingRequests));
+
+const ConfiguredServer = Layer.unwrap(
+  Effect.gen(function* () {
+    const { store } = yield* ServerConfig;
+    return store.kind === 'disk' ? DiskServer(store) : BucketServer(store);
+  }),
+);
+
+const Main = ConfiguredServer.pipe(
   Layer.provide(NodeServer),
-  Layer.provide(Layer.mergeAll(Store.layer, TokenVerifier.layer)),
-  Layer.provide(
-    Layer.mergeAll(
-      FetchHttpClient.layer,
-      // No trace headers on requests to GitHub: it has no use for them.
-      Layer.succeed(HttpClient.TracerPropagationEnabled, false),
-    ),
-  ),
+  Layer.provide(TokenVerifier.layer),
+  Layer.provide(OutgoingRequests),
 );
 
 const serve = Command.make(

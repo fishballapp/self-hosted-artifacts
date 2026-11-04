@@ -4,6 +4,7 @@ import * as FileSystem from 'effect/FileSystem';
 import * as Layer from 'effect/Layer';
 import * as Schema from 'effect/Schema';
 import { describeError } from './log.ts';
+import { isHttpBase, S3_BUCKET, S3_REGION } from './protocol.ts';
 
 const GIB = 1024 ** 3;
 const MAX_GIB = Number.MAX_SAFE_INTEGER / GIB;
@@ -14,8 +15,25 @@ const isLinkBase = (base: string) =>
 
 const positiveInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1));
 
+const DiskStoreFileSchema = Schema.Struct({
+  kind: Schema.Literal('disk'),
+  dir: Schema.String.check(Schema.isPattern(/^\//u)),
+  minFreeGiB: Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: MAX_GIB })).pipe(
+    Schema.withDecodingDefaultKey(Effect.succeed(20)),
+  ),
+});
+
+const S3StoreFileSchema = Schema.Struct({
+  kind: Schema.Literal('s3'),
+  bucket: Schema.String.check(Schema.isPattern(S3_BUCKET)),
+  region: Schema.String.check(Schema.isPattern(S3_REGION)),
+  endpoint: Schema.optionalKey(
+    Schema.String.check(Schema.makeFilter(isHttpBase, { message: 'an http(s) base URL' })),
+  ),
+});
+
 const ConfigFileSchema = Schema.Struct({
-  storeDir: Schema.String.check(Schema.isPattern(/^\//u)),
+  store: Schema.Union([DiskStoreFileSchema, S3StoreFileSchema]),
   oidcAudience: Schema.NonEmptyString,
   oidcRepositoryOwnerId: positiveInt,
   linkBases: Schema.Record(
@@ -28,16 +46,27 @@ const ConfigFileSchema = Schema.Struct({
   ),
   defaultRetentionDays: positiveInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(90))),
   maxRetentionDays: positiveInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(90))),
-  minFreeGiB: Schema.Finite.check(Schema.isBetween({ minimum: 0, maximum: MAX_GIB })).pipe(
-    Schema.withDecodingDefaultKey(Effect.succeed(20)),
-  ),
   maxFileGiB: Schema.Finite.check(Schema.isBetween({ minimum: 1 / GIB, maximum: MAX_GIB })).pipe(
     Schema.withDecodingDefaultKey(Effect.succeed(2)),
   ),
 });
 
+export type DiskStoreConfig = {
+  readonly kind: 'disk';
+  readonly dir: string;
+  readonly minFreeBytes: number;
+};
+
+export type S3StoreConfig = {
+  readonly kind: 's3';
+  readonly bucket: string;
+  readonly region: string;
+  /** Empty on AWS. */
+  readonly endpoint: string;
+};
+
 export type Config = {
-  readonly storeDir: string;
+  readonly store: DiskStoreConfig | S3StoreConfig;
   readonly oidcAudience: string;
   readonly oidcRepositoryOwnerId: string;
   readonly linkBases: Readonly<Record<string, string>>;
@@ -45,24 +74,29 @@ export type Config = {
   readonly port: number;
   readonly defaultRetentionDays: number;
   readonly maxRetentionDays: number;
-  readonly minFreeBytes: number;
   readonly maxFileBytes: number;
 };
 
+const toStoreConfig = (store: typeof ConfigFileSchema.Type.store): Config['store'] => {
+  if (store.kind === 's3') return { ...store, endpoint: store.endpoint ?? '' };
+  const { minFreeGiB, ...disk } = store;
+  return { ...disk, minFreeBytes: Math.floor(minFreeGiB * GIB) };
+};
+
 const toConfig = ({
+  store,
   oidcRepositoryOwnerId,
   linkBases,
-  minFreeGiB,
   maxFileGiB,
   ...settings
 }: typeof ConfigFileSchema.Type): Config => ({
   ...settings,
+  store: toStoreConfig(store),
   // GitHub's token carries the ID as a string.
   oidcRepositoryOwnerId: String(oidcRepositoryOwnerId),
   linkBases: Object.fromEntries(
     Object.entries(linkBases).map(([label, base]) => [label, base.replace(/\/+$/u, '')]),
   ),
-  minFreeBytes: Math.floor(minFreeGiB * GIB),
   maxFileBytes: Math.floor(maxFileGiB * GIB),
 });
 

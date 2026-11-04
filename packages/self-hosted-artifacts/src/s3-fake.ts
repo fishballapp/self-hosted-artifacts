@@ -6,7 +6,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import * as Redacted from 'effect/Redacted';
-import { encodeS3Path, encodeS3Query, type S3Credentials, signS3Request } from './s3-sigv4.ts';
+import {
+  encodeS3Path,
+  encodeS3Query,
+  presignS3Request,
+  type S3Credentials,
+  signS3Request,
+} from './s3-sigv4.ts';
 import { closeServer, listenOnLoopback } from './test-support.ts';
 
 /** What the tests sign with: never a real credential. */
@@ -48,15 +54,12 @@ const signatureIsValid = (req: IncomingMessage, url: URL, path: string) => {
       authorization,
     );
   const [, accessKeyId, region, signedHeaders] = parts ?? [];
-  const amzDate = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/u.exec(
-    headerOf(req, 'x-amz-date') ?? '',
-  );
+  const amzDate = headerOf(req, 'x-amz-date') ?? '';
   if (accessKeyId !== FAKE_ACCESS_KEY_ID || region === undefined || signedHeaders === undefined) {
     return false;
   }
-  if (amzDate === null) return false;
-  const [, year, month, day, hour, minute, second] = amzDate.map(Number);
-  const nowMs = Date.UTC(year ?? 0, (month ?? 1) - 1, day, hour, minute, second);
+  const nowMs = millisOfAmzDate(amzDate);
+  if (nowMs === undefined) return false;
   const names = signedHeaders.split(';');
   // The bare minimum of what a real store insists on.
   if (!names.includes('host') || !names.includes('x-amz-date')) return false;
@@ -86,13 +89,73 @@ const signatureIsValid = (req: IncomingMessage, url: URL, path: string) => {
   );
 };
 
+const millisOfAmzDate = (amzDate: string) => {
+  const parts = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/u.exec(amzDate);
+  if (parts === null) return undefined;
+  const [, year, month, day, hour, minute, second] = parts.map(Number);
+  return Date.UTC(year ?? 0, (month ?? 1) - 1, day, hour, minute, second);
+};
+
 /**
- * A small S3 on a loopback socket, in path style: checks each signature, honours conditional writes,
- * checksums and listing, and keeps `Content-Disposition`, as `s3-sigv4.test.ts` holds the signer to
- * AWS's own examples. Anonymous reads get what the README's bucket policy gives them. It answers a
- * `GET` that accepts gzip with a weak ETag, as R2 does.
+ * Why a URL with a signature in it is refused, as R2 was measured refusing one: a signed header that
+ * is missing or changed, the length among them, breaks the signature, and only `GET` and `PUT` work.
  */
-export const startFakeS3 = async () => {
+const presignedRefusal = (req: IncomingMessage, url: URL, path: string) => {
+  const signatureFailure = { code: 'SignatureDoesNotMatch', message: 'Signature mismatch' };
+  if (req.method !== 'GET' && req.method !== 'PUT') return signatureFailure;
+  const { searchParams: params } = url;
+  const [, accessKeyId, date, region] =
+    /^([^/]+)\/(\d{8})\/([^/]+)\/s3\/aws4_request$/u.exec(params.get('X-Amz-Credential') ?? '') ??
+    [];
+  const nowMs = millisOfAmzDate(params.get('X-Amz-Date') ?? '');
+  const expiresInSeconds = Number(params.get('X-Amz-Expires'));
+  if (accessKeyId !== FAKE_ACCESS_KEY_ID || region === undefined || nowMs === undefined) {
+    return signatureFailure;
+  }
+  if (date !== params.get('X-Amz-Date')?.slice(0, 8)) return signatureFailure;
+  const names = (params.get('X-Amz-SignedHeaders') ?? '').split(';');
+  if (!names.includes('host')) return signatureFailure;
+  const sessionToken = params.get('X-Amz-Security-Token');
+  const expected = new URLSearchParams(
+    presignS3Request({
+      method: req.method,
+      host: headerOf(req, 'host') ?? '',
+      path,
+      query: Object.fromEntries([...params].filter(([name]) => !name.startsWith('X-Amz-'))),
+      headers: Object.fromEntries(
+        names
+          .filter(name => name !== 'host')
+          .map(name => [name, headerOf(req, name) ?? ''] as const),
+      ),
+      credentials: {
+        accessKeyId,
+        secretAccessKey: Redacted.make(FAKE_SECRET_ACCESS_KEY),
+        ...(sessionToken === null ? {} : { sessionToken: Redacted.make(sessionToken) }),
+      },
+      region,
+      nowMs,
+      expiresInSeconds,
+    }),
+  );
+  const isUnsignedAmzHeader = Object.keys(req.headers).some(
+    name => name.startsWith('x-amz-') && !names.includes(name),
+  );
+  if (expected.get('X-Amz-Signature') !== params.get('X-Amz-Signature') || isUnsignedAmzHeader) {
+    return signatureFailure;
+  }
+  return Date.now() >= nowMs + expiresInSeconds * 1000
+    ? { code: 'ExpiredRequest', message: 'The request has expired' }
+    : undefined;
+};
+
+/**
+ * A small S3 on a loopback socket, in path style: checks each signature, in a header or a URL,
+ * honours conditional writes, checksums and listing, and keeps `Content-Disposition`, as
+ * `s3-sigv4.test.ts` holds the signer to AWS's own examples. It answers a `GET` that accepts gzip with
+ * a weak ETag, as R2 does. Anonymous reads get what the README's bucket policy gives them, or nothing
+ * from a private bucket.
+ */
+export const startFakeS3 = async ({ isPublic = true }: { isPublic?: boolean } = {}) => {
   const directory = await mkdtemp(join(tmpdir(), 'self-hosted-artifacts-s3-'));
   const objects = new Map<string, StoredObject>();
   let nextFile = 0;
@@ -171,6 +234,7 @@ export const startFakeS3 = async () => {
     res: ServerResponse,
     key: string,
     isAnonymous: boolean,
+    disposition: string | null = null,
   ) => {
     const held = objects.get(key);
     if (held === undefined) {
@@ -182,6 +246,7 @@ export const startFakeS3 = async () => {
     const acceptsGzip = headerOf(req, 'accept-encoding')?.includes('gzip') === true;
     const headers = {
       ...held.headers,
+      ...(disposition === null ? {} : { 'content-disposition': disposition }),
       'content-length': String(held.size),
       etag: acceptsGzip ? `W/${held.etag}` : held.etag,
     };
@@ -221,9 +286,18 @@ export const startFakeS3 = async () => {
     const path = url.pathname.split('/').map(decodeURIComponent).join('/');
     const isListing = key === '';
 
+    if (url.searchParams.has('X-Amz-Signature')) {
+      const refusal = presignedRefusal(req, url, path);
+      if (refusal !== undefined) {
+        req.resume();
+        return respondError(res, 403, refusal.code, refusal.message);
+      }
+      if (req.method === 'PUT') return void putObject(req, res, key);
+      return getObject(req, res, key, false, url.searchParams.get('response-content-disposition'));
+    }
     if (isAnonymous) {
       // The README's policy: anonymous `GetObject` on `artifacts/*`, and nothing else.
-      if (req.method !== 'GET' || isListing || !key.startsWith('artifacts/')) {
+      if (!isPublic || req.method !== 'GET' || isListing || !key.startsWith('artifacts/')) {
         req.resume();
         return respondError(res, 403, 'AccessDenied', 'Access Denied');
       }

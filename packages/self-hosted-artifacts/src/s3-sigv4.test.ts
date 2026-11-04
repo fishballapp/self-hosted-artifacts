@@ -1,6 +1,6 @@
 import * as Redacted from 'effect/Redacted';
 import { describe, expect, it } from 'vitest';
-import { signS3Request } from './s3-sigv4.ts';
+import { presignS3Request, signS3Request } from './s3-sigv4.ts';
 
 // The examples of "Signature Calculations for the Authorization Header: Transferring Payload in a
 // Single Chunk" in the Amazon S3 API Reference: same keys, same time, same signatures.
@@ -105,5 +105,78 @@ describe('what the client relies on', () => {
   it('marks a streamed body unsigned', () => {
     const headers = signS3Request({ ...EXAMPLE, method: 'PUT', path: '/a' });
     expect(headers['x-amz-content-sha256']).toBe('UNSIGNED-PAYLOAD');
+  });
+});
+
+describe('a URL that holds its signature', () => {
+  // "Authenticating Requests: Using Query Parameters" in the Amazon S3 API Reference: same keys, same
+  // time, same signature.
+  it("reproduces AWS's published example", () => {
+    expect(
+      presignS3Request({
+        ...EXAMPLE,
+        method: 'GET',
+        path: '/test.txt',
+        expiresInSeconds: 86_400,
+      }),
+    ).toBe(
+      'X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404&X-Amz-SignedHeaders=host',
+    );
+  });
+
+  const presign = (overrides: Partial<Parameters<typeof presignS3Request>[0]> = {}) =>
+    new URLSearchParams(
+      presignS3Request({
+        ...EXAMPLE,
+        method: 'PUT',
+        path: '/a',
+        expiresInSeconds: 3600,
+        ...overrides,
+      }),
+    );
+
+  it('signs every header given, sorted, with its name in lower case', () => {
+    const signed = presign({ headers: { 'Content-Length': '1', 'x-amz-meta-run-scope': '7/1/1' } });
+    expect(signed.get('X-Amz-SignedHeaders')).toBe('content-length;host;x-amz-meta-run-scope');
+  });
+
+  it('changes with each thing it binds', () => {
+    const signatureOf = (overrides: Parameters<typeof presign>[0]) =>
+      presign(overrides).get('X-Amz-Signature');
+    const base = signatureOf({ headers: { 'content-length': '1' } });
+    expect(signatureOf({ headers: { 'content-length': '2' } })).not.toBe(base);
+    expect(signatureOf({ headers: { 'content-length': '1' }, path: '/b' })).not.toBe(base);
+    expect(signatureOf({ headers: { 'content-length': '1' }, method: 'GET' })).not.toBe(base);
+    expect(signatureOf({ headers: { 'content-length': '1' }, expiresInSeconds: 60 })).not.toBe(
+      base,
+    );
+  });
+
+  it('puts a session token in the query, signed', () => {
+    const withToken = presign({
+      credentials: { ...EXAMPLE.credentials, sessionToken: Redacted.make('the-session') },
+    });
+    expect(withToken.get('X-Amz-Security-Token')).toBe('the-session');
+    expect(withToken.get('X-Amz-Signature')).not.toBe(presign().get('X-Amz-Signature'));
+  });
+
+  it('signs a query it is given, encoded as S3 reads it', () => {
+    const query = { 'response-content-disposition': 'attachment; filename="a.zip"' };
+    expect(
+      presignS3Request({ ...EXAMPLE, method: 'GET', path: '/a', query, expiresInSeconds: 60 }),
+    ).toContain('response-content-disposition=attachment%3B%20filename%3D%22a.zip%22');
+    expect(presign({ query }).get('X-Amz-Signature')).not.toBe(presign().get('X-Amz-Signature'));
+  });
+
+  it('never holds the secret', () => {
+    expect(presign().toString()).not.toContain('wJalrXUtnFEMI');
+  });
+
+  it.each([0, 604_801])('refuses to last %i seconds, as S3 would', expiresInSeconds => {
+    expect(() => presign({ expiresInSeconds })).toThrow(RangeError);
+  });
+
+  it('takes seven days', () => {
+    expect(presign({ expiresInSeconds: 604_800 }).get('X-Amz-Expires')).toBe('604800');
   });
 });

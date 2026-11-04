@@ -33,6 +33,15 @@ export const MERGE_ACTION: UserConfig = {
   outDir: '../../upload/merge/dist',
 };
 
+/** What a Worker runs. Only what workerd has itself stays outside: `node:crypto` is `nodejs_compat`'s. */
+export const WORKER: UserConfig = {
+  ...shared,
+  entry: { worker: 'src/worker.ts' },
+  platform: 'neutral',
+  outputOptions: { entryFileNames: '[name].js' },
+  deps: { neverBundle: ['cloudflare:workers', 'node:crypto'] },
+};
+
 // Everything is bundled (effect and @effect/platform-node are devDependencies): the published CLI
 // installs with zero dependencies, since platform-node's `redis` peer would otherwise land on every
 // user's machine.
@@ -42,6 +51,7 @@ export default defineConfig([
     entry: { bin: 'src/bin.ts' },
     outputOptions: { entryFileNames: '[name].js' },
   },
+  WORKER,
   UPLOAD_ACTION,
   DOWNLOAD_ACTION,
   MERGE_ACTION,

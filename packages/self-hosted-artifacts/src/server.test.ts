@@ -29,6 +29,18 @@ import type { Config } from './config.ts';
 import { UPLOAD_TIMEOUT } from './store.ts';
 import { clockAt, startTestServer, type Verification, verifierAnswering } from './test-support.ts';
 
+const freeSpace = vi.hoisted(() => ({ bytes: undefined as number | undefined }));
+
+// What a disk has free can't be arranged, so a test that needs a number says it here.
+vi.mock('node:fs/promises', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    statfs: async (path: string) =>
+      freeSpace.bytes === undefined ? actual.statfs(path) : { bavail: freeSpace.bytes, bsize: 1 },
+  };
+});
+
 const OIDC_TOKEN = 'oidc-token-that-must-never-be-logged';
 const NOW = Temporal.Instant.from('2026-06-01T12:00:00Z');
 const AUTH = { Authorization: `Bearer ${OIDC_TOKEN}` };
@@ -48,6 +60,8 @@ let verification: Verification;
 let logLines: string[];
 let testServer: Awaited<ReturnType<typeof startTestServer>>;
 let baseConfig: Config;
+
+const diskStore = (dir: string, minFreeBytes = 0) => ({ kind: 'disk', dir, minFreeBytes }) as const;
 
 const startServer = async (
   overrides: Partial<Config> = {},
@@ -100,13 +114,45 @@ const send = (
     req.end(body);
   });
 
-const upload = async (
+const sha256 = (content: Uint8Array | string) => createHash('sha256').update(content).digest('hex');
+
+type UploadOptions = { query?: string; headers?: OutgoingHttpHeaders; digest?: string };
+
+const declarationOf = (
   name: string,
   content: Uint8Array,
-  { query = '', headers = AUTH as OutgoingHttpHeaders } = {},
-) => send('POST', `/artifacts?name=${name}${query}`, { headers, body: content });
+  { query = '', digest = sha256(content) }: UploadOptions = {},
+) => `name=${name}&digest=${digest}&size=${content.length}${query}`;
 
-const sha256 = (content: Uint8Array | string) => createHash('sha256').update(content).digest('hex');
+const create = (name: string, content: Uint8Array, options: UploadOptions = {}) =>
+  send('POST', `/uploads?${declarationOf(name, content, options)}`, {
+    headers: options.headers ?? AUTH,
+  });
+
+const targetOf = ({ body }: Answer) =>
+  (JSON.parse(body) as { upload: { id: string; url: string; headers: Record<string, string> } })
+    .upload;
+
+const created = async (name: string, content: Uint8Array, options: UploadOptions = {}) => {
+  const answer = await create(name, content, options);
+  expect(answer.status).toBe(201);
+  return targetOf(answer);
+};
+
+const commit = (id: string, name: string, content: Uint8Array, options: UploadOptions = {}) =>
+  send('POST', `/uploads/${id}/commit?${declarationOf(name, content, options)}`, {
+    headers: options.headers ?? AUTH,
+  });
+
+/** All three steps, as a client takes them, stopping at the first that refuses. */
+const upload = async (name: string, content: Uint8Array, options: UploadOptions = {}) => {
+  const answer = await create(name, content, options);
+  if (answer.status !== 201) return answer;
+  const { id, url } = targetOf(answer);
+  const sent = await send('PUT', url, { body: content });
+  if (sent.status !== 200) return sent;
+  return commit(id, name, content, options);
+};
 
 const stored = (answer: Answer) => {
   const { id, links } = JSON.parse(answer.body) as { id: string; links: Record<string, string> };
@@ -120,6 +166,7 @@ const uploaded = async (name: string, content: Uint8Array, query = '') => {
   return { answer, ...stored(answer) };
 };
 
+const uploadedAt = (id: string) => join(storeDir, 'tmp', id);
 const artifactsOnDisk = async () => readdir(join(storeDir, 'artifacts')).catch(() => []);
 const tempsOnDisk = async () => readdir(join(storeDir, 'tmp')).catch(() => []);
 const runsDir = () => join(storeDir, 'runs');
@@ -135,8 +182,9 @@ beforeEach(async () => {
   now = NOW;
   verification = VERIFIED;
   logLines = [];
+  freeSpace.bytes = undefined;
   baseConfig = {
-    storeDir,
+    store: diskStore(storeDir),
     oidcAudience: 'self-hosted-artifacts',
     oidcRepositoryOwnerId: '42',
     linkBases: { home: 'http://192.0.2.1:8420', tailscale: 'https://files.example' },
@@ -144,7 +192,6 @@ beforeEach(async () => {
     port: 0,
     defaultRetentionDays: 7,
     maxRetentionDays: 30,
-    minFreeBytes: 0,
     maxFileBytes: 1024 * 1024,
   };
 });
@@ -310,7 +357,7 @@ describe('upload refusals', () => {
 
   it('refuses a missing name', async () => {
     await startServer();
-    const answer = await send('POST', '/artifacts', { headers: AUTH, body: randomBytes(8) });
+    const answer = await send('POST', '/uploads', { headers: AUTH });
     expect(answer.status).toBe(400);
   });
 
@@ -324,20 +371,6 @@ describe('upload refusals', () => {
     const answer = await upload('a.apk', randomBytes(8), { query: `&retention-days=${days}` });
     expect(answer.status).toBe(400);
     expect(JSON.parse(answer.body).error).toMatch(/retention-days/);
-  });
-
-  it('checks auth before reading any of the body', async () => {
-    await startServer();
-    verification = { kind: 'rejected', reason: 'wrong org' };
-    // The headers promise a body that never comes: only an answer that ignores it can arrive.
-    const answer = await new Promise<Answer>((resolve, reject) => {
-      const req = openRequest('POST', '/artifacts?name=a.apk', { ...AUTH, 'Content-Length': 100 });
-      req.on('response', res => resolve(answerOf(res)));
-      req.on('error', reject);
-      req.flushHeaders();
-    });
-    expect(answer.status).toBe(401);
-    expect(await tempsOnDisk()).toEqual([]);
   });
 
   it('answers 401 with a generic message and logs the specific reason', async () => {
@@ -367,10 +400,30 @@ describe('upload refusals', () => {
     'refuses digest=%s',
     async digest => {
       await startServer();
-      const answer = await upload('a.apk', randomBytes(8), { query: `&digest=${digest}` });
+      const answer = await create('a.apk', randomBytes(8), { digest });
       expect(answer.status).toBe(400);
       expect(JSON.parse(answer.body).error).toMatch(/^digest must be/);
-      expect(await artifactsOnDisk()).toEqual([]);
+      expect(await tempsOnDisk()).toEqual([]);
+    },
+  );
+
+  it('refuses no digest', async () => {
+    await startServer();
+    const answer = await send('POST', '/uploads?name=a.apk&size=8', { headers: AUTH });
+    expect(answer.status).toBe(400);
+    expect(JSON.parse(answer.body).error).toMatch(/^digest must be/);
+  });
+
+  it.each(['size=-1&', 'size=1.5&', 'size=8e3&', 'size=&', 'size=soon&', ''])(
+    'refuses a size in `%s`',
+    async size => {
+      await startServer();
+      const answer = await send('POST', `/uploads?${size}name=a.apk&digest=${sha256('a')}`, {
+        headers: AUTH,
+      });
+      expect(answer.status).toBe(400);
+      expect(JSON.parse(answer.body).error).toMatch(/^size must be/);
+      expect(await tempsOnDisk()).toEqual([]);
     },
   );
 
@@ -381,39 +434,420 @@ describe('upload refusals', () => {
     expect(JSON.parse(answer.body).error).toMatch(/^overwrite must be/);
   });
 
-  it('answers 411 without a Content-Length', async () => {
-    await startServer();
-    const answer = await new Promise<Answer>((resolve, reject) => {
-      const req = openRequest('POST', '/artifacts?name=a.apk', {
-        ...AUTH,
-        'Transfer-Encoding': 'chunked',
-      });
-      req.on('response', res => resolve(answerOf(res)));
-      req.on('error', reject);
-      req.end('hello');
-    });
-    expect(answer.status).toBe(411);
-  });
-
-  it('answers 413 from the Content-Length, before any of the body', async () => {
+  it('answers 413 from the size declared', async () => {
     await startServer({ maxFileBytes: 10 });
     expect((await upload('a.apk', randomBytes(11))).status).toBe(413);
     expect(await tempsOnDisk()).toEqual([]);
     await uploaded('a.apk', randomBytes(10));
+    const huge = await send(
+      'POST',
+      `/uploads?name=b.apk&digest=${sha256('a')}&size=${'9'.repeat(400)}`,
+      {
+        headers: AUTH,
+      },
+    );
+    expect(huge.status).toBe(413);
   });
 
   it('answers 507 when the upload would cross the free-space floor', async () => {
-    await startServer({ minFreeBytes: Number.MAX_SAFE_INTEGER });
+    await startServer({ store: diskStore(storeDir, Number.MAX_SAFE_INTEGER) });
     const answer = await upload('a.apk', randomBytes(8));
     expect(answer.status).toBe(507);
-    expect(await artifactsOnDisk()).toEqual([]);
+    expect(await tempsOnDisk()).toEqual([]);
   });
 
   it('counts the file against the free-space floor', async () => {
-    await startServer({ minFreeBytes: 900 });
-    Object.assign(testServer.store, { freeBytes: Effect.succeed(1000) });
+    await startServer({ store: diskStore(storeDir, 900) });
+    freeSpace.bytes = 1000;
     expect((await upload('a.apk', randomBytes(100))).status).toBe(201);
     expect((await upload('b.apk', randomBytes(101))).status).toBe(507);
+  });
+
+  it('checks the floor again as a body starts, as URLs made earlier could otherwise pass it together', async () => {
+    await startServer({ store: diskStore(storeDir, 900) });
+    freeSpace.bytes = 1000;
+    const content = randomBytes(100);
+    const { id, url } = targetOf(await create('a.apk', content));
+    freeSpace.bytes = 999;
+    expect((await send('PUT', url, { body: content })).status).toBe(507);
+    freeSpace.bytes = 1000;
+    expect((await send('PUT', url, { body: content })).status).toBe(200);
+    expect((await commit(id, 'a.apk', content)).status).toBe(201);
+  });
+});
+
+describe('an upload, step by step', () => {
+  const content = randomBytes(64);
+
+  /** A token for what the test says, as `verification` is, from the next request on. */
+  const asRun = (scope: Partial<typeof SCOPE>) => {
+    verification = { ...VERIFIED, scope: { ...SCOPE, ...scope } };
+  };
+
+  const sentBody = async (name = 'a.apk') => {
+    const target = await created(name, content);
+    expect((await send('PUT', target.url, { body: content })).status).toBe(200);
+    return target;
+  };
+
+  describe('starting', () => {
+    it('answers with a path on this server and what to send, and takes no body', async () => {
+      await startServer();
+      const answer = await create('a.apk', content);
+
+      expect(answer.status).toBe(201);
+      const { id, url, headers } = targetOf(answer);
+      expect(id).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect(url).toBe(`/uploads/${id}`);
+      expect(headers).toEqual({ 'content-type': 'application/octet-stream' });
+      expect(await artifactsOnDisk()).toEqual([]);
+    });
+
+    it('keeps what was declared beside where the body will go', async () => {
+      await startServer();
+      const { id } = await created('a.apk', content, { query: '&retention-days=3&overwrite=true' });
+      expect(await readdir(uploadedAt(id))).toEqual(['upload.json']);
+      expect(JSON.parse(await readFile(join(uploadedAt(id), 'upload.json'), 'utf8'))).toEqual({
+        id,
+        ...SCOPE,
+        name: 'a.apk',
+        size: content.length,
+        digest: sha256(content),
+        overwrite: true,
+        retentionDays: 3,
+        createdAtMs: NOW.epochMilliseconds,
+      });
+    });
+
+    it('no longer takes a body at `POST /artifacts`', async () => {
+      await startServer();
+      const answer = await send('POST', `/artifacts?name=a.apk&digest=${sha256(content)}`, {
+        headers: AUTH,
+        body: content,
+      });
+      expect(answer.status).toBe(404);
+      expect(await tempsOnDisk()).toEqual([]);
+    });
+  });
+
+  describe('sending the body', () => {
+    it('needs no token: the URL is the capability', async () => {
+      await startServer();
+      const { url } = await created('a.apk', content);
+      verification = { kind: 'rejected', reason: 'nobody' };
+      expect((await send('PUT', url, { body: content })).status).toBe(200);
+    });
+
+    it.each([
+      ['an unknown ID', `/uploads/${'a'.repeat(43)}`],
+      ['an ID of the wrong shape', '/uploads/short'],
+      ['a traversal', '/uploads/..%2f..%2fetc'],
+      ['a query string', '/uploads/<id>?x=1'],
+    ])('answers 404 for %s, leaving nothing', async (_, path) => {
+      await startServer();
+      const { id } = await created('a.apk', content);
+      const answer = await send('PUT', path.replace('<id>', id), { body: content });
+      expect(answer.status).toBe(404);
+      expect(await tempsOnDisk()).toEqual([id]);
+      expect(await readdir(uploadedAt(id))).toEqual(['upload.json']);
+    });
+
+    it('answers 404 once the hour is up, before any of the body', async () => {
+      await startServer();
+      const { url } = await created('a.apk', content);
+      now = NOW.add({ minutes: Duration.toMinutes(UPLOAD_TIMEOUT) - 1 });
+      const inTime = await send('PUT', url, { body: content });
+      expect(inTime.status).toBe(200);
+      now = NOW.add({ minutes: Duration.toMinutes(UPLOAD_TIMEOUT) });
+      expect((await send('PUT', url, { body: content })).status).toBe(404);
+    });
+
+    it.each([
+      ['too small', 63],
+      ['too big', 65],
+    ])('answers 400 for a Content-Length %s, before any of the body', async (_, length) => {
+      await startServer();
+      const { id, url } = await created('a.apk', content);
+      // The headers promise a body that never comes: only an answer that ignores it can arrive.
+      const answer = await new Promise<Answer>((resolve, reject) => {
+        const req = openRequest('PUT', url, { 'Content-Length': length });
+        req.on('response', res => resolve(answerOf(res)));
+        req.on('error', reject);
+        req.flushHeaders();
+      });
+      expect(answer.status).toBe(400);
+      expect(JSON.parse(answer.body).error).toContain(String(content.length));
+      expect(await tempsOnDisk()).toEqual([id]);
+      expect((await send('PUT', url, { body: content })).status).toBe(200);
+    });
+
+    it('answers 400 for no Content-Length', async () => {
+      await startServer();
+      const { url } = await created('a.apk', content);
+      const answer = await new Promise<Answer>((resolve, reject) => {
+        const req = openRequest('PUT', url, { 'Transfer-Encoding': 'chunked' });
+        req.on('response', res => resolve(answerOf(res)));
+        req.on('error', reject);
+        req.end(content);
+      });
+      expect(answer.status).toBe(400);
+    });
+
+    it('answers 422 for the wrong digest, leaving nothing behind', async () => {
+      await startServer();
+      const { id, url } = await created('a.apk', content);
+
+      const answer = await send('PUT', url, { body: randomBytes(content.length) });
+
+      expect(answer.status).toBe(422);
+      expect(JSON.parse(answer.body).error).toMatch(
+        /^The body's SHA-256 is [0-9a-f]{64}, not the digest sent, [0-9a-f]{64}\. Did the file change while it was uploading\?$/,
+      );
+      expect(await tempsOnDisk()).toEqual([]);
+      expect(await artifactsOnDisk()).toEqual([]);
+      expect((await send('PUT', url, { body: content })).status).toBe(404);
+      expect((await commit(id, 'a.apk', content)).status).toBe(404);
+    });
+
+    it('takes another try, which replaces the first', async () => {
+      await startServer();
+      const { id, url } = await sentBody();
+      expect((await send('PUT', url, { body: content })).status).toBe(200);
+      expect((await readdir(uploadedAt(id))).toSorted()).toEqual(['data', 'upload.json']);
+      expect(await tempsOnDisk()).toEqual([id]);
+
+      const answer = await commit(id, 'a.apk', content);
+      expect(answer.status).toBe(201);
+      expect((await send('GET', stored(answer).pathname)).bytes.equals(content)).toBe(true);
+    });
+
+    it('answers 404 after the commit, leaving the artifact as it was', async () => {
+      await startServer();
+      const { id, url } = await sentBody();
+      const { pathname } = stored(await commit(id, 'a.apk', content));
+
+      expect((await send('PUT', url, { body: randomBytes(content.length) })).status).toBe(404);
+      expect((await send('PUT', url, { body: content })).status).toBe(404);
+
+      expect((await send('GET', pathname)).bytes.equals(content)).toBe(true);
+      expect(await artifactsOnDisk()).toEqual([id]);
+      expect(await tempsOnDisk()).toEqual([]);
+    });
+
+    it('answers 404 to a try still arriving when the commit lands, leaving nothing of it', async () => {
+      await startServer();
+      const { id, url } = await sentBody();
+      const late = new Promise<Answer>((resolve, reject) => {
+        const req = openRequest('PUT', url, { 'Content-Length': content.length });
+        req.on('response', res => resolve(answerOf(res)));
+        req.on('error', reject);
+        req.write(content.subarray(0, 8), () => {
+          void vi
+            .waitFor(async () => expect(await tempsOnDisk()).toHaveLength(2))
+            .then(async () => {
+              expect((await commit(id, 'a.apk', content)).status).toBe(201);
+              req.end(content.subarray(8));
+            });
+        });
+      });
+
+      expect((await late).status).toBe(404);
+      expect(await tempsOnDisk()).toEqual([]);
+      expect((await readdir(join(storeDir, 'artifacts', id))).toSorted()).toEqual([
+        'data',
+        'meta.json',
+      ]);
+    });
+  });
+
+  describe('committing', () => {
+    it("makes the upload's ID the artifact's, with a token of its own", async () => {
+      await startServer();
+      const { id } = await sentBody();
+      const answer = await commit(id, 'a.apk', content);
+      expect(answer.status).toBe(201);
+      expect(stored(answer).id).toBe(id);
+      expect(await tempsOnDisk()).toEqual([]);
+    });
+
+    it('answers 404 for an upload whose body never came, which can still come', async () => {
+      await startServer();
+      const { id, url } = await created('a.apk', content);
+
+      const answer = await commit(id, 'a.apk', content);
+
+      expect(answer.status).toBe(404);
+      expect(JSON.parse(answer.body).error).toMatch(/^This upload is not there to commit/);
+      await send('PUT', url, { body: content });
+      expect((await commit(id, 'a.apk', content)).status).toBe(201);
+    });
+
+    it('answers 404 for an unknown ID', async () => {
+      await startServer();
+      expect((await commit('a'.repeat(43), 'a.apk', content)).status).toBe(404);
+    });
+
+    it.each([
+      ['another repository', { repositoryId: '8' }],
+      ['another run', { runId: '101' }],
+      ['another attempt', { runAttempt: '2' }],
+    ])('answers 404 to a token of %s, and the upload is still there', async (_, scope) => {
+      await startServer();
+      const { id } = await sentBody();
+
+      asRun(scope);
+      expect((await commit(id, 'a.apk', content)).status).toBe(404);
+      expect(await tempsOnDisk()).toEqual([id]);
+
+      asRun({});
+      expect((await commit(id, 'a.apk', content)).status).toBe(201);
+
+      asRun(scope);
+      expect((await commit(id, 'a.apk', content)).status).toBe(404);
+    });
+
+    it.each([
+      ['a name', { name: 'b.apk', content, options: {} }],
+      ['a digest', { name: 'a.apk', content, options: { digest: sha256('other') } }],
+      ['a size', { name: 'a.apk', content: randomBytes(65), options: { digest: sha256(content) } }],
+      ['retention', { name: 'a.apk', content, options: { query: '&retention-days=1' } }],
+      ['overwrite', { name: 'a.apk', content, options: { query: '&overwrite=true' } }],
+    ])('answers 404 when it declares another %s', async (_, declared) => {
+      await startServer();
+      const { id } = await sentBody();
+      expect((await commit(id, declared.name, declared.content, declared.options)).status).toBe(
+        404,
+      );
+      expect((await commit(id, 'a.apk', content)).status).toBe(201);
+    });
+
+    it('checks the token and what it declares before anything else', async () => {
+      await startServer();
+      const { id } = await sentBody();
+      expect((await commit(id, 'a.apk', content, { headers: {} })).status).toBe(401);
+      expect((await commit(id, '.bad', content)).status).toBe(400);
+      expect(await tempsOnDisk()).toEqual([id]);
+    });
+
+    it('answers a commit of what is already committed with the same artifact', async () => {
+      await startServer();
+      const { id } = await sentBody();
+      const first = await commit(id, 'a.apk', content);
+
+      const again = await commit(id, 'a.apk', content);
+
+      expect(first.status).toBe(201);
+      expect(again.status).toBe(200);
+      expect(JSON.parse(again.body)).toEqual(JSON.parse(first.body));
+      expect(await artifactsOnDisk()).toEqual([id]);
+    });
+
+    it('answers commits that cross with the one artifact', async () => {
+      await startServer();
+      const { id } = await sentBody();
+      const answers = await Promise.all(
+        Array.from({ length: 8 }, () => commit(id, 'a.apk', content)),
+      );
+      expect(answers.map(({ status }) => status).toSorted()).toEqual([
+        200, 200, 200, 200, 200, 200, 200, 201,
+      ]);
+      expect(await artifactsOnDisk()).toEqual([id]);
+      expect(await tempsOnDisk()).toEqual([]);
+    });
+
+    it('answers 409 if the name was taken meanwhile, leaving nothing of it', async () => {
+      await startServer();
+      const { id } = await sentBody();
+      const other = randomBytes(64);
+      const winner = stored(await upload('a.apk', other));
+
+      const answer = await commit(id, 'a.apk', content);
+
+      expect(answer.status).toBe(409);
+      expect(JSON.parse(answer.body).error).toMatch(/already exists on the workflow run/);
+      expect(await tempsOnDisk()).toEqual([]);
+      expect((await send('GET', winner.pathname)).bytes.equals(other)).toBe(true);
+    });
+
+    it('replaces what took the name meanwhile, with overwrite', async () => {
+      await startServer();
+      const { id, url } = await created('a.apk', content, { query: '&overwrite=true' });
+      await send('PUT', url, { body: content });
+      const old = stored(await upload('a.apk', randomBytes(64)));
+
+      const answer = await commit(id, 'a.apk', content, { query: '&overwrite=true' });
+
+      expect(answer.status).toBe(201);
+      expect((await send('GET', old.pathname)).status).toBe(404);
+      expect(await artifactsOnDisk()).toEqual([id]);
+    });
+
+    it('answers with what took the name meanwhile if it is the same content', async () => {
+      await startServer();
+      const { id } = await sentBody();
+      const winner = stored(await upload('a.apk', content));
+
+      const answer = await commit(id, 'a.apk', content);
+
+      expect(answer.status).toBe(200);
+      expect(stored(answer).id).toBe(winner.id);
+      expect(await artifactsOnDisk()).toEqual([winner.id]);
+      expect(await tempsOnDisk()).toEqual([]);
+    });
+
+    it('still takes a body that took most of the hour, after the hour is up', async () => {
+      await startServer();
+      const { id } = await sentBody();
+      now = NOW.add({ minutes: Duration.toMinutes(UPLOAD_TIMEOUT) + 1 });
+      expect((await commit(id, 'a.apk', content)).status).toBe(201);
+    });
+
+    it('answers 503 while the store is missing', async () => {
+      await startServer();
+      const { id } = await sentBody();
+      await rm(storeDir, { recursive: true });
+      expect((await commit(id, 'a.apk', content)).status).toBe(503);
+    });
+  });
+
+  describe('abandoned', () => {
+    const age = async (entry: string) => {
+      const modifiedAt = new Date(
+        Temporal.Now.instant().subtract({ minutes: Duration.toMinutes(UPLOAD_TIMEOUT) + 2 })
+          .epochMilliseconds,
+      );
+      await utimes(join(storeDir, 'tmp', entry), modifiedAt, modifiedAt);
+    };
+
+    it.each([
+      ['with no body', false],
+      ['with its body', true],
+    ])('is swept %s, and can no longer be committed', async (_, hasBody) => {
+      await startServer();
+      now = Temporal.Now.instant();
+      const { id, url } = await created('a.apk', content);
+      if (hasBody) await send('PUT', url, { body: content });
+      const fresh = await created('b.apk', content);
+      await age(id);
+
+      expect(await sweep()).toMatchObject({ removedTemps: 1, removedArtifacts: 0 });
+
+      expect(await tempsOnDisk()).toEqual([fresh.id]);
+      expect((await commit(id, 'a.apk', content)).status).toBe(404);
+      expect((await send('PUT', url, { body: content })).status).toBe(404);
+    });
+
+    it('is swept with a body a crash left on its way', async () => {
+      await startServer();
+      now = Temporal.Now.instant();
+      const { id } = await created('a.apk', content);
+      await writeFile(join(storeDir, 'tmp', `${id}.part`), 'partial');
+      await age(id);
+      await age(`${id}.part`);
+
+      expect(await sweep()).toMatchObject({ removedTemps: 2 });
+      expect(await tempsOnDisk()).toEqual([]);
+    });
   });
 });
 
@@ -626,7 +1060,7 @@ describe('listing a run', () => {
   });
 
   it('answers 503 rather than an empty list while the store is missing', async () => {
-    await startServer({ storeDir: join(rootDir, 'volume') });
+    await startServer({ store: diskStore(join(rootDir, 'volume')) });
     expect((await send('GET', '/artifacts', { headers: AUTH })).status).toBe(503);
   });
 
@@ -811,7 +1245,7 @@ describe('deleting', () => {
   });
 
   it('answers 503 while the store is missing', async () => {
-    await startServer({ storeDir: join(rootDir, 'volume') });
+    await startServer({ store: diskStore(join(rootDir, 'volume')) });
     expect((await remove('a'.repeat(43))).status).toBe(503);
   });
 
@@ -910,7 +1344,7 @@ describe('retention', () => {
 describe('a store that goes away', () => {
   it('answers 503 and 404, never creates it, and recovers without a restart', async () => {
     const missing = join(rootDir, 'volume');
-    await startServer({ storeDir: missing });
+    await startServer({ store: diskStore(missing) });
 
     expect((await send('GET', '/healthz')).status).toBe(503);
     const refused = await upload('a.apk', randomBytes(8));
@@ -942,20 +1376,19 @@ describe('a store that goes away', () => {
 });
 
 describe('a cancelled upload', () => {
-  it('removes its temp straight away and publishes nothing', async () => {
+  it('removes what it sent straight away and publishes nothing', async () => {
     await startServer();
     const size = 512 * 1024;
-    const req = openRequest('POST', '/artifacts?name=cancelled.apk', {
-      ...AUTH,
-      'Content-Length': size,
-    });
+    const content = randomBytes(size);
+    const { id, url } = await created('cancelled.apk', content);
+    const req = openRequest('PUT', url, { 'Content-Length': size });
     req.on('error', () => undefined);
-    req.write(randomBytes(64 * 1024));
-    await vi.waitFor(async () => expect(await tempsOnDisk()).toHaveLength(1));
+    req.write(content.subarray(0, 64 * 1024));
+    await vi.waitFor(async () => expect(await tempsOnDisk()).toHaveLength(2));
 
     req.destroy();
 
-    await vi.waitFor(async () => expect(await tempsOnDisk()).toEqual([]));
+    await vi.waitFor(async () => expect(await tempsOnDisk()).toEqual([id]));
     expect(await artifactsOnDisk()).toEqual([]);
     await vi.waitFor(() => expect(logLines.join('\n')).toContain('upload stopped'));
   });
@@ -994,37 +1427,44 @@ describe('a stalled download', () => {
   });
 });
 
-describe('store.put', () => {
-  const putFailure = async (chunks: Uint8Array[], size: number) => {
+describe('store.receive', () => {
+  const receiveFailure = async (chunks: Uint8Array[], size: number) => {
     await startServer();
     return testServer.run(
-      testServer.store
-        .put({
-          repository: VERIFIED.repository,
+      Effect.gen(function* () {
+        const { store } = testServer;
+        const { id } = yield* store.create({
           scope: SCOPE,
           name: 'a.apk',
           size,
-          digest: undefined,
+          digest: sha256('a'),
           overwrite: false,
           retentionDays: 1,
-          body: Stream.fromIterable(chunks),
-        })
-        .pipe(Effect.flip),
+        });
+        const pending = yield* store.findUpload(id);
+        if (pending._tag === 'None') throw new Error('The upload is not there');
+        return yield* store
+          .receive({ upload: pending.value, stream: Stream.fromIterable(chunks) })
+          .pipe(
+            Effect.flip,
+            Effect.map(failure => ({ failure, id })),
+          );
+      }),
     );
   };
 
   it('refuses a body longer than declared, while streaming', async () => {
-    const failure = await putFailure([new Uint8Array(4), new Uint8Array(4)], 5);
+    const { failure, id } = await receiveFailure([new Uint8Array(4), new Uint8Array(4)], 5);
     expect(failure).toMatchObject({ reason: expect.stringMatching(/longer/) });
-    expect(await tempsOnDisk()).toEqual([]);
-    expect(await artifactsOnDisk()).toEqual([]);
+    expect(await tempsOnDisk()).toEqual([id]);
+    expect(await readdir(uploadedAt(id))).toEqual(['upload.json']);
   });
 
   it('refuses a body shorter than declared', async () => {
-    const failure = await putFailure([new Uint8Array(4)], 5);
+    const { failure, id } = await receiveFailure([new Uint8Array(4)], 5);
     expect(failure).toMatchObject({ reason: expect.stringMatching(/shorter/) });
-    expect(await tempsOnDisk()).toEqual([]);
-    expect(await artifactsOnDisk()).toEqual([]);
+    expect(await tempsOnDisk()).toEqual([id]);
+    expect(await readdir(uploadedAt(id))).toEqual(['upload.json']);
   });
 });
 
@@ -1085,24 +1525,22 @@ describe('the temp sweep', () => {
   it('leaves a real upload in flight alone', async () => {
     await startServer();
     now = Temporal.Now.instant();
-    const req = openRequest('POST', '/artifacts?name=slow.apk', {
-      ...AUTH,
-      'Content-Length': 1024,
-    });
+    const content = randomBytes(1024);
+    const { id, url } = await created('slow.apk', content);
+    const req = openRequest('PUT', url, { 'Content-Length': content.length });
     req.on('error', () => undefined);
-    req.write(randomBytes(8));
-    await vi.waitFor(async () => expect(await tempsOnDisk()).toHaveLength(1));
+    req.write(content.subarray(0, 8));
+    await vi.waitFor(async () => expect(await tempsOnDisk()).toHaveLength(2));
 
     expect(await sweep()).toMatchObject({ removedTemps: 0 });
-    expect(await tempsOnDisk()).toHaveLength(1);
+    expect(await tempsOnDisk()).toHaveLength(2);
     req.destroy();
-    await vi.waitFor(async () => expect(await tempsOnDisk()).toEqual([]));
+    await vi.waitFor(async () => expect(await tempsOnDisk()).toEqual([id]));
   });
 });
 
 describe('a name in a run attempt', () => {
-  const put = (name: string, content: Uint8Array, query = '') =>
-    upload(name, content, { query: `&digest=${sha256(content)}${query}` });
+  const put = (name: string, content: Uint8Array, query = '') => upload(name, content, { query });
 
   it('refuses a second upload with other content, leaving the first as it was', async () => {
     await startServer();
@@ -1114,30 +1552,6 @@ describe('a name in a run attempt', () => {
     expect(answer.status).toBe(409);
     expect(JSON.parse(answer.body).error).toMatch(/already exists on the workflow run/);
     expect((await send('GET', pathname)).bytes.equals(first)).toBe(true);
-    expect(await artifactsOnDisk()).toHaveLength(1);
-    expect(await tempsOnDisk()).toEqual([]);
-  });
-
-  it('refuses with a digest before reading any of the body', async () => {
-    await startServer();
-    await put('a.apk', randomBytes(8));
-    const answer = await new Promise<Answer>((resolve, reject) => {
-      const req = openRequest('POST', `/artifacts?name=a.apk&digest=${sha256('other')}`, {
-        ...AUTH,
-        'Content-Length': 100,
-      });
-      req.on('response', res => resolve(answerOf(res)));
-      req.on('error', reject);
-      req.flushHeaders();
-    });
-    expect(answer.status).toBe(409);
-    expect(await tempsOnDisk()).toEqual([]);
-  });
-
-  it('refuses without a digest once it has the body to compare', async () => {
-    await startServer();
-    await uploaded('a.apk', randomBytes(8));
-    expect((await upload('a.apk', randomBytes(8))).status).toBe(409);
     expect(await artifactsOnDisk()).toHaveLength(1);
     expect(await tempsOnDisk()).toEqual([]);
   });
@@ -1168,7 +1582,8 @@ describe('a name in a run attempt', () => {
     await startServer();
     const old = stored(await put('a.apk', randomBytes(8)));
     const answer = await upload('a.apk', randomBytes(8), {
-      query: `&digest=${sha256('other')}&overwrite=true`,
+      digest: sha256('other'),
+      query: '&overwrite=true',
     });
     expect(answer.status).toBe(422);
     expect((await send('GET', old.pathname)).status).toBe(200);
@@ -1193,30 +1608,19 @@ describe('a name in a run attempt', () => {
   });
 
   it('answers a retry even when the disk could not take it again', async () => {
-    await startServer({ minFreeBytes: 900 });
-    Object.assign(testServer.store, { freeBytes: Effect.succeed(1000) });
+    await startServer({ store: diskStore(storeDir, 900) });
+    freeSpace.bytes = 1000;
     const content = randomBytes(8);
     const { id } = stored(await put('a.apk', content));
-    Object.assign(testServer.store, { freeBytes: Effect.succeed(0) });
+    freeSpace.bytes = 0;
     const retry = await put('a.apk', content);
     expect(retry.status).toBe(200);
     expect(stored(retry).id).toBe(id);
   });
 
-  it('recognises a retry with no digest sent, by what the body hashes to', async () => {
-    await startServer();
-    const content = randomBytes(8);
-    const first = await uploaded('a.apk', content);
-    const retry = await upload('a.apk', content);
-    expect(retry.status).toBe(200);
-    expect(stored(retry).id).toBe(first.id);
-    expect(await artifactsOnDisk()).toEqual([first.id]);
-    expect(await tempsOnDisk()).toEqual([]);
-  });
-
   it('refuses a body that is not what its digest says, storing nothing', async () => {
     await startServer();
-    const answer = await upload('a.apk', randomBytes(8), { query: `&digest=${sha256('other')}` });
+    const answer = await upload('a.apk', randomBytes(8), { digest: sha256('other') });
     expect(answer.status).toBe(422);
     expect(JSON.parse(answer.body).error).toContain(sha256('other'));
     expect(await artifactsOnDisk()).toEqual([]);
@@ -1283,30 +1687,20 @@ describe('a name in a run attempt', () => {
 });
 
 describe('uploads racing for one name', () => {
-  /**
-   * Every request is past the first check, its temp open, before any of them may finish, so
-   * the only thing left to decide between them is the publish.
-   */
+  /** Every upload's body is in place before any commits, so all that's left to decide is the publish. */
   const race = async (contents: Uint8Array[], query = '') => {
-    const requests = contents.map(content => {
-      const req = openRequest('POST', `/artifacts?name=a.apk&digest=${sha256(content)}${query}`, {
-        ...AUTH,
-        'Content-Length': content.length,
-      });
-      req.write(content.subarray(0, 1));
-      return {
-        content,
-        req,
-        answer: new Promise<Answer>((resolve, reject) => {
-          req.on('response', res => resolve(answerOf(res)));
-          req.on('error', reject);
-        }),
-      };
-    });
-    await vi.waitFor(async () => expect(await tempsOnDisk()).toHaveLength(contents.length));
-    for (const { req, content } of requests) req.end(content.subarray(1));
+    const uploads = await Promise.all(
+      contents.map(async content => {
+        const { id, url } = await created('a.apk', content, { query });
+        expect((await send('PUT', url, { body: content })).status).toBe(200);
+        return { id, content };
+      }),
+    );
     return Promise.all(
-      requests.map(async ({ answer, content }) => ({ answer: await answer, content })),
+      uploads.map(async ({ id, content }) => ({
+        answer: await commit(id, 'a.apk', content, { query }),
+        content,
+      })),
     );
   };
 
@@ -1355,21 +1749,20 @@ describe('uploads racing for one name', () => {
     expect(await tempsOnDisk()).toEqual([]);
   });
 
-  it('finishes publishing for a client that has gone', async () => {
+  it('recovers a commit whose client has gone, however far it got', async () => {
     await startServer();
     const content = randomBytes(64 * 1024);
-    const req = openRequest('POST', `/artifacts?name=a.apk&digest=${sha256(content)}`, {
-      ...AUTH,
-      'Content-Length': content.length,
-    });
+    const { id, url } = await created('a.apk', content);
+    await send('PUT', url, { body: content });
+    const req = openRequest(
+      'POST',
+      `/uploads/${id}/commit?${declarationOf('a.apk', content)}`,
+      AUTH,
+    );
     req.on('error', () => undefined);
-    req.end(content, () => req.destroy());
-    await vi.waitFor(async () => {
-      expect(await tempsOnDisk()).toEqual([]);
-    });
+    req.end(() => req.destroy());
 
-    // However far it got, the retry finds the name free or holding this very content.
-    const retry = await upload('a.apk', content, { query: `&digest=${sha256(content)}` });
+    const retry = await upload('a.apk', content);
     expect([200, 201]).toContain(retry.status);
     expect((await send('GET', stored(retry).pathname)).bytes.equals(content)).toBe(true);
     expect(await artifactsOnDisk()).toHaveLength(1);
@@ -1628,7 +2021,7 @@ describe('/healthz', () => {
   it('answers 503 when storeDir is a file', async () => {
     const file = join(rootDir, 'file');
     await writeFile(file, 'not a directory');
-    await startServer({ storeDir: file });
+    await startServer({ store: diskStore(file) });
     expect((await send('GET', '/healthz')).status).toBe(503);
   });
 });
@@ -1657,16 +2050,15 @@ describe('logs', () => {
     await send('GET', pathname);
     await send('HEAD', pathname);
     await send('GET', `/${token}/wrong.apk`);
-    await upload(name, content, { query: `&digest=${sha256(content)}` });
     await upload(name, content);
-    await upload(name, randomBytes(8), { query: `&digest=${sha256('other')}` });
+    await upload(name, randomBytes(8));
     verification = { kind: 'rejected', reason: 'wrong org' };
     await upload(name, randomBytes(8));
     // A failing upload: the store's own directory is in the way, so the error names a path.
     verification = VERIFIED;
     await rm(join(storeDir, 'tmp'), { recursive: true, force: true });
     await writeFile(join(storeDir, 'tmp'), 'in the way');
-    expect((await upload(name, randomBytes(8))).status).toBe(500);
+    expect((await upload('another.apk', randomBytes(8))).status).toBe(500);
 
     const logged = logLines.join('\n');
     expect(logged).not.toContain(token);
@@ -1706,14 +2098,40 @@ describe('logs', () => {
     await startServer();
     const content = randomBytes(8);
     await uploaded('a.apk', content);
-    await upload('a.apk', content, { query: `&digest=${sha256(content)}` });
-    await upload('a.apk', randomBytes(8), { query: `&digest=${sha256('other')}` });
+    await upload('a.apk', content);
+    await upload('a.apk', randomBytes(8));
     const logged = logLines.join('\n');
     expect(logged).toMatch(/upload already stored.*digest=.*expiresAt=/u);
     const refused = logLines.find(line => line.includes('upload refused'));
     expect(refused).toContain('name taken');
     expect(refused).toContain('repository=fishballapp/private-thing');
     expect(refused).toContain('name=a.apk');
+  });
+
+  it("never hold an upload's whole ID, whatever becomes of it", async () => {
+    await startServer();
+    const content = randomBytes(8);
+
+    const refused = await created('refused.apk', content);
+    await send('PUT', refused.url, { body: randomBytes(9) });
+    await send('PUT', refused.url, { body: randomBytes(8) });
+    await commit(refused.id, 'refused.apk', content);
+    const stopped = await created('stopped.apk', content);
+    const req = openRequest('PUT', stopped.url, { 'Content-Length': content.length });
+    req.on('error', () => undefined);
+    req.write(content.subarray(0, 2));
+    await vi.waitFor(async () => expect(await tempsOnDisk()).toHaveLength(2));
+    req.destroy();
+    await vi.waitFor(() => expect(logLines.join('\n')).toContain('upload stopped'));
+    const { id, url } = await created('kept.apk', content);
+    await send('PUT', url, { body: content });
+    await send('PUT', `/uploads/${'a'.repeat(43)}`, { body: content });
+
+    const logged = logLines.join('\n');
+    expect(logged).toContain(`${id.slice(0, 8)}…`);
+    for (const whole of [refused.id, stopped.id, id, 'a'.repeat(43)]) {
+      expect(logged).not.toContain(whole);
+    }
   });
 
   it('do not echo a refused name', async () => {

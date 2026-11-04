@@ -12,13 +12,18 @@ import * as Schema from 'effect/Schema';
 import { ClientError } from './client-support.ts';
 import type { Target } from './target.ts';
 import {
+  downloadUnavailable,
+  executeDownload,
   executeRequest,
+  executeWithoutUrl,
   isOk,
   ListedArtifactSchema,
   SingleLineSchema,
+  StoredArtifactFields,
   streamBodyToFile,
   UnavailableError,
   unavailableFrom,
+  unavailableWithoutUrl,
   withRetries,
 } from './transport.ts';
 
@@ -32,18 +37,36 @@ const StoredSchema = Schema.Struct({
   links: Schema.Record(Schema.String, SingleLineSchema),
 });
 
+const UploadTargetSchema = Schema.Struct({
+  upload: Schema.Struct({
+    id: StoredArtifactFields.id,
+    url: SingleLineSchema,
+    headers: Schema.Record(Schema.String, SingleLineSchema),
+  }),
+});
+
 const ListingSchema = Schema.Struct({ artifacts: Schema.Array(ListedArtifactSchema) });
 const RemovedSchema = Schema.Struct({ id: Schema.String, name: Schema.String });
 
-const FailureSchema = Schema.Struct({ error: Schema.String });
+const decodeFailure = Schema.decodeUnknownOption(
+  Schema.fromJsonString(Schema.Struct({ error: Schema.String })),
+);
 const TokenSchema = Schema.Struct({ value: Schema.String });
 
+/**
+ * A bucket answers a body it refuses in XML. Only its code: the rest can hold the string it signed and
+ * the access key's ID.
+ */
 const readFailure = Effect.fnUntraced(function* (response: HttpClientResponse.HttpClientResponse) {
-  const message = yield* response.json.pipe(
-    Effect.flatMap(Schema.decodeUnknownEffect(FailureSchema)),
-    Effect.map(({ error }) => error),
-    Effect.orElseSucceed(() => `HTTP ${response.status}`),
-  );
+  const body = yield* response.text.pipe(Effect.orElseSucceed(() => ''));
+  const bucketCode = /<Code>([A-Za-z]+)<\/Code>/u.exec(body)?.[1];
+  const message = Option.match(decodeFailure(body), {
+    onSome: ({ error }) => error,
+    onNone: () =>
+      bucketCode === undefined
+        ? `HTTP ${response.status}`
+        : `HTTP ${response.status}: ${bucketCode}`,
+  });
   return response.status >= 500 ? new UnavailableError({ message }) : new ClientError({ message });
 });
 
@@ -108,39 +131,79 @@ export const makeServerTarget = Effect.fnUntraced(function* ({
   /** With a token minted for this attempt alone, as one could expire over a long retry. */
   const executeAuthorized = Effect.fnUntraced(function* (
     request: HttpClientRequest.HttpClientRequest,
+    execute: typeof executeRequest = executeRequest,
   ) {
     const token = yield* mintToken({ client, ...(yield* readAudiencedTokenRequest) });
-    return yield* executeRequest(client, HttpClientRequest.bearerToken(request, token));
+    return yield* execute(client, HttpClientRequest.bearerToken(request, token));
   });
+
+  const decodeStored = (answer: unknown) =>
+    Schema.decodeUnknownEffect(StoredSchema)(answer).pipe(
+      Effect.mapError(() => new ClientError({ message: `${base} answered without a usable link` })),
+    );
 
   return {
     // Fails at once in a job without `id-token: write`, the likeliest mistake when moving over.
     ready: Effect.asVoid(readAudiencedTokenRequest),
 
-    /** `POST /artifacts`. */
+    /**
+     * `POST /uploads`, `PUT` of the body and `POST /uploads/<id>/commit`, each attempt all three. A
+     * commit whose answer was lost is recovered by the next attempt's first step: the digest is stored.
+     */
     send: Effect.fnUntraced(function* ({ file, name, digest, overwrite, retentionDays }) {
+      const declaration = {
+        name,
+        digest,
+        size: String(file.size),
+        ...(overwrite ? { overwrite: 'true' } : {}),
+        // The server takes no `0`: leaving it out asks for its default.
+        ...(retentionDays === 0 ? {} : { 'retention-days': String(retentionDays) }),
+      };
+
       const attempt = Effect.gen(function* () {
-        const response = yield* executeAuthorized(
-          HttpClientRequest.post(`${base}/artifacts`).pipe(
-            HttpClientRequest.setUrlParams({
-              name,
-              digest,
-              ...(overwrite ? { overwrite: 'true' } : {}),
-              // The server takes no `0`: leaving it out asks for its default.
-              ...(retentionDays === 0 ? {} : { 'retention-days': String(retentionDays) }),
-            }),
-            HttpClientRequest.setBody(
-              HttpBody.raw(file, { contentType: 'application/octet-stream' }),
-            ),
+        const created = yield* executeAuthorized(
+          HttpClientRequest.post(`${base}/uploads`).pipe(
+            HttpClientRequest.setUrlParams(declaration),
           ),
         );
-        if (!isOk(response)) return yield* yield* readFailure(response);
-        // An answer cut short may follow a stored upload, which a retry recovers by its digest.
-        const answer = yield* response.json.pipe(Effect.mapError(unavailableFrom));
-        return yield* Schema.decodeUnknownEffect(StoredSchema)(answer).pipe(
+        if (!isOk(created)) return yield* yield* readFailure(created);
+        const answer = yield* created.json.pipe(Effect.mapError(unavailableFrom));
+        if (created.status === 200) return yield* decodeStored(answer);
+
+        const {
+          upload: { id, url, headers },
+        } = yield* Schema.decodeUnknownEffect(UploadTargetSchema)(answer).pipe(
           Effect.mapError(
-            () => new ClientError({ message: `${base} answered without a usable link` }),
+            () => new ClientError({ message: `${base} answered without a usable upload` }),
           ),
+        );
+        // Against `server-url`, as a runner reaches the server by that, keeping any path it has.
+        const target = URL.parse(url.replace(/^\/+/u, ''), `${base}/`);
+        if (target === null) {
+          return yield* new ClientError({ message: `${base} answered without a usable upload` });
+        }
+        const addressed = HttpClientRequest.put(target.href).pipe(
+          HttpClientRequest.setHeaders(headers),
+        );
+        const sent = yield* executeWithoutUrl(
+          client,
+          // `setBody` sets the body's own `Content-Type` over the one given, and what's given may be signed.
+          HttpClientRequest.setBody(
+            addressed,
+            HttpBody.raw(file, { contentType: addressed.headers['content-type'] }),
+          ),
+        );
+        if (!isOk(sent)) return yield* yield* readFailure(sent);
+
+        const committed = yield* executeAuthorized(
+          HttpClientRequest.post(`${base}/uploads/${id}/commit`).pipe(
+            HttpClientRequest.setUrlParams(declaration),
+          ),
+          executeWithoutUrl,
+        );
+        if (!isOk(committed)) return yield* yield* readFailure(committed);
+        return yield* decodeStored(
+          yield* committed.json.pipe(Effect.mapError(unavailableWithoutUrl)),
         );
       });
 
@@ -179,16 +242,28 @@ export const makeServerTarget = Effect.fnUntraced(function* ({
       return artifacts;
     }),
 
-    /** `GET /<id>/<name>`. From `base`, not a link: a runner may not reach a link's base. */
+    /**
+     * `GET /<id>/<name>`. From `base`, not a link: a runner may not reach a link's base. A server in
+     * front of a bucket redirects this, and each retry asks it for a new URL.
+     */
     fetch: ({ artifact, target }) =>
       withRetries(
         Effect.gen(function* () {
-          const response = yield* executeRequest(
+          const response = yield* executeDownload(
             client,
-            HttpClientRequest.get(`${base}/${artifact.id}/${artifact.name}`),
+            HttpClientRequest.get(`${base}/${artifact.id}/${artifact.name}`, {
+              // `fetch` asks for gzip by default, and R2 would then compress what the digest is of.
+              headers: { 'accept-encoding': 'identity' },
+            }),
           );
           if (!isOk(response)) return yield* yield* readFailure(response);
-          return yield* streamBodyToFile({ fs, response, artifact, target });
+          return yield* streamBodyToFile({
+            fs,
+            response,
+            artifact,
+            target,
+            toUnavailable: downloadUnavailable,
+          });
         }),
       ),
 

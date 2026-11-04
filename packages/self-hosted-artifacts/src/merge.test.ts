@@ -344,7 +344,7 @@ describe.each(TARGET_KINDS)('merging, against %s', kind => {
     it("keeps for the target's default without it, and for the days asked with it", async () => {
       expectSucceeded(await runAction({ INPUT_NAME: 'by-default' }));
       expect(daysUntil((await runner.readOutputs())['expires-at'])).toBeCloseTo(
-        kind === 'server' ? 7 : 90,
+        kind === 's3' ? 90 : 7,
         1,
       );
 
@@ -475,7 +475,10 @@ describe.each(TARGET_KINDS)('merging, against %s', kind => {
       const result = await runAction({ 'INPUT_DELETE-MERGED': 'true' });
 
       expect(result.exitCode).toBe(1);
-      expect(result.stdout).toMatch(/^::error::.*no uploads today/m);
+      // A bucket refuses a client directly, and only the code of what it says gets through.
+      expect(result.stdout).toMatch(
+        kind === 'server-s3' ? /^::error::HTTP 403: Refused/m : /^::error::.*no uploads today/m,
+      );
       expect(await namesInRun()).toEqual(['build-a.zip']);
     });
 
