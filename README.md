@@ -233,6 +233,9 @@ and if you restrict who can reach it, add `"workers_dev": false`, as the `worker
   same. So check `/healthz` once it's deployed, which answers `200` once the config is valid and the keys are there, without
   trying them.
 - **Downloads stop if the Worker is down,** as each link goes through it, though the bytes don't.
+- **Plan on Workers Paid.** The Free plan allows [10 ms of CPU a request](https://developers.cloudflare.com/workers/platform/limits/#cpu-time),
+  and the smoke run on a newly deployed Worker used 18 ms at the median and 55 ms at the most. Over the limit, a request
+  fails with Error 1102.
 - **On the Free plan a request makes at most 50 to the bucket,** which a run's list reaches at about 48 names, counting
   each name once per attempt that holds it, so a re-run reaches it at about half that, and
   merging lists first. Paid allows thousands.
@@ -401,8 +404,8 @@ the artifact rather than let it expire.
 
 ### What's been tried
 
-The tests run against MinIO in a container, as well as a small fake, and have been run once against real
-R2, with [the setup above](#on-r2) on a custom domain:
+The tests run against MinIO in a container, as well as a small fake, and have been run against real R2, with
+[the setup above](#on-r2) on a custom domain:
 
 - **Races:** of 8 clients uploading other content under one name, one succeeded and 7 failed with the
   usual message. Of 6 uploading the same content, all succeeded with one ID.
@@ -415,14 +418,16 @@ R2, with [the setup above](#on-r2) on a custom domain:
   passed against a real Worker and private R2 bucket with a real GitHub token: upload, a taken name refused, download,
   merge, list, delete, a link's `302`, a `HEAD`'s `content-length`, the digest checked through the redirect. It was
   installed from the package as this README says. Anonymous reads at the bucket answer `400`.
+- **A server on Node in front of real R2:** the suites pass, other than those that can't there, which step between
+  the server and the bucket.
+- **The lifecycle rule:** R2 reports it on an object under it, as `x-amz-expiration`, at its `last-modified` plus the
+  rule's 90 days. Removing the object is R2's to do, and hasn't been waited for.
 - **On `r2.dev`:** a link answers `200` with nothing cached, and `404` straight after a delete. Metadata is readable
   there, as [accepted](#on-r2).
 - **Signed URLs on R2:** a `PUT` with the wrong length, a missing or changed signed header, or the wrong checksum is
   refused, as is an expired URL.
 
-The lifecycle rule hasn't been seen to remove anything. A server on Node in front of a bucket has run against MinIO
-and the fake, not R2. The Worker ran on a paid account, so the Free plan's limits weren't reached or measured. AWS is
-still from its docs, not from a run.
+The Worker ran on a paid account, so its CPU was measured and not refused. AWS is still from its docs, not from a run.
 
 ## Upload
 
