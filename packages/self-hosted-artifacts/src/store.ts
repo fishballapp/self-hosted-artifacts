@@ -110,7 +110,7 @@ const countedTo =
           received += chunk.length;
           return received > expectedSize
             ? Effect.fail(
-                new UploadFailedError({ reason: 'body is longer than its Content-Length' }),
+                new UploadFailedError({ reason: 'body is longer than the size declared' }),
               )
             : Effect.void;
         }),
@@ -119,7 +119,7 @@ const countedTo =
             received === expectedSize
               ? Stream.empty
               : Stream.fail(
-                  new UploadFailedError({ reason: 'body is shorter than its Content-Length' }),
+                  new UploadFailedError({ reason: 'body is shorter than the size declared' }),
                 ),
           ),
         ),
@@ -413,13 +413,18 @@ export class DiskStore extends Context.Service<
               yield* fs.makeDirectory(path.join(tempDir, id));
               yield* fs.writeFileString(path.join(tempDir, id, UPLOAD_FILE), upload);
               return {
+                kind: 'single',
                 id,
                 url: `/uploads/${id}`,
                 headers: { 'content-type': 'application/octet-stream' },
-              };
+              } as const;
             },
             Effect.catchTag('PlatformError', Effect.die),
           ),
+
+          // A disk takes one stream, however big.
+          signParts: () => Effect.fail(new UploadNotFoundError()),
+          abort: () => Effect.fail(new UploadNotFoundError()),
 
           findUpload: Effect.fn('DiskStore.findUpload')(function* (id) {
             const upload = yield* readUploadFile(id);

@@ -12,6 +12,7 @@ import {
   FILE_NAME_MESSAGE,
   isFileName,
   isHttpBase,
+  MULTIPART_FROM_BYTES,
   NAME_TAKEN,
   newArtifactId,
   OTHER_REPOSITORY,
@@ -22,16 +23,17 @@ import {
 import {
   type ArtifactFile,
   checksumOf,
+  dataHeadersOf,
   dataKeyOf,
   isExpired,
   makeS3Bucket,
   nameKeyOf,
   readFailure,
   readS3Credentials,
-  SCOPE_HEADER,
-  scopeHeaderOf,
 } from './s3-bucket.ts';
 import { encodeS3Path } from './s3-sigv4.ts';
+import { type FileToSend, sendParts } from './sending.ts';
+import type { RunScope } from './store-contract.ts';
 import type { Target } from './target.ts';
 import { isOk, type ListedArtifact, streamBodyToFile } from './transport.ts';
 
@@ -142,6 +144,11 @@ export const makeS3Target = Effect.fnUntraced(function* ({
   const {
     retrying,
     execute,
+    startMultipart,
+    signParts,
+    completeMultipart,
+    abortMultipart,
+    holdsData,
     readHeld,
     deleteObject,
     deleteOrNote,
@@ -196,13 +203,64 @@ export const makeS3Target = Effect.fnUntraced(function* ({
       );
     }).pipe(Effect.timeout(SWEEP_BUDGET), Effect.ignoreCause);
 
+  /** The object made out of its parts, or nothing but what the bucket's rule removes. */
+  const putInParts = Effect.fnUntraced(function* ({
+    key,
+    name,
+    file,
+    scope,
+  }: {
+    key: string;
+    name: string;
+    file: FileToSend;
+    scope: RunScope;
+  }) {
+    const uploadId = yield* startMultipart({ key, headers: dataHeadersOf(scope) });
+    yield* Effect.gen(function* () {
+      const parts = yield* sendParts({
+        client,
+        file,
+        sign: batch => signParts({ key, uploadId, size: file.size, parts: batch }),
+      });
+      yield* completeMultipart({ key, uploadId, parts });
+      if (!(yield* holdsData({ key, size: file.size, scope }))) {
+        return yield* new ClientError({ message: `${name} isn't what was sent, once stored` });
+      }
+    }).pipe(Effect.onError(() => abortMultipart({ key, uploadId })));
+  });
+
+  /** One signed `PUT`, whose checksum S3 holds the whole file to. */
+  const putWhole = ({
+    key,
+    name,
+    file,
+    scope,
+  }: {
+    key: string;
+    name: string;
+    file: FileToSend;
+    scope: RunScope;
+  }) =>
+    retrying(
+      Effect.gen(function* () {
+        const response = yield* execute({
+          method: 'PUT',
+          key,
+          headers: { ...dataHeadersOf(scope), 'x-amz-checksum-sha256': checksumOf(file.digest) },
+          body: file.wholeBody('application/octet-stream'),
+        });
+        if (!isOk(response)) return yield* yield* readFailure(`store ${name}`, response);
+      }),
+    );
+
   return {
     ready: Effect.asVoid(connection),
 
-    send: Effect.fnUntraced(function* ({ file, name, digest, overwrite, retentionDays }) {
+    send: Effect.fnUntraced(function* ({ file, name, overwrite, retentionDays }) {
       if (!isFileName(name)) return yield* new ClientError({ message: FILE_NAME_MESSAGE });
       if (retentionDays < 0) return yield* new ClientError({ message: BAD_RETENTION });
       const { scope, repositoryName } = yield* connection;
+      const { digest, size } = file;
 
       // With the digest, a retried upload or a refusal needs none of the body.
       const nowMs = yield* Clock.currentTimeMillis;
@@ -216,26 +274,17 @@ export const makeS3Target = Effect.fnUntraced(function* ({
         ...scope,
         id: newArtifactId(),
         name,
-        size: file.size,
+        size,
         digest,
         expiresAt: expiryAfter({ retentionDays, nowMs }),
       };
       const dataKey = dataKeyOf(artifact);
-      yield* retrying(
-        Effect.gen(function* () {
-          const response = yield* execute({
-            method: 'PUT',
-            key: dataKey,
-            headers: {
-              'content-disposition': 'attachment',
-              'x-amz-checksum-sha256': checksumOf(digest),
-              [SCOPE_HEADER]: scopeHeaderOf(scope),
-            },
-            body: { content: file, contentType: 'application/octet-stream' },
-          });
-          if (!isOk(response)) return yield* yield* readFailure(`store ${name}`, response);
-        }),
-      ).pipe(Effect.tapError(() => deleteOrNote(dataKey)));
+      yield* (size >= MULTIPART_FROM_BYTES ? putInParts : putWhole)({
+        key: dataKey,
+        name,
+        file,
+        scope,
+      }).pipe(Effect.tapError(() => deleteOrNote(dataKey)));
 
       if (repositoryName !== undefined) {
         yield* recordRepository({ repositoryName, repositoryId: scope.repositoryId });

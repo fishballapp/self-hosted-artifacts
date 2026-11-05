@@ -1,7 +1,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { mkdir, readdir, readFile, rm, symlink, truncate, writeFile } from 'node:fs/promises';
+import { mkdir, open, readdir, readFile, rm, symlink, truncate, writeFile } from 'node:fs/promises';
 import {
   createServer,
   type IncomingHttpHeaders,
@@ -11,21 +11,30 @@ import {
 } from 'node:http';
 import { dirname, join } from 'node:path';
 import { unzipSync } from 'fflate';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { UPLOAD_ACTION } from '../tsdown.config.ts';
 import {
   AUDIENCE,
   buildBundle,
   exitCodeOf,
   generateRunnerKeys,
+  PEAK_IN_PARTS_BYTES,
   PEAK_REPORTER,
   REQUEST_TOKEN,
   removeBundle,
   startRunner,
   TARGET_KINDS,
+  TEST_MULTIPART_FROM_BYTES,
   UNUSUAL_NAME,
+  withSmallMultipart,
 } from './action-harness.ts';
 import { closeServer, listenOnLoopback, verifierAnswering } from './test-support.ts';
+
+vi.mock('./protocol.ts', async importOriginal => ({
+  ...(await importOriginal<typeof import('./protocol.ts')>()),
+  // TEST_MULTIPART_FROM_BYTES, which a hoisted mock can't import.
+  MULTIPART_FROM_BYTES: 32 * 1024 ** 2,
+}));
 
 let ACTION: string;
 const UPLOAD_ID = 'U'.repeat(43);
@@ -50,7 +59,7 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
   let runnerTemp: string;
 
   beforeAll(async () => {
-    ACTION = await buildBundle(UPLOAD_ACTION);
+    ACTION = await buildBundle(withSmallMultipart(UPLOAD_ACTION));
     keys = await generateRunnerKeys();
   }, 60_000);
 
@@ -191,7 +200,7 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
     expect(exitCode).toBe(0);
     const peakBytes = Number(/peak-kib=(\d+)/.exec(stderr)?.[1]) * 1024;
     expect(peakBytes).toBeGreaterThan(0);
-    expect(peakBytes).toBeLessThan(fileBytes / 2);
+    expect(peakBytes).toBeLessThan(kind === 'server' ? fileBytes / 2 : PEAK_IN_PARTS_BYTES);
   });
 
   const runCli = (args: readonly string[]) =>
@@ -948,7 +957,7 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
   const useUploadServer = async ({
     create = (_req, res) =>
       answerJson(res, 201, {
-        upload: { id: UPLOAD_ID, url: `/uploads/${UPLOAD_ID}`, headers: {} },
+        upload: { kind: 'single', id: UPLOAD_ID, url: `/uploads/${UPLOAD_ID}`, headers: {} },
       }),
     put = (req, res) => {
       req.resume();
@@ -996,7 +1005,7 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
       const { puts } = await useUploadServer({
         create: (_req, res) =>
           answerJson(res, 201, {
-            upload: { id: UPLOAD_ID, url: `/uploads/${UPLOAD_ID}`, headers },
+            upload: { kind: 'single', id: UPLOAD_ID, url: `/uploads/${UPLOAD_ID}`, headers },
           }),
       });
       await writeFiles({ 'app.bin': 'x' });
@@ -1030,7 +1039,12 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
     const { puts } = await useUploadServer({
       create: (req, res) =>
         answerJson(res, 201, {
-          upload: { id: UPLOAD_ID, url: `http://${req.headers.host}${signed}`, headers: {} },
+          upload: {
+            kind: 'single',
+            id: UPLOAD_ID,
+            url: `http://${req.headers.host}${signed}`,
+            headers: {},
+          },
         }),
     });
     await writeFiles({ 'app.bin': 'x' });
@@ -1090,7 +1104,12 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
       await useUploadServer({
         create: (_req, res) =>
           answerJson(res, 201, {
-            upload: { id: UPLOAD_ID, url: `/uploads/${UPLOAD_ID}?${SIGNATURE}`, headers: {} },
+            upload: {
+              kind: 'single',
+              id: UPLOAD_ID,
+              url: `/uploads/${UPLOAD_ID}?${SIGNATURE}`,
+              headers: {},
+            },
           }),
         put,
       });
@@ -1111,6 +1130,7 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
         create: (_req, res) =>
           answerJson(res, 201, {
             upload: {
+              kind: 'single',
               id: UPLOAD_ID,
               url: `${closed}/uploads/${UPLOAD_ID}?${SIGNATURE}`,
               headers: {},
@@ -1129,7 +1149,12 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
       await useUploadServer({
         create: (_req, res) =>
           answerJson(res, 201, {
-            upload: { id: UPLOAD_ID, url: `/uploads/${UPLOAD_ID}?${SIGNATURE}`, headers: {} },
+            upload: {
+              kind: 'single',
+              id: UPLOAD_ID,
+              url: `/uploads/${UPLOAD_ID}?${SIGNATURE}`,
+              headers: {},
+            },
           }),
         put: (_req, res) => void res.writeHead(307, { Location: '/elsewhere' }).end(),
       });
@@ -1144,7 +1169,12 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
       await useUploadServer({
         create: (_req, res) =>
           answerJson(res, 201, {
-            upload: { id: UPLOAD_ID, url: `http://[${UPLOAD_ID}?${SIGNATURE}`, headers: {} },
+            upload: {
+              kind: 'single',
+              id: UPLOAD_ID,
+              url: `http://[${UPLOAD_ID}?${SIGNATURE}`,
+              headers: {},
+            },
           }),
       });
 
@@ -1184,7 +1214,12 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
       await useUploadServer({
         create: (_req, res) =>
           answerJson(res, 201, {
-            upload: { id: UPLOAD_ID, url: `/uploads/${UPLOAD_ID}?${SIGNATURE}`, headers: {} },
+            upload: {
+              kind: 'single',
+              id: UPLOAD_ID,
+              url: `/uploads/${UPLOAD_ID}?${SIGNATURE}`,
+              headers: {},
+            },
           }),
         put: req => void req.socket.destroy(),
       });
@@ -1268,15 +1303,355 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
     expectTokenRequests(1);
   });
 
-  it('refuses 4 GiB or more up front, as Node would send the wrong Content-Length', async () => {
-    await startTarget();
-    const path = join(rootDir, 'huge.bin');
-    await writeFile(path, '');
-    await truncate(path, 4 * 1024 ** 3 + 1);
-    const { exitCode, stdout } = await runAction({ INPUT_PATH: path, INPUT_ARCHIVE: 'false' });
-    expect(exitCode).toBe(1);
-    expect(stdout).toContain("::error::huge.bin is 4294967297 bytes, and Node can't upload");
-    expect(runner.tokenRequests).toEqual([]);
+  it.runIf(kind === 'server')(
+    'sends 4 GiB or more to a disk as one stream, as Node would send the wrong Content-Length',
+    { timeout: 180_000 },
+    async () => {
+      let received = 0;
+      const { creates, puts } = await useUploadServer({
+        put: (req, res) => {
+          req.on('data', chunk => {
+            received += chunk.length;
+          });
+          req.on('end', () => res.writeHead(200).end());
+        },
+      });
+      const size = 4 * 1024 ** 3 + 1;
+      const path = join(rootDir, 'huge.bin');
+      await writeFile(path, '');
+      await truncate(path, size);
+
+      const { exitCode } = await runAction({ INPUT_PATH: path, INPUT_ARCHIVE: 'false' });
+
+      expect(exitCode).toBe(0);
+      expect(creates[0]?.searchParams.get('size')).toBe(String(size));
+      expect(puts).toHaveLength(1);
+      expect(puts[0]?.headers['content-length']).toBeUndefined();
+      expect(puts[0]?.headers['transfer-encoding']).toBe('chunked');
+      expect(received).toBe(size);
+    },
+  );
+
+  describe('a file big enough to go in parts', () => {
+    const MIB = 1024 ** 2;
+    const BIG_FILE_BYTES = TEST_MULTIPART_FROM_BYTES + 8 * MIB;
+
+    /** Each MiB its own bytes, so a part out of place shows in the digest. */
+    const writeBigFile = async () => {
+      const path = join(rootDir, 'big.bin');
+      const file = await open(path, 'w');
+      const hash = createHash('sha256');
+      for (let mib = 0; mib < BIG_FILE_BYTES / MIB; mib += 1) {
+        const bytes = Buffer.alloc(MIB, mib);
+        hash.update(bytes);
+        await file.write(bytes);
+      }
+      await file.close();
+      return { path, digest: hash.digest('hex') };
+    };
+
+    const partNumberOf = ({ url = '' }: IncomingMessage) =>
+      new URL(url, 'http://localhost').searchParams.get('partNumber');
+
+    const isFinishing = ({ method, url = '' }: IncomingMessage) =>
+      method === 'POST' && new URL(url, 'http://localhost').searchParams.has('uploadId');
+
+    const isStopping = ({ method, url = '' }: IncomingMessage) =>
+      method === 'DELETE' && new URL(url, 'http://localhost').searchParams.has('uploadId');
+
+    const bucketTarget = () => {
+      const active = requireTarget();
+      if (active.kind === 'server') throw new Error('This target has no bucket');
+      return active;
+    };
+
+    const dataKeyOf = (id: string | undefined) => `artifacts/${id}/big.bin`;
+
+    const uploadBigFile = async () => {
+      const { path, digest } = await writeBigFile();
+      const result = await runAction({ INPUT_PATH: path, INPUT_ARCHIVE: 'false' });
+      return { ...result, digest };
+    };
+
+    it('arrives byte for byte, as one stream to a disk and in parts to a bucket', async () => {
+      const active = await startTarget();
+      const { exitCode, digest } = await uploadBigFile();
+
+      expect(exitCode).toBe(0);
+      const outputs = await readOutputs();
+      expect(outputs['artifact-digest']).toBe(digest);
+      const read = await fetch(active.reachable(outputs['artifact-url'] ?? ''));
+      expect(read.status).toBe(200);
+      const hash = createHash('sha256');
+      for await (const chunk of read.body ?? []) hash.update(chunk);
+      expect(hash.digest('hex')).toBe(digest);
+      if (active.kind === 'server') return;
+      const head = await active.raw.send('HEAD', dataKeyOf(outputs['artifact-id']));
+      expect(head.headers.get('etag')).toMatch(/-3"$/u);
+      expect(head.headers.get('content-length')).toBe(String(BIG_FILE_BYTES));
+      expect(head.headers.get('content-type')).toBe('application/octet-stream');
+      expect(head.headers.get('content-disposition')).toBe('attachment');
+      expect(head.headers.get('x-amz-meta-run-scope')).toBe('7/100/1');
+      expect(await active.raw.pendingUploads()).toEqual([]);
+    });
+
+    it.runIf(kind !== 'server')('sends a failed part again, and only that', async () => {
+      const active = await startTarget();
+      const sends = new Map<string | null, number>();
+      await active.interpose(request => {
+        const partNumber = partNumberOf(request);
+        if (partNumber === null) return undefined;
+        sends.set(partNumber, (sends.get(partNumber) ?? 0) + 1);
+        return partNumber === '2' && sends.get('2') === 1
+          ? { status: 503, message: 'Slow down' }
+          : undefined;
+      });
+
+      const { exitCode, stderr } = await uploadBigFile();
+
+      expect(exitCode).toBe(0);
+      expect(stderr).toContain('Attempt 1 failed (Part 2: HTTP 503');
+      expect(Object.fromEntries(sends)).toEqual({ '1': 1, '2': 2, '3': 1 });
+    });
+
+    it.runIf(kind !== 'server')('sends a part again when its answer is lost', async () => {
+      const active = await startTarget();
+      let sent = 0;
+      await active.interpose(request => {
+        if (partNumberOf(request) !== '3') return undefined;
+        sent += 1;
+        return sent === 1 ? 'lose-answer' : undefined;
+      });
+
+      const { exitCode, digest } = await uploadBigFile();
+
+      expect(exitCode).toBe(0);
+      expect(sent).toBe(2);
+      expect((await readOutputs())['artifact-digest']).toBe(digest);
+    });
+
+    it.runIf(kind !== 'server')('fails at once on a refused part, and stops', async () => {
+      const active = await startTarget();
+      let sent = 0;
+      let stops = 0;
+      await active.interpose(request => {
+        if (isStopping(request)) stops += 1;
+        if (partNumberOf(request) !== '2') return undefined;
+        sent += 1;
+        return { status: 403, message: 'Nope' };
+      });
+
+      const { exitCode, stdout } = await uploadBigFile();
+
+      expect(exitCode).toBe(1);
+      expect(stdout).toContain('Part 2: HTTP 403: Refused');
+      expect(sent).toBe(1);
+      expect(stops).toBe(1);
+      expect(await bucketTarget().raw.pendingUploads()).toEqual([]);
+      expect(await bucketTarget().raw.keys('runs/')).toEqual([]);
+    });
+
+    it.runIf(kind === 's3')(
+      'does not wait long for a stop that never answers',
+      { timeout: 30_000 },
+      async () => {
+        const active = await startTarget();
+        await active.interpose(request => {
+          if (partNumberOf(request) === '1') return { status: 403, message: 'Nope' };
+          return isStopping(request) ? 'hang' : undefined;
+        });
+
+        const started = Temporal.Now.instant();
+        const { exitCode, stderr } = await uploadBigFile();
+
+        expect(exitCode).toBe(1);
+        expect(stderr).toContain("which the bucket's lifecycle rule will");
+        expect(started.until(Temporal.Now.instant()).total('seconds')).toBeLessThan(25);
+      },
+    );
+
+    it.runIf(kind !== 'server')(
+      'still fails when it cannot stop',
+      { timeout: 20_000 },
+      async () => {
+        const active = await startTarget();
+        await active.interpose(request => {
+          if (partNumberOf(request) === '1') return { status: 403, message: 'Nope' };
+          return isStopping(request) ? { status: 500, message: 'No' } : undefined;
+        });
+
+        const { exitCode, stdout, stderr } = await uploadBigFile();
+
+        expect(exitCode).toBe(1);
+        expect(stdout).toContain('Part 1: HTTP 403');
+        const log = active.kind === 'server-s3' ? active.serverLog.join('\n') : stderr;
+        expect(log).toContain("which the bucket's lifecycle rule will");
+      },
+    );
+
+    it.runIf(kind !== 'server')(
+      'survives losing the answer to the object being finished',
+      async () => {
+        const active = await startTarget();
+        let finishes = 0;
+        await active.interpose(request => {
+          if (!isFinishing(request)) return undefined;
+          finishes += 1;
+          return finishes === 1 ? 'lose-answer' : undefined;
+        });
+
+        const { exitCode, stdout, digest } = await uploadBigFile();
+
+        expect(stdout).not.toContain('::error::');
+        expect(exitCode).toBe(0);
+        // The second answers `NoSuchUpload` on the fake and MinIO, and the object is what decides.
+        expect(finishes).toBe(2);
+        const outputs = await readOutputs();
+        expect(outputs['artifact-digest']).toBe(digest);
+        const head = await bucketTarget().raw.send('HEAD', dataKeyOf(outputs['artifact-id']));
+        expect(head.headers.get('content-length')).toBe(String(BIG_FILE_BYTES));
+      },
+    );
+
+    it.runIf(kind !== 'server')('finishes again when S3 says in a 200 that it failed', async () => {
+      const active = await startTarget();
+      let finishes = 0;
+      await active.interpose(request => {
+        if (!isFinishing(request)) return undefined;
+        finishes += 1;
+        return finishes === 1 ? { status: 200, message: 'We encountered an error' } : undefined;
+      });
+
+      const { exitCode } = await uploadBigFile();
+
+      expect(exitCode).toBe(0);
+      expect(finishes).toBe(2);
+    });
+
+    it.runIf(kind !== 'server')(
+      'keeps what is in memory to what is in flight, whatever the size',
+      { timeout: 120_000 },
+      async () => {
+        await startTarget();
+        const fileBytes = 1024 * MIB;
+        const path = join(rootDir, 'huge.bin');
+        await writeFile(path, '');
+        await truncate(path, fileBytes);
+        const reporter = join(rootDir, 'report-peak-memory.mjs');
+        await writeFile(reporter, PEAK_REPORTER);
+
+        const { exitCode, stderr } = await runAction(
+          { INPUT_PATH: path, INPUT_ARCHIVE: 'false' },
+          { NODE_OPTIONS: `--import=${reporter}` },
+        );
+
+        expect(exitCode).toBe(0);
+        const peakBytes = Number(/peak-kib=(\d+)/.exec(stderr)?.[1]) * 1024;
+        expect(peakBytes).toBeGreaterThan(0);
+        expect(peakBytes).toBeLessThan(PEAK_IN_PARTS_BYTES);
+      },
+    );
+
+    describe.runIf(kind !== 'server')('whose upload ID is a credential', () => {
+      const expectUnseen = async (
+        { stdout, stderr }: { stdout: string; stderr: string },
+        uploadId: string | undefined,
+      ) => {
+        if (uploadId === undefined) throw new Error('No request held an upload ID');
+        const outputs = await readFile(outputPath, 'utf8').catch(() => '');
+        const active = requireTarget();
+        const log = active.kind === 'server-s3' ? active.serverLog.join('\n') : '';
+        for (const seen of [stdout, stderr, outputs, log]) {
+          expect(seen).not.toContain(uploadId);
+          expect(seen).not.toMatch(/X-Amz-(?:Signature|Credential)/u);
+        }
+      };
+
+      const uploadIdOf = ({ url = '' }: IncomingMessage) =>
+        new URL(url, 'http://localhost').searchParams.get('uploadId') ?? undefined;
+
+      it('stays out of everything on a success', async () => {
+        const active = await startTarget();
+        let uploadId: string | undefined;
+        await active.interpose(request => {
+          uploadId ??= uploadIdOf(request);
+          return undefined;
+        });
+        const result = await uploadBigFile();
+        expect(result.exitCode).toBe(0);
+        await expectUnseen(result, uploadId);
+      });
+
+      type EchoCase = [string, (request: IncomingMessage) => boolean, number];
+      it.each<EchoCase>([
+        ['a part refused', request => partNumberOf(request) === '1', 403],
+        ['finishing', isFinishing, 400],
+        ...(kind === 's3'
+          ? // In front of a bucket, this retries on both sides of the server, for half a minute.
+            [['finishing, failed', isFinishing, 500] satisfies EchoCase]
+          : []),
+      ])(
+        'stays out of everything when S3 echoes it, on %s',
+        {
+          timeout: 20_000,
+        },
+        async (_, isTheOne, status) => {
+          const active = await startTarget();
+          let uploadId: string | undefined;
+          await active.interpose(request => {
+            uploadId ??= uploadIdOf(request);
+            return isTheOne(request)
+              ? { status, message: `no such upload as ${uploadIdOf(request)}` }
+              : undefined;
+          });
+          const result = await uploadBigFile();
+          expect(result.exitCode).toBe(1);
+          await expectUnseen(result, uploadId);
+        },
+      );
+
+      it('gives up on a part that keeps failing, and stops, saying nothing of it', {
+        timeout: 20_000,
+      }, async () => {
+        const active = await startTarget();
+        let uploadId: string | undefined;
+        let sent = 0;
+        await active.interpose(request => {
+          uploadId ??= uploadIdOf(request);
+          if (partNumberOf(request) !== '2') return undefined;
+          sent += 1;
+          return { status: 503, message: `no such upload as ${uploadIdOf(request)}` };
+        });
+
+        const result = await uploadBigFile();
+
+        expect(result.exitCode).toBe(1);
+        expect(result.stderr).toContain('Attempt 3 failed (Part 2');
+        expect(sent).toBe(4);
+        expect(await bucketTarget().raw.pendingUploads()).toEqual([]);
+        expect(await bucketTarget().raw.keys('runs/')).toEqual([]);
+        await expectUnseen(result, uploadId);
+      });
+
+      it.runIf(kind === 's3')(
+        'stays out of everything when the connection is cut',
+        {
+          timeout: 20_000,
+        },
+        async () => {
+          const active = await startTarget();
+          let uploadId: string | undefined;
+          await active.interpose(request => {
+            uploadId ??= uploadIdOf(request);
+            return partNumberOf(request) === '1' ? 'lose-answer' : undefined;
+          });
+          const result = await uploadBigFile();
+          expect(result.exitCode).toBe(1);
+          expect(result.stderr).toContain('Attempt 3 failed (The upload failed');
+          await expectUnseen(result, uploadId);
+        },
+      );
+    });
   });
 
   it.runIf(kind === 'server')('reads the 413 of a file much bigger than the limit', async () => {
@@ -1358,11 +1733,17 @@ describe.each(TARGET_KINDS)('the upload action, against %s', kind => {
 
   it.runIf(kind === 'server').each([
     ['no upload', {}],
-    ['no ID', { upload: { url: '/uploads/x', headers: {} } }],
-    ['an ID that could lead elsewhere', { upload: { id: '../..', url: '/x', headers: {} } }],
-    ['no URL', { upload: { id: UPLOAD_ID, headers: {} } }],
-    ['no headers', { upload: { id: UPLOAD_ID, url: '/x' } }],
-    ['a line break in a header', { upload: { id: UPLOAD_ID, url: '/x', headers: { a: 'b\nc' } } }],
+    ['no ID', { upload: { kind: 'single', url: '/uploads/x', headers: {} } }],
+    [
+      'an ID that could lead elsewhere',
+      { upload: { kind: 'single', id: '../..', url: '/x', headers: {} } },
+    ],
+    ['no URL', { upload: { kind: 'single', id: UPLOAD_ID, headers: {} } }],
+    ['no headers', { upload: { kind: 'single', id: UPLOAD_ID, url: '/x' } }],
+    [
+      'a line break in a header',
+      { upload: { kind: 'single', id: UPLOAD_ID, url: '/x', headers: { a: 'b\nc' } } },
+    ],
   ])('refuses a new upload with %s, sending nothing', async (_, body) => {
     const { puts } = await useUploadServer({ create: (_req, res) => answerJson(res, 201, body) });
     await writeFiles({ 'a.bin': 'x' });

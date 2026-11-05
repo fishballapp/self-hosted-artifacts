@@ -5,6 +5,7 @@ import type * as HttpClient from 'effect/http/HttpClient';
 import * as Layer from 'effect/Layer';
 import { ClientError } from './client-support.ts';
 import { makeS3Target } from './s3-client.ts';
+import type { FileToSend } from './sending.ts';
 import { makeServerTarget } from './server-client.ts';
 import type { ListedArtifact } from './transport.ts';
 
@@ -14,9 +15,8 @@ export type Target = {
   readonly ready: Effect.Effect<void, ClientError>;
   /** Stores a file under a name, or answers with what the name already holds with this content. */
   readonly send: (upload: {
-    readonly file: Blob;
+    readonly file: FileToSend;
     readonly name: string;
-    readonly digest: string;
     readonly overwrite: boolean;
     /** `0` means the target's default. */
     readonly retentionDays: number;

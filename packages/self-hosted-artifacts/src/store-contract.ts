@@ -42,12 +42,44 @@ export type UploadDeclaration = {
   readonly retentionDays: number;
 };
 
-/** Where the body goes. `url` is a credential: it must never reach a log or an error's message. */
-export type UploadTarget = {
-  readonly id: string;
-  /** A path on this server, or an absolute URL when the body goes elsewhere. */
+/**
+ * Where the body goes. `url` and `uploadId` are credentials: they must never reach a log or an error's
+ * message.
+ */
+export type UploadTarget =
+  | {
+      readonly kind: 'single';
+      readonly id: string;
+      /** A path on this server, or an absolute URL when the body goes elsewhere. */
+      readonly url: string;
+      readonly headers: Readonly<Record<string, string>>;
+    }
+  | {
+      readonly kind: 'multipart';
+      readonly id: string;
+      /** The bucket's, which the client echoes, as a server holds no state between requests. */
+      readonly uploadId: string;
+      readonly partSize: number;
+    };
+
+/** A part a client is about to send: what S3 holds it to is signed into its URL. */
+export type PartToSign = { readonly partNumber: number; readonly md5: string };
+
+/** `url` is a credential, like an upload's. */
+export type SignedPart = {
+  readonly partNumber: number;
   readonly url: string;
   readonly headers: Readonly<Record<string, string>>;
+};
+
+/** A part the bucket holds, and the ETag it answered with. */
+export type SentPart = { readonly partNumber: number; readonly etag: string };
+
+/** An upload in parts, by what names it in the bucket. */
+export type MultipartUpload = {
+  readonly id: string;
+  readonly name: string;
+  readonly uploadId: string;
 };
 
 /** An upload that didn't become an artifact. `reason` is safe to log: it holds no path. */
@@ -105,13 +137,27 @@ export type StoreShape = {
   readonly isPresent: Effect.Effect<boolean>;
   /** Makes somewhere for a declared upload's body to go. */
   readonly create: (upload: UploadDeclaration) => Effect.Effect<UploadTarget, NotEnoughSpaceError>;
+  /** Signs URLs for parts of an upload, asking nothing of the bucket. A disk takes no parts. */
+  readonly signParts: (
+    upload: MultipartUpload & { readonly size: number; readonly parts: readonly PartToSign[] },
+  ) => Effect.Effect<readonly SignedPart[], UploadNotFoundError>;
+  /** Stops an upload in parts, best-effort. A disk takes no parts. */
+  readonly abort: (upload: MultipartUpload) => Effect.Effect<void, UploadNotFoundError>;
   /**
    * Publishes an uploaded body under its name, which is the only commit. `isNew` is false when the
    * scope already held the same content, this upload's included: the answer is then that artifact,
    * unchanged.
    */
   readonly commit: (
-    upload: UploadDeclaration & { readonly id: string; readonly repository: string },
+    upload: UploadDeclaration & {
+      readonly id: string;
+      readonly repository: string;
+      /** What finishes an upload in parts first. */
+      readonly multipart?: {
+        readonly uploadId: string;
+        readonly parts: readonly SentPart[];
+      };
+    },
   ) => Effect.Effect<
     { readonly artifact: ArtifactMeta; readonly isNew: boolean },
     UploadNotFoundError | ArtifactExistsError

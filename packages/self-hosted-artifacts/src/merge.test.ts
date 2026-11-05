@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
 import { existsSync } from 'node:fs';
 import { mkdir, readdir, truncate, writeFile } from 'node:fs/promises';
@@ -8,20 +8,29 @@ import { join } from 'node:path';
 import * as NodeServices from '@effect/platform-node/NodeServices';
 import * as Effect from 'effect/Effect';
 import { strFromU8, strToU8, unzipSync, zipSync } from 'fflate';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MERGE_ACTION } from '../tsdown.config.ts';
 import {
   AUDIENCE,
   buildBundle,
   generateRunnerKeys,
+  PEAK_IN_PARTS_BYTES,
   PEAK_REPORTER,
   removeBundle,
   type Stored,
   startRunner,
   TARGET_KINDS,
+  TEST_MULTIPART_FROM_BYTES,
   UNUSUAL_NAME,
+  withSmallMultipart,
 } from './action-harness.ts';
 import { zipFiles } from './zip.ts';
+
+vi.mock('./protocol.ts', async importOriginal => ({
+  ...(await importOriginal<typeof import('./protocol.ts')>()),
+  // TEST_MULTIPART_FROM_BYTES, which a hoisted mock can't import.
+  MULTIPART_FROM_BYTES: 32 * 1024 ** 2,
+}));
 
 let ACTION: string;
 const BIN = new URL('./bin.ts', import.meta.url).pathname;
@@ -37,7 +46,7 @@ describe.each(TARGET_KINDS)('merging, against %s', kind => {
   let serverUrl: string;
 
   beforeAll(async () => {
-    ACTION = await buildBundle(MERGE_ACTION);
+    ACTION = await buildBundle(withSmallMultipart(MERGE_ACTION));
     keys = await generateRunnerKeys();
   }, 60_000);
 
@@ -150,6 +159,33 @@ describe.each(TARGET_KINDS)('merging, against %s', kind => {
   const expectLeftNothingInTemp = async () => {
     expect(await readdir(runner.runnerTemp)).toEqual([]);
   };
+
+  it('merges into something big enough to go in parts, deleting the originals only after', {
+    timeout: 60_000,
+  }, async () => {
+    await startTarget();
+    const half = randomBytes(TEST_MULTIPART_FROM_BYTES / 2 + 1024 ** 2);
+    await store('a.bin', half);
+    await store('b.bin', half);
+
+    const result = await runAction({
+      'INPUT_COMPRESSION-LEVEL': '0',
+      'INPUT_DELETE-MERGED': 'true',
+    });
+
+    expectSucceeded(result);
+    expect(await namesInRun()).toEqual(['merged-artifacts.zip']);
+    const stored = await findInRun('merged-artifacts.zip');
+    expect(stored.size).toBeGreaterThanOrEqual(TEST_MULTIPART_FROM_BYTES);
+    const zip = await bytesOf(stored);
+    expect(sha256(zip)).toBe(stored.digest);
+    expect(sha256(unzipSync(zip)['b.bin'] ?? new Uint8Array())).toBe(sha256(half));
+    const active = requireTarget();
+    if (active.kind !== 'server') {
+      const head = await active.raw.send('HEAD', `artifacts/${stored.id}/merged-artifacts.zip`);
+      expect(head.headers.get('etag')).toMatch(/-\d+"$/u);
+    }
+  });
 
   describe('with no inputs but the server', () => {
     it('merges every artifact of the run into `merged-artifacts`, and leaves them', async () => {
@@ -814,7 +850,7 @@ describe.each(TARGET_KINDS)('merging, against %s', kind => {
         expectSucceeded(result);
         const peakBytes = Number(/peak-kib=(\d+)/.exec(result.stderr)?.[1]) * 1024;
         expect(peakBytes).toBeGreaterThan(0);
-        expect(peakBytes).toBeLessThan(fileBytes / 2);
+        expect(peakBytes).toBeLessThan(kind === 'server' ? fileBytes / 2 : PEAK_IN_PARTS_BYTES);
         expect(await namesInRun()).toEqual(['merged-artifacts.zip']);
         await expectLeftNothingInTemp();
       },

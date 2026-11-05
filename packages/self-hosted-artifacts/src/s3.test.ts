@@ -3,17 +3,27 @@ import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdir, readdir, truncate, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import * as Effect from 'effect/Effect';
 import { strToU8, zipSync } from 'fflate';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DOWNLOAD_ACTION, UPLOAD_ACTION } from '../tsdown.config.ts';
 import {
   buildBundle,
   generateRunnerKeys,
+  PEAK_IN_PARTS_BYTES,
   PEAK_REPORTER,
   removeBundle,
   startRunner,
+  withSmallMultipart,
 } from './action-harness.ts';
 import { s3AddressOf } from './s3-bucket.ts';
+import { openFileToSend } from './sending.ts';
+
+vi.mock('./protocol.ts', async importOriginal => ({
+  ...(await importOriginal<typeof import('./protocol.ts')>()),
+  // TEST_MULTIPART_FROM_BYTES, which a hoisted mock can't import.
+  MULTIPART_FROM_BYTES: 32 * 1024 ** 2,
+}));
 
 // What only a bucket does. What it shares with a server is in the suites that run against both.
 
@@ -64,7 +74,7 @@ describe('a bucket as the target', () => {
 
   beforeAll(async () => {
     [UPLOAD, DOWNLOAD] = await Promise.all([
-      buildBundle(UPLOAD_ACTION),
+      buildBundle(withSmallMultipart(UPLOAD_ACTION)),
       buildBundle(DOWNLOAD_ACTION),
     ]);
     keys = await generateRunnerKeys();
@@ -133,6 +143,14 @@ describe('a bucket as the target', () => {
   };
 
   const statusOf = async (url: string | undefined) => (await fetch(url ?? '')).status;
+
+  /** A file on disk, as the client sends, holding what a test says. */
+  const fileHolding = (content: string) =>
+    Effect.gen(function* () {
+      const path = join(runner.rootDir, `sent-${crypto.randomUUID()}`);
+      yield* Effect.promise(() => writeFile(path, content));
+      return yield* openFileToSend(path);
+    });
 
   /** The scope's key for a name, as the job in `CURRENT_RUN` writes it. */
   const nameKeyOf = (name: string, attempt = '1') => `runs/7/100/${attempt}/${sha256(name)}.json`;
@@ -313,12 +331,14 @@ describe('a bucket as the target', () => {
       await expect(
         target.asJob(
           job =>
-            job.send({
-              file: new Blob(['not this']),
-              name: 'app.bin',
-              digest: sha256('this'),
-              overwrite: false,
-              retentionDays: 0,
+            Effect.gen(function* () {
+              const file = yield* fileHolding('not this');
+              return yield* job.send({
+                file: { ...file, digest: sha256('this') },
+                name: 'app.bin',
+                overwrite: false,
+                retentionDays: 0,
+              });
             }),
           {},
         ),
@@ -489,13 +509,11 @@ describe('a bucket as the target', () => {
     const sendFrom = (content: string, overwrite: boolean) =>
       target.asJob(
         job =>
-          job.send({
-            file: new Blob([content]),
-            name: 'crowded.bin',
-            digest: sha256(content),
-            overwrite,
-            retentionDays: 0,
-          }),
+          fileHolding(content).pipe(
+            Effect.flatMap(file =>
+              job.send({ file, name: 'crowded.bin', overwrite, retentionDays: 0 }),
+            ),
+          ),
         {},
       );
 
@@ -892,6 +910,159 @@ describe('a bucket as the target', () => {
     },
   );
 
+  describe('the real threshold, in a bundle as published', () => {
+    const pathOfSize = async (size: number) => {
+      const path = join(runner.rootDir, 'sized.bin');
+      await writeFile(path, '');
+      await truncate(path, size);
+      return path;
+    };
+
+    it('goes as one `PUT` below 1 GiB, and in parts of 16 MiB at it', {
+      timeout: 180_000,
+    }, async () => {
+      const bundle = await buildBundle(UPLOAD_ACTION);
+      const seen: string[] = [];
+      await target.interpose(({ method, url = '' }) => {
+        const { searchParams } = new URL(url, 'http://localhost');
+        if (method === 'POST' && searchParams.has('uploads')) seen.push('start');
+        if (method === 'PUT' && searchParams.has('partNumber')) seen.push('part');
+        if (method === 'PUT' && url.includes('/artifacts/') && !searchParams.has('partNumber')) {
+          seen.push('whole');
+        }
+        return undefined;
+      });
+      const reporter = join(runner.rootDir, 'report-peak-memory.mjs');
+      await writeFile(reporter, PEAK_REPORTER);
+      const upload = async (size: number) => {
+        seen.length = 0;
+        const { exitCode, stdout, stderr } = await runner.runNode(ACTION_NODE, [bundle], {
+          ...target.inputs(),
+          ...target.env(),
+          INPUT_PATH: await pathOfSize(size),
+          INPUT_ARCHIVE: 'false',
+          INPUT_OVERWRITE: 'true',
+          NODE_OPTIONS: `--import=${reporter}`,
+        });
+        expect(stdout).not.toContain('::error::');
+        expect(exitCode).toBe(0);
+        return {
+          requests: Object.groupBy(seen, kind => kind),
+          peakBytes: Number(/peak-kib=(\d+)/.exec(stderr)?.[1]) * 1024,
+        };
+      };
+
+      const below = await upload(1024 ** 3 - 1);
+      expect(below.requests.whole).toHaveLength(1);
+      expect(below.requests.part).toBeUndefined();
+      // Every other memory test here is in parts, by the threshold they build with.
+      expect(below.peakBytes).toBeGreaterThan(0);
+      expect(below.peakBytes).toBeLessThan(512 * 1024 ** 2);
+
+      const at = await upload(1024 ** 3);
+      expect(at.requests.whole).toBeUndefined();
+      expect(at.requests.start).toHaveLength(1);
+      expect(at.requests.part).toHaveLength(64);
+      await removeBundle(bundle);
+    });
+  });
+
+  describe('what a store holds parts to', () => {
+    const KEY = 'artifacts/parts-test/a.bin';
+    const MIB = 1024 ** 2;
+
+    const start = async () => {
+      const started = await target.raw.send('POST', KEY, { query: { uploads: '' } });
+      const uploadId = /<UploadId>([^<]*)<\/UploadId>/u.exec(await started.text())?.[1] ?? '';
+      expect(uploadId).not.toBe('');
+      return uploadId;
+    };
+
+    const sendPart = async (uploadId: string, partNumber: number, bytes: Uint8Array) => {
+      const sent = await target.raw.send('PUT', KEY, {
+        query: { partNumber: String(partNumber), uploadId },
+        body: new Uint8Array(bytes),
+      });
+      expect(sent.status).toBe(200);
+      return sent.headers.get('etag') ?? '';
+    };
+
+    const finish = async (uploadId: string, etags: readonly string[]) => {
+      const parts = etags
+        .map(
+          (etag, index) => `<Part><PartNumber>${index + 1}</PartNumber><ETag>${etag}</ETag></Part>`,
+        )
+        .join('');
+      const answer = await target.raw.send('POST', KEY, {
+        query: { uploadId },
+        headers: { 'content-type': 'application/xml' },
+        body: `<CompleteMultipartUpload>${parts}</CompleteMultipartUpload>`,
+      });
+      return { status: answer.status, text: await answer.text() };
+    };
+
+    it('takes equal parts and a smaller last, and answers a second finish NoSuchUpload', async () => {
+      const uploadId = await start();
+      const etags = [
+        await sendPart(uploadId, 1, Buffer.alloc(5 * MIB, 1)),
+        await sendPart(uploadId, 2, Buffer.alloc(MIB, 2)),
+      ];
+      expect((await finish(uploadId, etags)).status).toBe(200);
+      const head = await target.raw.send('HEAD', KEY);
+      expect(head.headers.get('content-length')).toBe(String(6 * MIB));
+
+      const again = await finish(uploadId, etags);
+      // AWS may repeat its answer for a while, and neither is an error to the client.
+      expect(again.text.includes('<Error>') ? again.status : 404).toBe(404);
+    });
+
+    it('refuses a part under 5 MiB other than the last', async () => {
+      const uploadId = await start();
+      const etags = [
+        await sendPart(uploadId, 1, Buffer.alloc(MIB, 1)),
+        await sendPart(uploadId, 2, Buffer.alloc(MIB, 2)),
+      ];
+      const answer = await finish(uploadId, etags);
+      expect(answer.status).toBe(400);
+      expect(answer.text).toContain('EntityTooSmall');
+    });
+
+    it.runIf(process.env.S3_TEST_ENDPOINT === undefined)(
+      'refuses unequal parts, as R2 documents, where AWS and MinIO take them',
+      async () => {
+        const uploadId = await start();
+        const etags = [
+          await sendPart(uploadId, 1, Buffer.alloc(6 * MIB, 1)),
+          await sendPart(uploadId, 2, Buffer.alloc(5 * MIB, 2)),
+          await sendPart(uploadId, 3, Buffer.alloc(MIB, 3)),
+        ];
+        const answer = await finish(uploadId, etags);
+        expect(answer.status).toBe(400);
+        expect(answer.text).toContain('InvalidPart');
+        expect(await target.raw.keys('artifacts/')).toEqual([]);
+      },
+    );
+
+    it('refuses a part with another MD5 than it says', async () => {
+      const uploadId = await start();
+      const answer = await target.raw.send('PUT', KEY, {
+        query: { partNumber: '1', uploadId },
+        headers: { 'content-md5': createHash('md5').update('other').digest('base64') },
+        body: 'this',
+      });
+      expect(answer.status).toBe(400);
+      expect(await answer.text()).toContain('BadDigest');
+    });
+
+    it('forgets a stopped upload', async () => {
+      const uploadId = await start();
+      expect(await target.raw.pendingUploads()).toEqual([KEY]);
+      const stopped = await target.raw.send('DELETE', KEY, { query: { uploadId } });
+      expect(stopped.ok).toBe(true);
+      expect(await target.raw.pendingUploads()).toEqual([]);
+    });
+  });
+
   it('holds a large file out of memory, through the signed requests', {
     timeout: 120_000,
   }, async () => {
@@ -905,7 +1076,9 @@ describe('a bucket as the target', () => {
 
     const uploaded = await runUpload({ INPUT_PATH: path, INPUT_ARCHIVE: 'false' }, options);
     expect(uploaded.exitCode).toBe(0);
-    expect(Number(/peak-kib=(\d+)/.exec(uploaded.stderr)?.[1]) * 1024).toBeLessThan(fileBytes / 2);
+    expect(Number(/peak-kib=(\d+)/.exec(uploaded.stderr)?.[1]) * 1024).toBeLessThan(
+      PEAK_IN_PARTS_BYTES,
+    );
 
     const downloaded = await runDownload({ INPUT_NAME: 'big.bin', INPUT_PATH: 'out' }, options);
     expect(downloaded.exitCode).toBe(0);

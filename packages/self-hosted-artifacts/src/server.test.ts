@@ -594,6 +594,56 @@ describe('an upload, step by step', () => {
       expect((await send('PUT', url, { body: content })).status).toBe(404);
     });
 
+    /** With no `Content-Length`, as a client's `fetch` can only send past 4 GiB. */
+    const sendChunked = (url: string, chunks: readonly Uint8Array[]) =>
+      new Promise<Answer>((resolve, reject) => {
+        const req = openRequest('PUT', url);
+        req.on('response', res => void answerOf(res).then(resolve));
+        req.on('error', reject);
+        for (const chunk of chunks) req.write(chunk);
+        req.end();
+      });
+
+    it('takes a body with no Content-Length, held to the size all the same', async () => {
+      await startServer();
+      const { id, url } = await created('a.apk', content);
+      const answer = await sendChunked(url, [content.subarray(0, 10), content.subarray(10)]);
+      expect(answer.status).toBe(200);
+      expect(await readFile(join(uploadedAt(id), 'data'))).toEqual(content);
+    });
+
+    it.each([
+      ['longer', Buffer.concat([content, Buffer.from('x')])],
+      ['shorter', content.subarray(0, 63)],
+    ])('refuses a body with no Content-Length that comes out %s', async (_, body) => {
+      await startServer();
+      const { id, url } = await created('a.apk', content);
+      const answer = await sendChunked(url, [body]).catch(() => ({ status: 0 }));
+      expect([0, 500]).toContain(answer.status);
+      expect(await readdir(uploadedAt(id))).toEqual(['upload.json']);
+    });
+
+    it('signs no parts and stops none, as a disk takes one stream', async () => {
+      await startServer({ maxFileBytes: 4 * 1024 ** 3 });
+      const { id } = await created('a.apk', content);
+      const declaration = `name=a.apk&digest=${'a'.repeat(64)}&size=${2 * 1024 ** 3}`;
+      const signing = await send('POST', `/uploads/${id}/parts?${declaration}`, {
+        headers: { ...AUTH, 'content-type': 'application/json' },
+        body: Buffer.from(
+          JSON.stringify({
+            uploadId: 'an-upload',
+            parts: [{ partNumber: 1, md5: 'A'.repeat(22).concat('==') }],
+          }),
+        ),
+      });
+      expect(signing.status).toBe(404);
+      const stopping = await send('POST', `/uploads/${id}/abort?${declaration}`, {
+        headers: { ...AUTH, 'content-type': 'application/json' },
+        body: Buffer.from(JSON.stringify({ uploadId: 'an-upload' })),
+      });
+      expect(stopping.status).toBe(404);
+    });
+
     it.each([
       ['too small', 63],
       ['too big', 65],
@@ -611,18 +661,6 @@ describe('an upload, step by step', () => {
       expect(JSON.parse(answer.body).error).toContain(String(content.length));
       expect(await tempsOnDisk()).toEqual([id]);
       expect((await send('PUT', url, { body: content })).status).toBe(200);
-    });
-
-    it('answers 400 for no Content-Length', async () => {
-      await startServer();
-      const { url } = await created('a.apk', content);
-      const answer = await new Promise<Answer>((resolve, reject) => {
-        const req = openRequest('PUT', url, { 'Transfer-Encoding': 'chunked' });
-        req.on('response', res => resolve(answerOf(res)));
-        req.on('error', reject);
-        req.end(content);
-      });
-      expect(answer.status).toBe(400);
     });
 
     it('answers 422 for the wrong digest, leaving nothing behind', async () => {

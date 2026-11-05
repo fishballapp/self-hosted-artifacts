@@ -69,7 +69,10 @@ const DiskUploadRoutes = Layer.unwrap(
         runAttempt,
         token: shortToken(upload.id),
       };
-      if (request.headers['content-length'] !== String(size)) {
+      // Past 4 GiB, a client's `fetch` can only send a stream, with no length. What arrives is counted
+      // against the size either way.
+      const contentLength = request.headers['content-length'];
+      if (contentLength !== undefined && contentLength !== String(size)) {
         yield* Effect.logInfo('upload refused').pipe(
           Effect.annotateLogs({ ...uploadLog, status: 400, reason: 'wrong Content-Length' }),
         );

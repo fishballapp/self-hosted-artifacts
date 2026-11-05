@@ -1,8 +1,8 @@
 import * as Config from 'effect/Config';
+import * as Console from 'effect/Console';
 import * as Duration from 'effect/Duration';
 import * as Effect from 'effect/Effect';
 import * as FileSystem from 'effect/FileSystem';
-import * as HttpBody from 'effect/http/HttpBody';
 import * as HttpClient from 'effect/http/HttpClient';
 import * as HttpClientRequest from 'effect/http/HttpClientRequest';
 import type * as HttpClientResponse from 'effect/http/HttpClientResponse';
@@ -10,7 +10,9 @@ import * as Option from 'effect/Option';
 import * as Redacted from 'effect/Redacted';
 import * as Schema from 'effect/Schema';
 import { ClientError } from './client-support.ts';
-import { uriEncode } from './protocol.ts';
+import { PARTS_PER_SIGNING, partSizeOf, uriEncode } from './protocol.ts';
+import { type FileToSend, sendParts } from './sending.ts';
+import type { MultipartUpload, PartToSign, SentPart } from './store-contract.ts';
 import type { Target } from './target.ts';
 import {
   downloadUnavailable,
@@ -31,6 +33,7 @@ import {
 // The target with a server: the token for each attempt, and one method per route.
 
 const TOKEN_REQUEST_TIMEOUT = Duration.seconds(30);
+const ABORT_BUDGET = Duration.seconds(10);
 
 const StoredSchema = Schema.Struct({
   id: SingleLineSchema,
@@ -39,11 +42,30 @@ const StoredSchema = Schema.Struct({
 });
 
 const UploadTargetSchema = Schema.Struct({
-  upload: Schema.Struct({
-    id: StoredArtifactFields.id,
-    url: SingleLineSchema,
-    headers: Schema.Record(Schema.String, SingleLineSchema),
-  }),
+  upload: Schema.Union([
+    Schema.Struct({
+      kind: Schema.Literal('single'),
+      id: StoredArtifactFields.id,
+      url: SingleLineSchema,
+      headers: Schema.Record(Schema.String, SingleLineSchema),
+    }),
+    Schema.Struct({
+      kind: Schema.Literal('multipart'),
+      id: StoredArtifactFields.id,
+      uploadId: SingleLineSchema,
+      partSize: Schema.Int,
+    }),
+  ]),
+});
+
+const SignedPartsSchema = Schema.Struct({
+  parts: Schema.Array(
+    Schema.Struct({
+      partNumber: Schema.Int,
+      url: SingleLineSchema,
+      headers: Schema.Record(Schema.String, SingleLineSchema),
+    }),
+  ).check(Schema.isMaxLength(PARTS_PER_SIGNING)),
 });
 
 const ListingSchema = Schema.Struct({ artifacts: Schema.Array(ListedArtifactSchema) });
@@ -143,6 +165,70 @@ export const makeServerTarget = Effect.fnUntraced(function* ({
       Effect.mapError(() => new ClientError({ message: `${base} answered without a usable link` })),
     );
 
+  /**
+   * An upload in parts, each step retried on its own, as starting over would send every part again.
+   * The upload's ID goes in a body: on a Worker, each request's URL reaches the logs.
+   */
+  const sendMultipart = Effect.fnUntraced(function* ({
+    file,
+    upload: { id, uploadId, partSize },
+    declaration,
+    name,
+  }: {
+    file: FileToSend;
+    upload: Pick<MultipartUpload, 'id' | 'uploadId'> & { readonly partSize: number };
+    declaration: Readonly<Record<string, string>>;
+    name: string;
+  }) {
+    if (partSize !== partSizeOf(file.size)) {
+      return yield* new ClientError({
+        message: `${base} wants parts of ${partSize} bytes, which this version doesn't send`,
+      });
+    }
+    const post = (route: string, body: object) =>
+      executeAuthorized(
+        HttpClientRequest.post(`${base}/uploads/${id}/${route}`).pipe(
+          HttpClientRequest.setUrlParams(declaration),
+          HttpClientRequest.bodyJsonUnsafe(body),
+        ),
+        executeWithoutUrl,
+      );
+    const sign = (parts: readonly PartToSign[]) =>
+      withRetries(
+        Effect.gen(function* () {
+          const response = yield* post('parts', { uploadId, parts });
+          if (!isOk(response)) return yield* yield* readFailure(response);
+          const answer = yield* response.json.pipe(Effect.mapError(unavailableWithoutUrl));
+          return (yield* Schema.decodeUnknownEffect(SignedPartsSchema)(answer).pipe(
+            Effect.mapError(
+              () => new ClientError({ message: `${base} answered without usable parts` }),
+            ),
+          )).parts;
+        }),
+      );
+    const commit = (parts: readonly SentPart[]) =>
+      withRetries(
+        Effect.gen(function* () {
+          const response = yield* post('commit', { uploadId, parts });
+          if (!isOk(response)) return yield* yield* readFailure(response);
+          return yield* decodeStored(
+            yield* response.json.pipe(Effect.mapError(unavailableWithoutUrl)),
+          );
+        }),
+      );
+    return yield* sendParts({ client, file, sign }).pipe(
+      Effect.flatMap(commit),
+      Effect.onError(() =>
+        post('abort', { uploadId }).pipe(
+          Effect.timeout(ABORT_BUDGET),
+          Effect.catchCause(() =>
+            Console.error(`Couldn't stop the upload of ${name}, which the bucket's rule will`),
+          ),
+        ),
+      ),
+    );
+  });
+
   return {
     // Fails at once in a job without `id-token: write`, the likeliest mistake when moving over.
     ready: Effect.asVoid(readAudiencedTokenRequest),
@@ -150,11 +236,12 @@ export const makeServerTarget = Effect.fnUntraced(function* ({
     /**
      * `POST /uploads`, `PUT` of the body and `POST /uploads/<id>/commit`, each attempt all three. A
      * commit whose answer was lost is recovered by the next attempt's first step: the digest is stored.
+     * Parts are the other way the first can answer, and they retry themselves.
      */
-    send: Effect.fnUntraced(function* ({ file, name, digest, overwrite, retentionDays }) {
+    send: Effect.fnUntraced(function* ({ file, name, overwrite, retentionDays }) {
       const declaration = {
         name,
-        digest,
+        digest: file.digest,
         size: String(file.size),
         ...(overwrite ? { overwrite: 'true' } : {}),
         // The server takes no `0`: leaving it out asks for its default.
@@ -171,13 +258,15 @@ export const makeServerTarget = Effect.fnUntraced(function* ({
         const answer = yield* created.json.pipe(Effect.mapError(unavailableFrom));
         if (created.status === 200) return yield* decodeStored(answer);
 
-        const {
-          upload: { id, url, headers },
-        } = yield* Schema.decodeUnknownEffect(UploadTargetSchema)(answer).pipe(
+        const { upload } = yield* Schema.decodeUnknownEffect(UploadTargetSchema)(answer).pipe(
           Effect.mapError(
             () => new ClientError({ message: `${base} answered without a usable upload` }),
           ),
         );
+        if (upload.kind === 'multipart') {
+          return yield* sendMultipart({ file, upload, declaration, name });
+        }
+        const { id, url, headers } = upload;
         // Against `server-url`, as a runner reaches the server by that, keeping any path it has.
         const target = URL.parse(url.replace(/^\/+/u, ''), `${base}/`);
         if (target === null) {
@@ -189,10 +278,7 @@ export const makeServerTarget = Effect.fnUntraced(function* ({
         const sent = yield* executeWithoutUrl(
           client,
           // `setBody` sets the body's own `Content-Type` over the one given, and what's given may be signed.
-          HttpClientRequest.setBody(
-            addressed,
-            HttpBody.raw(file, { contentType: addressed.headers['content-type'] }),
-          ),
+          HttpClientRequest.setBody(addressed, file.wholeBody(addressed.headers['content-type'])),
         );
         if (!isOk(sent)) return yield* yield* readFailure(sent);
 

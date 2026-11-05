@@ -1,40 +1,12 @@
-import { createHash } from 'node:crypto';
-import { openAsBlob } from 'node:fs';
 import { basename } from 'node:path';
 import * as Console from 'effect/Console';
 import * as Effect from 'effect/Effect';
-import * as FileSystem from 'effect/FileSystem';
 import * as Schema from 'effect/Schema';
-import * as Stream from 'effect/Stream';
 import { ClientError, makeRunnerTempFile, parseBooleanInput } from './client-support.ts';
 import { findFilesToUpload } from './search.ts';
+import { openFileToSend } from './sending.ts';
 import { ArtifactTarget } from './target.ts';
 import { zipFiles } from './zip.ts';
-
-const openFile = Effect.fnUntraced(function* ({ path, name }: { path: string; name: string }) {
-  const fs = yield* FileSystem.FileSystem;
-  const unreadable = () => new ClientError({ message: `Can't read ${path}` });
-  const { size } = yield* fs.stat(path).pipe(Effect.mapError(unreadable));
-  const file = yield* Effect.tryPromise({ try: () => openAsBlob(path), catch: unreadable });
-  // Node keeps this Blob's size in 32 bits, and fetch would send it as the Content-Length.
-  if (file.size !== Number(size)) {
-    return yield* new ClientError({
-      message: `${name} is ${size} bytes, and Node can't upload 4 GiB or more`,
-    });
-  }
-  return file;
-});
-
-/** The SHA-256 of what is sent, streamed, which every target checks it against. */
-const digestFile = Effect.fnUntraced(function* (path: string) {
-  const fs = yield* FileSystem.FileSystem;
-  const hash = createHash('sha256');
-  yield* fs.stream(path).pipe(
-    Stream.runForEach(chunk => Effect.sync(() => hash.update(chunk))),
-    Effect.mapError(() => new ClientError({ message: `Can't read ${path}` })),
-  );
-  return hash.digest('hex');
-});
 
 /** The same in the action's inputs and the command's flags, as actions/upload-artifact has them. */
 export const UPLOAD_DEFAULTS = {
@@ -75,7 +47,7 @@ export const parseCompressionLevel = Effect.fnUntraced(function* (value: string)
   return level;
 });
 
-/** In a temp file, as the upload's `Blob` body needs a file; the surrounding scope removes it. */
+/** In a temp file, as an upload reads a file; the surrounding scope removes it. */
 const zipToTempFile = Effect.fnUntraced(function* ({
   files,
   rootDirectory,
@@ -149,10 +121,9 @@ export const upload = Effect.fn('upload.upload')(
         })
       : firstFile;
     const name = archive ? `${inputs.name}.zip` : basename(firstFile);
-    const file = yield* openFile({ path: filePath, name });
-    const digest = yield* digestFile(filePath);
-    const stored = yield* target.send({ file, name, digest, overwrite, retentionDays });
-    return { _tag: 'Uploaded', name, size: file.size, digest, ...stored } as const;
+    const file = yield* openFileToSend(filePath);
+    const stored = yield* target.send({ file, name, overwrite, retentionDays });
+    return { _tag: 'Uploaded', name, size: file.size, digest: file.digest, ...stored } as const;
   },
   // Holds the zip until the last retry is over, and removes it however the upload ends.
   Effect.scoped,

@@ -49,6 +49,27 @@ export const attachmentOf = (name: string) => {
   return plain === name ? attachment : `${attachment}; filename*=UTF-8''${uriEncode(name)}`;
 };
 
+/** A file this big or bigger goes to a bucket in parts, and anything smaller as one `PUT`. */
+export const MULTIPART_FROM_BYTES = 1024 ** 3;
+/** How many parts a client asks to have signed at once, and the most a server signs in a request. */
+export const PARTS_PER_SIGNING = 64;
+const MIN_PART_BYTES = 16 * 1024 ** 2;
+const PART_SIZE_STEP_BYTES = 1024 ** 2;
+const MAX_PARTS = 10_000;
+
+/** The same for every part but the last, as R2 requires, and scaled up only to fit S3's 10,000. */
+export const partSizeOf = (size: number) =>
+  Math.max(
+    MIN_PART_BYTES,
+    Math.ceil(size / MAX_PARTS / PART_SIZE_STEP_BYTES) * PART_SIZE_STEP_BYTES,
+  );
+
+export const partCountOf = (size: number) => Math.ceil(size / partSizeOf(size));
+
+/** Part numbers start at 1, as S3's do. */
+export const partLengthOf = (size: number, partNumber: number) =>
+  Math.min(partSizeOf(size), size - (partNumber - 1) * partSizeOf(size));
+
 export const NAME_TAKEN =
   'An artifact with this name already exists on the workflow run. Set overwrite to replace it';
 export const OTHER_REPOSITORY = 'A job can only delete artifacts of its own repository';

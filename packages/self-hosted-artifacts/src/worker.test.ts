@@ -143,11 +143,18 @@ describe('the built Worker, in workerd', { timeout: 30_000 }, () => {
     stops.push(() => miniflare.dispose());
     return {
       logs,
-      request: async (path: string, init: { method?: string; token?: string } = {}) => {
-        const { token, method } = init;
+      request: async (
+        path: string,
+        init: { method?: string; token?: string; body?: string } = {},
+      ) => {
+        const { token, method, body } = init;
         const response = await miniflare.dispatchFetch(`${ORIGIN}${path}`, {
           ...(method === undefined ? {} : { method }),
-          ...(token === undefined ? {} : { headers: { Authorization: `Bearer ${token}` } }),
+          headers: {
+            ...(token === undefined ? {} : { Authorization: `Bearer ${token}` }),
+            ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+          },
+          ...(body === undefined ? {} : { body }),
           redirect: 'manual',
         });
         return {
@@ -181,8 +188,9 @@ describe('the built Worker, in workerd', { timeout: 30_000 }, () => {
     const created = await request(`/uploads?${declaration}`, { method: 'POST', token });
     expect(created.status).toBe(201);
     const { upload } = JSON.parse(created.text) as {
-      upload: { id: string; url: string; headers: Record<string, string> };
+      upload: { kind: string; id: string; url: string; headers: Record<string, string> };
     };
+    expect(upload.kind).toBe('single');
     const put = await fetch(upload.url, { method: 'PUT', headers: upload.headers, body: bytes });
     expect(put.status).toBe(200);
     const committed = await request(`/uploads/${upload.id}/commit?${declaration}`, {
@@ -276,6 +284,61 @@ describe('the built Worker, in workerd', { timeout: 30_000 }, () => {
       );
       expect((await worker.request(`/${second.id}/a.apk`)).status).toBe(302);
       expect((await worker.request(`/${first.id}/a.apk`)).status).toBe(404);
+    });
+
+    it('takes a job in parts from 1 GiB, one batch at most, with its upload ID in no log', async () => {
+      const { worker } = await startOverFake();
+      const token = await signToken();
+      const size = 1024 ** 3;
+      const part = Buffer.alloc(16 * 1024 ** 2, 1);
+      const md5 = createHash('md5').update(part).digest('base64');
+      const declaration = `name=a.bin&digest=${'a'.repeat(64)}&size=${size}`;
+
+      const created = await worker.request(`/uploads?${declaration}`, { method: 'POST', token });
+      expect(created.status).toBe(201);
+      const { upload } = JSON.parse(created.text) as {
+        upload: { kind: string; id: string; uploadId: string; partSize: number };
+      };
+      expect(upload).toMatchObject({ kind: 'multipart', partSize: part.length });
+      const { id, uploadId } = upload;
+
+      const parts = Array.from({ length: 64 }, (_, index) => ({ partNumber: index + 1, md5 }));
+      const tooMany = await worker.request(`/uploads/${id}/parts?${declaration}`, {
+        method: 'POST',
+        token,
+        body: JSON.stringify({ uploadId, parts: [...parts, ...parts] }),
+      });
+      expect(tooMany.status).toBe(400);
+
+      const signing = await worker.request(`/uploads/${id}/parts?${declaration}`, {
+        method: 'POST',
+        token,
+        body: JSON.stringify({ uploadId, parts }),
+      });
+      expect(signing.status).toBe(200);
+      const { parts: signed } = JSON.parse(signing.text) as {
+        parts: { partNumber: number; url: string; headers: Record<string, string> }[];
+      };
+      const sent = await Promise.all(
+        signed.map(async ({ partNumber, url, headers }) => {
+          const answer = await fetch(url, { method: 'PUT', headers, body: part });
+          expect(answer.status).toBe(200);
+          return { partNumber, etag: answer.headers.get('etag') };
+        }),
+      );
+
+      const committed = await worker.request(`/uploads/${id}/commit?${declaration}`, {
+        method: 'POST',
+        token,
+        body: JSON.stringify({ uploadId, parts: sent }),
+      });
+      expect(committed.status).toBe(201);
+      const head = await worker.request(`/${id}/a.bin`, { method: 'HEAD' });
+      expect(head.headers.get('content-length')).toBe(String(size));
+
+      const logged = worker.logs.join('\n');
+      expect(logged).toContain(`"token":"${id.slice(0, 8)}…"`);
+      expect(logged).not.toContain(uploadId);
     });
 
     it('keeps the signing keys across requests', async () => {

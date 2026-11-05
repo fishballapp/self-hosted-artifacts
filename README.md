@@ -133,15 +133,16 @@ Set up the bucket, used for this alone, and with versioning off:
 
    ```bash
    aws s3api put-bucket-lifecycle-configuration --bucket YOUR-BUCKET --lifecycle-configuration \
-     '{"Rules":[{"ID":"artifacts","Status":"Enabled","Filter":{},"Expiration":{"Days":90}}]}'
+     '{"Rules":[{"ID":"artifacts","Status":"Enabled","Filter":{},"Expiration":{"Days":90},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}'
    ```
 
    and on R2, an [object lifecycle rule](https://developers.cloudflare.com/r2/buckets/object-lifecycles/)
-   that deletes objects after that many days.
+   that deletes objects after that many days. The rule's second half removes an
+   [upload in parts](#limits) nobody finished, which R2 does after 7 days by default.
 3. **Give the server keys for this bucket alone, that read, write, delete and list its objects.** On AWS,
-   `s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on the bucket's objects, and `s3:ListBucket` on the
-   bucket, without which a missing object reads as `403` and every first upload is a `500`. On R2, an API
-   token with **Object Read & Write** on this bucket.
+   `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and `s3:AbortMultipartUpload` on the bucket's objects, and
+   `s3:ListBucket` on the bucket, without which a missing object reads as `403` and every first upload is a
+   `500`. On R2, an API token with **Object Read & Write** on this bucket.
 
 The store has to honour conditional writes and a checksum, as AWS, R2 and MinIO do: see
 [what's been tried](#whats-been-tried).
@@ -258,8 +259,8 @@ run [a server in front of it](#a-server-in-front-of-a-bucket).
 
 The credentials are the standard variables, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and, with
 temporary ones, `AWS_SESSION_TOKEN`. There is no input for them, and nothing prints them. They need
-`s3:GetObject`, `s3:PutObject` and `s3:DeleteObject` on the bucket's objects, and `s3:ListBucket` on
-the bucket, without which a missing object reads as `403` and every first upload fails.
+`s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and `s3:AbortMultipartUpload` on the bucket's objects, and
+`s3:ListBucket` on the bucket, without which a missing object reads as `403` and every first upload fails.
 
 Which run a job belongs to comes from `GITHUB_REPOSITORY_ID`, `GITHUB_RUN_ID` and `GITHUB_RUN_ATTEMPT`.
 Outside Actions, [`--scope`](#from-the-command-line) gives the same.
@@ -285,7 +286,7 @@ jobs:
           aws-region: eu-west-2
       - run: ./build.sh
       - id: upload
-        uses: fishballapp/self-hosted-artifacts/upload@v0.8.0
+        uses: fishballapp/self-hosted-artifacts/upload@v0.9.0
         with:
           s3-bucket: YOUR-BUCKET
           s3-link-base: https://YOUR-BUCKET.s3.eu-west-2.amazonaws.com
@@ -324,11 +325,12 @@ bucket for this alone, with versioning off, since a deleted version would still 
    ```
 
 3. Add one lifecycle rule across the bucket, at the longest retention you use, 90 days at most. This
-   is the backstop: see [Expiry](#expiry-with-a-bucket).
+   is the backstop: see [Expiry](#expiry-with-a-bucket). Its second half removes an
+   [upload in parts](#limits) nobody finished.
 
    ```bash
    aws s3api put-bucket-lifecycle-configuration --bucket YOUR-BUCKET --lifecycle-configuration \
-     '{"Rules":[{"ID":"artifacts","Status":"Enabled","Filter":{},"Expiration":{"Days":90}}]}'
+     '{"Rules":[{"ID":"artifacts","Status":"Enabled","Filter":{},"Expiration":{"Days":90},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}'
    ```
 
 A bucket whose name holds a dot doesn't match S3's TLS certificate when virtual-hosted. Set
@@ -338,7 +340,7 @@ A bucket whose name holds a dot doesn't match S3's TLS certificate when virtual-
 
 ```yaml
       - id: upload
-        uses: fishballapp/self-hosted-artifacts/upload@v0.8.0
+        uses: fishballapp/self-hosted-artifacts/upload@v0.9.0
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -369,7 +371,8 @@ listed.
    reading the metadata, which is worth it for a bucket holding private repositories' artifacts. For
    sensitive ones, [run a server in front](#a-server-in-front-of-a-bucket) instead.
 4. Add one [object lifecycle rule](https://developers.cloudflare.com/r2/buckets/object-lifecycles/)
-   across the bucket that deletes objects after your longest retention, 90 days at most.
+   across the bucket that deletes objects after your longest retention, 90 days at most. An
+   [upload in parts](#limits) nobody finished goes by R2's default rule, after 7 days.
 
 Create an R2 API token with **Object Read & Write** on this bucket for the credentials.
 
@@ -396,7 +399,7 @@ There's no sweeper, so:
 - **Each upload removes what has expired for its own repository,** best-effort, looking at up to 100
   names for up to 3 seconds. It can't fail the upload.
 - **The lifecycle rule is the backstop,** for a repository that stops uploading and for what a crash
-  leaves. Without it, those stay and you pay to store them.
+  leaves, an upload in parts nobody finished among it. Without it, those stay and you pay to store them.
 
 Retention defaults to 90 days, and 90 is the most. **So an expired link can keep working until the next
 upload of that repository or that rule removes it,** for up to the rule's age. If it mustn't, delete
@@ -422,6 +425,11 @@ The tests run against MinIO in a container, as well as a small fake, and have be
   the server and the bucket.
 - **The lifecycle rule:** R2 reports it on an object under it, as `x-amz-expiration`, at its `last-modified` plus the
   rule's 90 days. Removing the object is R2's to do, and hasn't been waited for.
+- **Uploads in parts:** 1.5 GiB came back byte for byte from a bucket alone, in 47 to 52 seconds up from a home
+  connection, where one `PUT` of it took 64 to 92. Through a real Worker, with a real GitHub token, 1.1 GiB went up
+  in 27 seconds and came back whole. R2 refuses a part with the wrong MD5, a changed signed header or the wrong number,
+  and a part too small, and answers a second finish `NoSuchUpload`, as the tests expect. Workers Logs hold no upload
+  ID. Unequal parts weren't sent to it: that R2 refuses them is from its docs.
 - **On `r2.dev`:** a link answers `200` with nothing cached, and `404` straight after a delete. Metadata is readable
   there, as [accepted](#on-r2).
 - **Signed URLs on R2:** a `PUT` with the wrong length, a missing or changed signed header, or the wrong checksum is
@@ -442,7 +450,7 @@ jobs:
       - uses: actions/checkout@v6
       - run: ./build.sh
       - id: upload
-        uses: fishballapp/self-hosted-artifacts/upload@v0.8.0
+        uses: fishballapp/self-hosted-artifacts/upload@v0.9.0
         with:
           server-url: http://192.0.2.10:8420
           path: dist/
@@ -453,7 +461,7 @@ That uploads what's in `dist/` as one zip, `artifact.zip`. To upload one file as
 link ends in its own name, set `archive: false`:
 
 ```yaml
-      - uses: fishballapp/self-hosted-artifacts/upload@v0.8.0
+      - uses: fishballapp/self-hosted-artifacts/upload@v0.9.0
         with:
           server-url: http://192.0.2.10:8420
           path: dist/app.apk
@@ -559,7 +567,7 @@ File handling and retention match v7. What's left differs because the files go t
 | `artifact-digest` | SHA-256 in hex | The same, checked as the file is stored |
 | `links`, `expires-at` | No | Every link by label, and when the file expires |
 | **Behaviour** | | |
-| Where files go | GitHub, against your plan's storage quota | A disk or a bucket you own, behind a server, 2 GiB per upload by default, or a bucket alone, under 4 GiB per upload |
+| Where files go | GitHub, against your plan's storage quota | A disk or a bucket you own, behind a server, 2 GiB per upload by default, or a bucket alone, 5 TiB per upload |
 | Which repositories | Any | With a server, private ones of one owner, as public repositories' artifacts are free on GitHub. With a bucket, any job with the credentials |
 | Runners | Any | Linux and macOS. `path` isn't read the Windows way |
 | Job permission | None to add | With a server, `id-token: write`. With a bucket, credentials in the environment |
@@ -580,7 +588,7 @@ jobs:
       id-token: write # to prove to the server which repository this is
     steps:
       - id: download
-        uses: fishballapp/self-hosted-artifacts/download@v0.8.0
+        uses: fishballapp/self-hosted-artifacts/download@v0.9.0
         with:
           server-url: http://192.0.2.10:8420
           name: build
@@ -677,7 +685,7 @@ jobs:
       id-token: write # to prove to the server which repository this is
     steps:
       - id: merge
-        uses: fishballapp/self-hosted-artifacts/upload/merge@v0.8.0
+        uses: fishballapp/self-hosted-artifacts/upload/merge@v0.9.0
         with:
           server-url: http://192.0.2.10:8420
           name: all-builds
@@ -829,7 +837,8 @@ answer `503` too.
 ### Storing a file
 
 Three requests, whichever store it is: declare the upload, send the body, commit. The first and last take
-the token. The body goes to the URL the first answers with, and needs none.
+the token. The body goes to the URL the first answers with, and needs none. A file of 1 GiB or more to a bucket
+sends its body [in parts](#sending-it-in-parts) instead.
 
 **1. `POST /uploads?name=<filename>&digest=<sha-256>&size=<bytes>`**, with no body.
 
@@ -847,6 +856,7 @@ artifact, as below, unchanged, whatever `overwrite` says. Otherwise `201`, and w
 ```json
 {
   "upload": {
+    "kind": "single",
     "id": "<token>",
     "url": "/uploads/<token>",
     "headers": { "content-type": "application/octet-stream" }
@@ -857,7 +867,7 @@ artifact, as below, unchanged, whatever `overwrite` says. Otherwise `201`, and w
 | Status | Meaning |
 | --- | --- |
 | `200` | Already stored. |
-| `201` | Send the body. |
+| `201` | Send the body, as `kind` says. |
 | `400` | Bad name, retention, digest, size or overwrite. |
 | `409` | The run attempt already holds this name with other content, and `overwrite` isn't `true`. |
 | `413` | Over `maxFileGiB`. |
@@ -867,15 +877,16 @@ artifact, as below, unchanged, whatever `overwrite` says. Otherwise `201`, and w
 path is resolved against the base URL the client reaches the server by, as a runner may not reach any
 of `linkBases`, and a link never comes from `Host`. An absolute one is used as it is.
 
-From a disk, `url` is a path on the server, which answers:
+From a disk, `url` is a path on the server, however big the file. It takes a body with a `Content-Length` or with
+none, counted against `size` either way, which is how the client sends 4 GiB or more. It answers:
 
 | Status | Meaning |
 | --- | --- |
 | `200` | The body is in place. Another `PUT` replaces it. |
-| `400` | `Content-Length` isn't the `size` declared. |
+| `400` | A `Content-Length` that isn't the `size` declared. |
 | `404` | No such upload: unknown, over an hour old, already committed, or refused for its digest. |
 | `422` | The body doesn't match `digest`. Nothing is kept, and the upload is over. |
-| `500` | The body wasn't stored. |
+| `500` | The body wasn't stored, as it was longer or shorter than `size`, or for any other reason. |
 
 With a bucket, `url` is absolute, `headers` include what's signed, and the `PUT` goes to the bucket. `fetch` sets
 `Content-Length` from the body, which is signed too. The bucket answers in its own way: `200`, or `403` for the
@@ -883,7 +894,7 @@ wrong length, a changed or missing header, or a URL over an hour old, and `400` 
 `PUT` of the same bytes replaces it.
 
 **3. `POST /uploads/<id>/commit`**, with a token minted for it, and the same parameters as the first.
-The upload's ID becomes the artifact's.
+The upload's ID becomes the artifact's. An upload in parts also says what it sent, in its body.
 
 ```json
 {
@@ -900,12 +911,52 @@ The upload's ID becomes the artifact's.
 | --- | --- |
 | `200` | Already there, with this content: this upload committed before, or another that got there first. The answer is that artifact. |
 | `201` | Stored. |
-| `400` | Bad name, retention, digest, size or overwrite. |
+| `400` | Bad name, retention, digest, size or overwrite, or an upload in parts without each of its parts in order. |
 | `404` | Nothing to commit: the body never arrived, the upload was swept, it declared something else (on a bucket, a different name or size), or it belongs to another repository, run or attempt. |
 | `409` | The name was taken meanwhile, with other content, and `overwrite` isn't `true`. The upload is over. |
 
 A client that loses any answer can start again from the first request. If the commit landed, that
 answers `200`, as the digest is stored, so a lost answer costs nothing but the retry.
+
+### Sending it in parts
+
+A file of 1 GiB or more, to a bucket. The first request answers with no URL:
+
+```json
+{ "upload": { "kind": "multipart", "id": "<token>", "uploadId": "<the bucket's>", "partSize": 16777216 } }
+```
+
+`partSize` is what every part is but the last, which is what's left: 16 MiB, or more if that would take over
+10,000 parts. **`uploadId` is a credential, like an upload's URL,** so a client keeps it out of its logs, and
+sends it only in a body, as a request's URL can reach a server's logs. The server remembers nothing, so each
+request below says it again, with the first's parameters in the query, a token, and `Content-Type: application/json`.
+
+**`POST /uploads/<id>/parts`** signs up to 64 parts, numbered from 1, for an hour, asking nothing of the bucket:
+
+```json
+{ "uploadId": "<the bucket's>", "parts": [{ "partNumber": 1, "md5": "<base64>" }] }
+```
+
+```json
+{ "parts": [{ "partNumber": 1, "url": "<on the bucket>", "headers": { "content-md5": "<base64>" } }] }
+```
+
+`400` for a part the declared `size` has no need of, a bad MD5, more than 64 parts, or a file under 1 GiB, and `404`
+from a disk. Each `url` takes a `PUT` of that part, with those `headers` and no token: another `PUT` of the part
+replaces it. The bucket answers with an `ETag`, `403` for the wrong length or a changed or missing header, and `400`
+for the wrong MD5. Sign a part again if its URL is getting old.
+
+**`POST /uploads/<id>/commit`** then takes every part, in order, as the bucket answered:
+
+```json
+{ "uploadId": "<the bucket's>", "parts": [{ "partNumber": 1, "etag": "\"<etag>\"" }] }
+```
+
+It makes the object out of them, then answers as above, so it can be sent again with the same body. If the bucket
+no longer knows the upload, the object decides: `404` unless it's there with this size and this run's scope.
+
+**`POST /uploads/<id>/abort`**, with `{ "uploadId": "<the bucket's>" }`, stops an upload that won't finish, best-effort:
+`200` whether or not the bucket could, and `404` from a disk. What's left goes by the bucket's rule.
 
 ### Listing a run
 
@@ -1009,6 +1060,12 @@ token just as it does with a disk. What's different is where the bytes go:
   and is given only to a job that passed the check. It's bound to that key, the length, the checksum and the
   run, so all it can write is that one file, which still takes a token of the same repository, run and attempt to
   become an artifact. Unlike a link, it's a credential, so neither the client nor the server prints it.
+- **What holds an upload in parts:** a file of 1 GiB or more goes this way, and S3 can't check a whole file's SHA-256
+  across parts. So what's signed into each part's URL is its key, its upload, its number, its length and its MD5, the
+  numbers are only those the declared size needs, and a commit reads back the object's length and run. An upload's ID
+  is a credential, and with it a job of another run could send parts or finish the upload, though that job's commit
+  still answers `404`. The digest in the artifact is then the client's word for it, which the client's own download
+  checks, and a server has nothing to check a link's bytes with.
 - **Who can download:** anyone who has the link and can reach the server, which then gives them a URL on the
   bucket for 5 minutes. **So what keeps a file private is the link alone**, and who can reach the server: once the
   redirect is followed, that URL works from anywhere, and the bytes never come through your network. A
@@ -1022,8 +1079,8 @@ token just as it does with a disk. What's different is where the bytes go:
   would meet it on the bucket's origin, which holds nothing else.
 - **What the keys can do:** everything in the bucket. The server is what holds a job to its own repository, so
   protect it and its environment as you would the bucket.
-- **What gets logged:** never a credential, the OIDC token or a URL with a signature in it, and only a short prefix
-  of a download token or an upload's ID, in a failure's key too. On a Worker, Cloudflare adds each request's URL to its
+- **What gets logged:** never a credential, the OIDC token, an upload's ID in the bucket or a URL with a signature in
+  it, and only a short prefix of a download token or an upload's ID here, in a failure's key too. On a Worker, Cloudflare adds each request's URL to its
   lines, and was seen to show a token in a path, and a digest, as `REDACTED`. A query's other values, such as `name`, stay.
 - **On a Worker, a misconfigured server says so to anyone,** as nothing else can tell whoever deployed it. Its `500`
   names settings and variables, never a value.
@@ -1057,6 +1114,9 @@ token just as it does with a disk. What's different is where the bytes go:
 - **What a file can do:** it's served as `application/octet-stream`, as an attachment. S3 can't add the
   server's `X-Content-Type-Options` and `Content-Security-Policy` headers, and a browser that ignored
   the attachment would meet it on the bucket's origin, which holds nothing else.
+- **What holds an upload in parts:** the client, and S3 for each part's MD5 and the object's size. A file of 1 GiB or
+  more is sent in parts, each with its MD5, so no one but the client checks the whole file's SHA-256 as it arrives.
+  A download checks it.
 - **What a name can do:** the same as with a server. Names reach a key only as their hash, or checked
   against the [name rule](#http-api) in `artifacts/<id>/<name>`, and whatever a bucket answers is held
   to those rules before it reaches a path.
@@ -1066,13 +1126,16 @@ token just as it does with a disk. What's different is where the bytes go:
 ## Limits
 
 - With a server, 2 GiB per file by default, checked from the size declared and counted while streaming, or
-  with a bucket, signed into the upload's URL. A zip counts as one file.
-- Under 4 GiB per upload from the action or the command, whatever the target allows: Node's `fetch`
-  can't send more with the right length. Files in a zip can be larger, as long as the zip isn't. A bucket
-  takes one `PUT` for it, with no multipart, whether a server is in front of it or not.
+  with a bucket, signed into the upload's URLs. A zip counts as one file.
+- **A file of 1 GiB or more to a bucket goes in parts,** whether a server is in front of it or not: 16 MiB each,
+  more only to fit 10,000 parts, and 5 TiB at most, 4 at a time, so what's in memory stays bounded whatever the
+  size. Only a failed part is sent again. Anything smaller goes as one `PUT`, whose checksum the bucket checks.
+- **A disk's server takes one stream, whatever the size,** up to `maxFileGiB`.
+- A file goes through a temp file in `RUNNER_TEMP` if it's zipped, so the runner needs room for it.
 - 90 days' retention at most by default, and always with a bucket.
 - One hour for a request to a server, enough for 2 GiB at about 5 Mbit/s. A slower upload is cut off. An
-  upload's URL takes a `PUT` for an hour after it's made. A link's URL on a bucket starts a download for 5 minutes.
+  upload's URL takes a `PUT` for an hour after it's made, and a part asks for a new one if its own is getting old, so
+  parts have no such limit. A link's URL on a bucket starts a download for 5 minutes.
 - A run's list is answered in one response from a server, with no pages. A bucket's is read in pages,
   with one read per artifact, by the server if there's one in front of it.
 - Five minutes idle on a server: a client that stops reading or sending is cut off, downloads included. A stalled
@@ -1081,7 +1144,7 @@ token just as it does with a disk. What's different is where the bytes go:
 ## Not supported
 
 A web UI, Windows runners, and a list of a run's earlier attempts where a later one holds the name, or,
-with a bucket, multipart uploads or a bucket that also holds other things.
+with a bucket, a bucket that also holds other things.
 
 ## License
 

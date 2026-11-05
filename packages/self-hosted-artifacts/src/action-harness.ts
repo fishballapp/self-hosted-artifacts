@@ -1,6 +1,5 @@
 import { type ExecFileException, execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { openAsBlob } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import {
   createServer,
@@ -14,6 +13,7 @@ import { dirname, join } from 'node:path';
 import * as NodeFileSystem from '@effect/platform-node/NodeFileSystem';
 import * as ConfigProvider from 'effect/ConfigProvider';
 import * as Effect from 'effect/Effect';
+import type * as FileSystem from 'effect/FileSystem';
 import * as FetchHttpClient from 'effect/http/FetchHttpClient';
 import * as HttpClient from 'effect/http/HttpClient';
 import * as Layer from 'effect/Layer';
@@ -21,9 +21,12 @@ import * as Redacted from 'effect/Redacted';
 import { build, type UserConfig } from 'tsdown';
 import { type Config, type S3StoreConfig, ServerConfig } from './config.ts';
 import { TokenVerifier } from './oidc.ts';
+import { unescapeXml } from './s3-bucket.ts';
 import { makeS3Target } from './s3-client.ts';
 import { FAKE_ACCESS_KEY_ID, FAKE_SECRET_ACCESS_KEY, rawS3Client, startFakeS3 } from './s3-fake.ts';
 import { encodeS3Path } from './s3-sigv4.ts';
+import { openFileToSend } from './sending.ts';
+import { makeServerTarget } from './server-client.ts';
 import {
   closeServer,
   listenOnLoopback,
@@ -55,6 +58,27 @@ process.on('exit', () => {
 `;
 
 /**
+ * A suite's bundle with a lower threshold for going in parts, which is the only thing about parts that
+ * can be small: a real bucket holds a part's size to its own minimum, and writing a real GiB for every
+ * scenario would be slow. A suite's own process has the same through `vi.mock` of `protocol.ts`, and
+ * nothing in the published package can reach it.
+ */
+export const withSmallMultipart = (config: UserConfig): UserConfig => ({
+  ...config,
+  plugins: [
+    {
+      name: 'small-multipart',
+      transform: (code: string, id: string) => {
+        if (!id.endsWith('/src/protocol.ts')) return undefined;
+        const declared = 'MULTIPART_FROM_BYTES = 1024 ** 3';
+        if (!code.includes(declared)) throw new Error(`protocol.ts no longer says ${declared}`);
+        return code.replace(declared, `MULTIPART_FROM_BYTES = ${TEST_MULTIPART_FROM_BYTES}`);
+      },
+    },
+  ],
+});
+
+/**
  * Builds an action into a folder of its own, and answers with the file. Test files run in parallel, and
  * a build empties its folder first, so sharing one would pull a bundle out from under another file's step.
  */
@@ -72,6 +96,15 @@ export const buildBundle = async (config: UserConfig, file = 'action.mjs') => {
 
 export const removeBundle = (bundle: string) =>
   rm(dirname(bundle), { recursive: true, force: true });
+
+/** What `withSmallMultipart` makes it, and what each suite's `vi.mock` says too. */
+export const TEST_MULTIPART_FROM_BYTES = 32 * 1024 ** 2;
+
+/**
+ * What a job in parts stays under, whatever the file's size: four parts in flight, and `fetch`'s copy of
+ * each that the GC hasn't got to yet. `DECISIONS.md` has what was measured.
+ */
+export const PEAK_IN_PARTS_BYTES = 640 * 1024 ** 2;
 
 export const AUDIENCE = 'custom-audience';
 export const REQUEST_TOKEN = 'runner-request-token';
@@ -313,6 +346,8 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
           headers: req.headers,
         },
         answer => {
+          // Cut off partway, as the client's connection then has nothing more coming.
+          answer.on('error', () => res.destroy());
           if (interception === 'lose-answer') {
             answer.resume();
             answer.on('end', () => res.destroy());
@@ -322,6 +357,15 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
           answer.pipe(res);
         },
       );
+      // A store can refuse from the headers and close on a body it's still being sent, so this can
+      // fail after its answer, which has already gone on to the client.
+      forward.on('error', () => {
+        if (!res.headersSent) res.destroy();
+      });
+      // A client that stops sending, as one does once it's refused, leaves nothing to forward.
+      req.on('close', () => {
+        if (!req.complete) forward.destroy();
+      });
       req.pipe(forward);
       return undefined;
     });
@@ -348,8 +392,9 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
       });
       if (created.status !== 201) throw new Error(`Storing ${name}: ${created.status}`);
       const { upload } = (await created.json()) as {
-        upload: { id: string; url: string; headers: Record<string, string> };
+        upload: { kind: string; id: string; url: string; headers: Record<string, string> };
       };
+      if (upload.kind !== 'single') throw new Error(`${name} is too big for this shortcut`);
       const sent = await fetch(new URL(upload.url, url), {
         method: 'PUT',
         headers: upload.headers,
@@ -371,8 +416,25 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
       /** Straight to the real server, as the job that uploaded would, with a real token. */
       store: (name: string, content: Uint8Array, run: Partial<RunClaims> = {}) =>
         post(name, new Blob([new Uint8Array(content)]), run),
-      /** Sent from disk, as the real upload is: the test's own memory stays out of it. */
-      storeFromDisk: async (name: string, path: string) => post(name, await openAsBlob(path), {}),
+      /** Through the real client, in parts if it's big enough, so the test's own memory stays out of it. */
+      storeFromDisk: async (name: string, path: string) => {
+        await Effect.runPromise(
+          Effect.gen(function* () {
+            const target = yield* makeServerTarget({ serverUrl: url, audience: AUDIENCE });
+            const file = yield* openFileToSend(path);
+            return yield* target.send({ file, name, overwrite: false, retentionDays: 0 });
+          }).pipe(
+            Effect.provide(
+              Layer.mergeAll(
+                FetchHttpClient.layer,
+                Layer.succeed(HttpClient.TracerPropagationEnabled, false),
+                NodeFileSystem.layer,
+                ConfigProvider.layer(ConfigProvider.fromUnknown(runnerEnv)),
+              ),
+            ),
+          ),
+        );
+      },
       /** What the run holds, latest attempt of each name. */
       list: async (run: Partial<RunClaims> = {}) => {
         claims = { ...CURRENT_RUN, ...run };
@@ -456,6 +518,18 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
       if (!created.ok) throw new Error(`Creating ${bucket}: ${await created.text()}`);
       stops.push(async () => {
         await Promise.all((await raw.keys()).map(key => raw.send('DELETE', key)));
+        // R2 won't remove a bucket that holds an upload nobody finished.
+        const open = await (await raw.send('GET', '', { query: { uploads: '' } })).text();
+        await Promise.all(
+          Array.from(open.matchAll(/<Upload>(.*?)<\/Upload>/gsu), ([, upload = '']) => {
+            // Each in its own match, as R2 lists the ID first and S3 the key.
+            const key = /<Key>([^<]*)<\/Key>/u.exec(upload)?.[1] ?? '';
+            const uploadId = /<UploadId>([^<]*)<\/UploadId>/u.exec(upload)?.[1] ?? '';
+            return raw.send('DELETE', unescapeXml(key), {
+              query: { uploadId: unescapeXml(uploadId) },
+            });
+          }),
+        );
         await raw.send('DELETE', '');
       });
       if (isPublic && REAL_S3.hasBucketPolicies) {
@@ -487,7 +561,9 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
     let endpoint = realEndpoint;
     /** The client itself, in this process, to store what a step will find. */
     const asJob = <A, E>(
-      use: (target: Effect.Success<ReturnType<typeof makeS3Target>>) => Effect.Effect<A, E>,
+      use: (
+        target: Effect.Success<ReturnType<typeof makeS3Target>>,
+      ) => Effect.Effect<A, E, FileSystem.FileSystem>,
       run: Partial<RunClaims>,
     ) => {
       const { repository, repository_id, run_id, run_attempt } = { ...CURRENT_RUN, ...run };
@@ -524,18 +600,18 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
       content: Uint8Array,
       run: Partial<RunClaims> = {},
     ): Promise<Stored> => {
-      const digest = createHash('sha256').update(content).digest('hex');
-      const { id, links, expiresAt } = await asJob(
+      const path = join(rootDir, `stored-${crypto.randomUUID()}`);
+      await writeFile(path, content);
+      const { id, digest, links, expiresAt } = await asJob(
         target =>
-          target.send({
-            file: new Blob([new Uint8Array(content)]),
-            name,
-            digest,
-            overwrite: false,
-            retentionDays: 0,
+          Effect.gen(function* () {
+            const file = yield* openFileToSend(path);
+            const sent = yield* target.send({ file, name, overwrite: false, retentionDays: 0 });
+            return { ...sent, digest: file.digest };
           }),
         run,
       );
+      await rm(path);
       return { id, name, digest, size: content.length, expiresAt, links: { ...links } };
     };
     return {
@@ -565,12 +641,13 @@ export const startRunner = async ({ keys }: { keys: CryptoKeyPair }) => {
       env,
       store: storeBytes,
       storeFromDisk: async (name: string, path: string) => {
-        const file = await openAsBlob(path);
-        const digest = createHash('sha256');
-        for await (const chunk of file.stream()) digest.update(chunk);
-        const hex = digest.digest('hex');
         await asJob(
-          target => target.send({ file, name, digest: hex, overwrite: false, retentionDays: 0 }),
+          target =>
+            openFileToSend(path).pipe(
+              Effect.flatMap(file =>
+                target.send({ file, name, overwrite: false, retentionDays: 0 }),
+              ),
+            ),
           {},
         );
       },

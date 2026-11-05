@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import * as Arr from 'effect/Array';
 import * as Clock from 'effect/Clock';
 import * as Config from 'effect/Config';
+import * as Duration from 'effect/Duration';
 import * as Effect from 'effect/Effect';
 import * as HttpBody from 'effect/http/HttpBody';
 import type * as HttpClient from 'effect/http/HttpClient';
@@ -14,15 +15,23 @@ import * as Redacted from 'effect/Redacted';
 import * as Schema from 'effect/Schema';
 import * as Stream from 'effect/Stream';
 import { ClientError } from './client-support.ts';
-import { isFileName, RUN_ID } from './protocol.ts';
-import { encodeS3Path, encodeS3Query, type S3Credentials, signS3Request } from './s3-sigv4.ts';
-import type { RunScope } from './store-contract.ts';
+import { isFileName, partLengthOf, RUN_ID } from './protocol.ts';
+import {
+  encodeS3Path,
+  encodeS3Query,
+  presignS3Request,
+  type S3Credentials,
+  signS3Request,
+} from './s3-sigv4.ts';
+import type { PartToSign, RunScope, SentPart, SignedPart } from './store-contract.ts';
 import {
   executeRequest,
+  executeWithoutUrl,
   isOk,
   StoredArtifactFields,
   UnavailableError,
   unavailableFrom,
+  unavailableWithoutUrl,
   withRetries,
 } from './transport.ts';
 
@@ -33,6 +42,8 @@ import {
 
 const COMMIT_ATTEMPTS = 8;
 const PARALLEL_READS = 16;
+export const UPLOAD_URL_SECONDS = 60 * 60;
+const ABORT_BUDGET = Duration.seconds(10);
 /** `artifacts/<id>/<name>` carries where its metadata is, so finding it by ID is a few requests. */
 export const SCOPE_HEADER = 'x-amz-meta-run-scope';
 
@@ -86,6 +97,13 @@ export const scopeFromHeader = (header: string | undefined): Option.Option<RunSc
   const [repositoryId = '', runId = '', runAttempt = ''] = header.split('/');
   return Option.some({ repositoryId, runId, runAttempt });
 };
+
+/** What the data key says of itself: how it's served, and the scope a commit and a link go by. */
+export const dataHeadersOf = (scope: RunScope) => ({
+  'content-type': 'application/octet-stream',
+  'content-disposition': 'attachment',
+  [SCOPE_HEADER]: scopeHeaderOf(scope),
+});
 
 /** What `x-amz-checksum-sha256` takes, from a digest in hex. */
 export const checksumOf = (digest: string) => Buffer.from(digest, 'hex').toString('base64');
@@ -161,6 +179,14 @@ export const unescapeXml = (text: string) =>
     },
   );
 
+const escapeXml = (text: string) =>
+  text
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;');
+
 const elementOf = (xml: string, name: string) =>
   new RegExp(`<${name}>([^<]*)</${name}>`, 'u').exec(xml)?.[1];
 
@@ -209,12 +235,15 @@ export const makeS3Bucket = ({
     query = {},
     headers = {},
     body,
+    isUrlSecret = false,
   }: {
-    method: 'GET' | 'HEAD' | 'PUT' | 'DELETE';
+    method: 'GET' | 'HEAD' | 'PUT' | 'POST' | 'DELETE';
     key: string;
     query?: Readonly<Record<string, string>>;
     headers?: Readonly<Record<string, string>>;
-    body?: { readonly content: Blob | string; readonly contentType: string };
+    body?: HttpBody.Raw | HttpBody.Uint8Array | HttpBody.Stream;
+    /** An upload's ID is in it. */
+    isUrlSecret?: boolean;
   }) {
     const { credentials, region } = yield* connection;
     const { origin, host, path } = s3AddressOf({ bucket, region, endpoint, key });
@@ -225,7 +254,7 @@ export const makeS3Bucket = ({
       query,
       headers: {
         ...headers,
-        ...(body === undefined ? {} : { 'content-type': body.contentType }),
+        ...(body?.contentType === undefined ? {} : { 'content-type': body.contentType }),
       },
       credentials,
       region,
@@ -243,14 +272,9 @@ export const makeS3Bucket = ({
         },
       },
     );
-    return yield* executeRequest(
+    return yield* (isUrlSecret ? executeWithoutUrl : executeRequest)(
       client,
-      body === undefined
-        ? request
-        : HttpClientRequest.setBody(
-            request,
-            HttpBody.raw(body.content, { contentType: body.contentType }),
-          ),
+      body === undefined ? request : HttpClientRequest.setBody(request, body),
     );
   });
 
@@ -405,7 +429,7 @@ export const makeS3Bucket = ({
         const response = yield* execute({
           method: 'PUT',
           key,
-          body: { content: body, contentType: 'application/json' },
+          body: HttpBody.text(body, 'application/json'),
         });
         if (!isOk(response)) return yield* yield* readFailure(`write ${key}`, response);
       }),
@@ -483,7 +507,7 @@ export const makeS3Bucket = ({
         method: 'PUT',
         key,
         headers: heldEtag === null ? { 'if-none-match': '*' } : { 'if-match': heldEtag },
-        body: { content: body, contentType: 'application/json' },
+        body: HttpBody.text(body, 'application/json'),
       }).pipe(
         Effect.tapError(() =>
           Effect.sync(() => {
@@ -543,9 +567,183 @@ export const makeS3Bucket = ({
     return Option.some({ artifact: held.value.artifact, nameKey, dataKey });
   });
 
+  /** The whole URL: `query` and `headers` are what S3 holds a request to it to. */
+  const presign = Effect.fnUntraced(function* ({
+    method,
+    key,
+    query,
+    headers,
+    expiresInSeconds,
+  }: {
+    method: 'GET' | 'PUT';
+    key: string;
+    query?: Readonly<Record<string, string>>;
+    headers?: Readonly<Record<string, string>>;
+    expiresInSeconds: number;
+  }) {
+    const { credentials, region } = yield* connection;
+    const { origin, host, path } = s3AddressOf({ bucket, region, endpoint, key });
+    const search = presignS3Request({
+      method,
+      host,
+      path,
+      ...(query === undefined ? {} : { query }),
+      ...(headers === undefined ? {} : { headers }),
+      credentials,
+      region,
+      nowMs: yield* Clock.currentTimeMillis,
+      expiresInSeconds,
+    });
+    return `${origin}${encodeS3Path(path)}?${search}`;
+  });
+
+  /** S3's message is its own to word, so an upload's ID can't reach a log through it. */
+  const withoutUploadId =
+    (uploadId: string) =>
+    <A, R>(self: Effect.Effect<A, ClientError | UnavailableError, R>) =>
+      self.pipe(
+        Effect.mapError(error =>
+          Predicate.isTagged(error, 'UnavailableError')
+            ? new UnavailableError({ message: error.message.replaceAll(uploadId, 'an upload') })
+            : new ClientError({ message: error.message.replaceAll(uploadId, 'an upload') }),
+        ),
+      );
+
+  /** Answers with the upload's ID, which is a credential. What `headers` say, the object will. */
+  const startMultipart = ({
+    key,
+    headers,
+  }: {
+    key: string;
+    headers: Readonly<Record<string, string>>;
+  }) =>
+    retrying(
+      Effect.gen(function* () {
+        const response = yield* execute({ method: 'POST', key, query: { uploads: '' }, headers });
+        if (!isOk(response)) return yield* yield* readFailure(`start ${key}`, response);
+        const xml = yield* response.text.pipe(Effect.mapError(unavailableWithoutUrl));
+        const uploadId = elementOf(xml, 'UploadId');
+        if (uploadId === undefined) {
+          return yield* new ClientError({ message: `S3 answered for ${key} with no upload ID` });
+        }
+        return unescapeXml(uploadId);
+      }),
+    );
+
+  /**
+   * One URL per part, which is all signing: nothing asks the bucket. What's signed is what S3 holds a
+   * part to: this key, this upload, this number, this length, and this MD5.
+   */
+  const signParts = ({
+    key,
+    uploadId,
+    size,
+    parts,
+  }: {
+    key: string;
+    uploadId: string;
+    size: number;
+    parts: readonly PartToSign[];
+  }) =>
+    Effect.forEach(
+      parts,
+      ({ partNumber, md5 }) =>
+        Effect.map(
+          presign({
+            method: 'PUT',
+            key,
+            query: { partNumber: String(partNumber), uploadId },
+            headers: {
+              'content-length': String(partLengthOf(size, partNumber)),
+              'content-md5': md5,
+            },
+            expiresInSeconds: UPLOAD_URL_SECONDS,
+          }),
+          // No `content-length`: `fetch` strips one set by hand, and sets it from the bytes.
+          (url): SignedPart => ({ partNumber, url, headers: { 'content-md5': md5 } }),
+        ),
+      { concurrency: 1 },
+    );
+
+  /**
+   * Makes the object out of its parts. A `404` is what a store may say to a try whose first answer was
+   * lost, as well as to what was never there, so this leaves that to the `HEAD` every caller makes next.
+   */
+  const completeMultipart = ({
+    key,
+    uploadId,
+    parts,
+  }: {
+    key: string;
+    uploadId: string;
+    parts: readonly SentPart[];
+  }) =>
+    retrying(
+      Effect.gen(function* () {
+        const response = yield* execute({
+          method: 'POST',
+          key,
+          query: { uploadId },
+          isUrlSecret: true,
+          body: HttpBody.text(
+            `<CompleteMultipartUpload>${parts
+              .map(
+                ({ partNumber, etag }) =>
+                  `<Part><PartNumber>${partNumber}</PartNumber><ETag>${escapeXml(etag)}</ETag></Part>`,
+              )
+              .join('')}</CompleteMultipartUpload>`,
+            'application/xml',
+          ),
+        });
+        if (response.status === 404) return;
+        if (!isOk(response)) return yield* yield* readFailure(`finish ${key}`, response);
+        // S3 answers `200` before it knows, and then says how it went in the body.
+        const xml = yield* response.text.pipe(Effect.mapError(unavailableWithoutUrl));
+        const code = elementOf(xml, 'Code');
+        if (code !== undefined) {
+          return yield* new UnavailableError({ message: `S3 failed to finish ${key}: ${code}` });
+        }
+      }).pipe(withoutUploadId(uploadId)),
+    );
+
+  /** Never fails what called it, or holds it up for long: the bucket's rule removes what this leaves. */
+  const abortMultipart = ({ key, uploadId }: { key: string; uploadId: string }) =>
+    Effect.gen(function* () {
+      const response = yield* execute({
+        method: 'DELETE',
+        key,
+        query: { uploadId },
+        isUrlSecret: true,
+      });
+      if (!isOk(response) && response.status !== 404) {
+        return yield* yield* readFailure(`stop ${key}`, response);
+      }
+    }).pipe(
+      Effect.timeout(ABORT_BUDGET),
+      Effect.catchCause(() =>
+        note(`Couldn't stop the upload of ${key}, which the bucket's lifecycle rule will`),
+      ),
+    );
+
+  /** Whether a key holds what an upload declared. That's all a bucket can say of an upload in parts. */
+  const holdsData = ({ key, size, scope }: { key: string; size: number; scope: RunScope }) =>
+    Effect.map(
+      readDataHead(key),
+      Option.exists(
+        ({ size: stored, scope: header }) =>
+          stored === String(size) && header === scopeHeaderOf(scope),
+      ),
+    );
+
   return {
     retrying,
     execute,
+    presign,
+    startMultipart,
+    signParts,
+    completeMultipart,
+    abortMultipart,
+    holdsData,
     readHeld,
     deleteObject,
     deleteOrNote,

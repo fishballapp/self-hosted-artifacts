@@ -1,8 +1,10 @@
 import * as Arr from 'effect/Array';
+import * as ByteSize from 'effect/ByteSize';
 import * as Cause from 'effect/Cause';
 import * as Context from 'effect/Context';
 import * as Effect from 'effect/Effect';
 import * as Exit from 'effect/Exit';
+import * as HttpIncomingMessage from 'effect/http/HttpIncomingMessage';
 import * as HttpRouter from 'effect/http/HttpRouter';
 import type * as HttpServerRequest from 'effect/http/HttpServerRequest';
 import * as HttpServerResponse from 'effect/http/HttpServerResponse';
@@ -19,8 +21,11 @@ import {
   BAD_RETENTION,
   FILE_NAME_MESSAGE,
   isFileName,
+  MULTIPART_FROM_BYTES,
   NAME_TAKEN,
   OTHER_REPOSITORY,
+  PARTS_PER_SIGNING,
+  partCountOf,
   REPOSITORY,
   RUN_ID,
   SHA_256,
@@ -35,6 +40,41 @@ const ARTIFACTS_URL = /^\/artifacts(?:\?(.*))?$/;
 const ARTIFACT_URL = /^\/artifacts\/([A-Za-z0-9_-]{43})$/;
 const UPLOADS_URL = /^\/uploads(?:\?(.*))?$/;
 const COMMIT_URL = /^\/uploads\/([A-Za-z0-9_-]{43})\/commit(?:\?(.*))?$/;
+const PARTS_URL = /^\/uploads\/([A-Za-z0-9_-]{43})\/parts(?:\?(.*))?$/;
+const ABORT_URL = /^\/uploads\/([A-Za-z0-9_-]{43})\/abort(?:\?(.*))?$/;
+const MAX_JSON_BODY = ByteSize.mebibytes(2);
+
+// In a body and never a query: a URL reaches a Worker's logs, and an upload's ID is a credential.
+const UploadIdSchema = Schema.String.check(Schema.isPattern(/^[\x21-\x7e]{1,4096}$/u));
+const PartNumberSchema = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1));
+
+const SignPartsBodySchema = Schema.fromJsonString(
+  Schema.Struct({
+    uploadId: UploadIdSchema,
+    parts: Schema.Array(
+      Schema.Struct({
+        partNumber: PartNumberSchema,
+        md5: Schema.String.check(Schema.isPattern(/^[A-Za-z0-9+/]{22}==$/u)),
+      }),
+    ).check(Schema.isMinLength(1), Schema.isMaxLength(PARTS_PER_SIGNING)),
+  }),
+);
+
+const CommitPartsBodySchema = Schema.fromJsonString(
+  Schema.Struct({
+    uploadId: UploadIdSchema,
+    parts: Schema.Array(
+      Schema.Struct({
+        partNumber: PartNumberSchema,
+        etag: Schema.String.check(Schema.isPattern(/^[\x20-\x7e]{1,256}$/u)),
+      }),
+    ),
+  }),
+);
+
+const AbortBodySchema = Schema.fromJsonString(Schema.Struct({ uploadId: UploadIdSchema }));
+
+const NO_PARTS = 'This upload does not go in parts';
 const DOWNLOAD_URL = /^\/([A-Za-z0-9_-]{43})\/([^/?#]+)$/;
 
 /** A bad escape in a link is a link to nothing. */
@@ -172,6 +212,17 @@ export const ArtifactRoutes = Layer.unwrap(
       return { name, size, digest, overwrite: overwriteParam === 'true', retentionDays };
     });
 
+    /** Only its shape is ever said back, as it holds a credential. */
+    const readBody = <S extends Schema.Top & { readonly DecodingServices: never }>(
+      request: HttpServerRequest.HttpServerRequest,
+      schema: S,
+    ) =>
+      request.text.pipe(
+        Effect.provideService(HttpIncomingMessage.MaxBodySize, MAX_JSON_BODY),
+        Effect.flatMap(Schema.decodeUnknownEffect(schema)),
+        Effect.mapError(() => refusal(400, 'The body must be JSON, with an upload ID and parts')),
+      );
+
     const uploadLogOf = (
       repository: string,
       { name, size, scope }: Pick<UploadDeclaration, 'name' | 'size' | 'scope'>,
@@ -242,25 +293,83 @@ export const ArtifactRoutes = Layer.unwrap(
       if (!(yield* store.isPresent)) return yield* refusal(503, 'The store is missing');
       const uploadLog = uploadLogOf(repository, { ...declaration, scope: runScope });
 
-      return yield* store.commit({ ...declaration, id, repository, scope: runScope }).pipe(
-        Effect.tap(({ artifact, isNew }) =>
-          logStored(isNew ? 'upload' : 'upload already stored', uploadLog, artifact),
-        ),
-        Effect.map(({ artifact, isNew }) =>
-          respondJson(isNew ? 201 : 200, describeArtifact(artifact)),
-        ),
-        Effect.catchTags({
-          ArtifactExistsError: () => refuseNameTaken(uploadLog),
-          UploadNotFoundError: () =>
-            Effect.fail(
-              refusal(
-                404,
-                "This upload is not there to commit: its body never arrived, it has expired, or it is another run's",
+      // An upload in parts says what it sent. Any other has no body.
+      const isInParts = request.headers['content-type']?.startsWith('application/json') === true;
+      const multipart = isInParts ? yield* readBody(request, CommitPartsBodySchema) : undefined;
+      const isEveryPart =
+        multipart === undefined ||
+        (declaration.size >= MULTIPART_FROM_BYTES &&
+          multipart.parts.length === partCountOf(declaration.size) &&
+          multipart.parts.every(({ partNumber }, index) => partNumber === index + 1));
+      if (!isEveryPart) {
+        return yield* refusal(
+          400,
+          `A file of this size goes in parts of every number up to its last`,
+        );
+      }
+
+      return yield* store
+        .commit({
+          ...declaration,
+          id,
+          repository,
+          scope: runScope,
+          ...(multipart === undefined ? {} : { multipart }),
+        })
+        .pipe(
+          Effect.tap(({ artifact, isNew }) =>
+            logStored(isNew ? 'upload' : 'upload already stored', uploadLog, artifact),
+          ),
+          Effect.map(({ artifact, isNew }) =>
+            respondJson(isNew ? 201 : 200, describeArtifact(artifact)),
+          ),
+          Effect.catchTags({
+            ArtifactExistsError: () => refuseNameTaken(uploadLog),
+            UploadNotFoundError: () =>
+              Effect.fail(
+                refusal(
+                  404,
+                  "This upload is not there to commit: its body never arrived, it has expired, or it is another run's",
+                ),
               ),
-            ),
-        }),
-      );
+          }),
+        );
     }, answeringRefusals('upload'));
+
+    /** Signing only, so this asks nothing of the bucket, and takes a batch at a time: a Worker bills CPU. */
+    const signParts = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
+      const [, id, query] = PARTS_URL.exec(request.url) ?? [];
+      if (id === undefined) return notFound;
+
+      yield* authenticate(request);
+      const { name, size } = yield* parseDeclaration(query ?? '');
+      if (!(yield* store.isPresent)) return yield* refusal(503, 'The store is missing');
+      const { uploadId, parts } = yield* readBody(request, SignPartsBodySchema);
+      if (
+        size < MULTIPART_FROM_BYTES ||
+        parts.some(({ partNumber }) => partNumber > partCountOf(size))
+      ) {
+        return yield* refusal(400, 'A file of this size has no such part');
+      }
+      const signed = yield* store
+        .signParts({ id, name, size, uploadId, parts })
+        .pipe(Effect.catchTag('UploadNotFoundError', () => Effect.fail(refusal(404, NO_PARTS))));
+      return respondJson(200, { parts: signed });
+    }, answeringRefusals('signing'));
+
+    const abortUpload = Effect.fnUntraced(function* (request: HttpServerRequest.HttpServerRequest) {
+      const [, id, query] = ABORT_URL.exec(request.url) ?? [];
+      if (id === undefined) return notFound;
+
+      yield* authenticate(request);
+      const { name } = yield* parseDeclaration(query ?? '');
+      if (!(yield* store.isPresent)) return yield* refusal(503, 'The store is missing');
+      const { uploadId } = yield* readBody(request, AbortBodySchema);
+      yield* store
+        .abort({ id, name, uploadId })
+        .pipe(Effect.catchTag('UploadNotFoundError', () => Effect.fail(refusal(404, NO_PARTS))));
+      return respondJson(200, {});
+    }, answeringRefusals('abort'));
 
     const describeListed = (artifact: ArtifactMeta) => ({
       ...describeArtifact(artifact),
@@ -404,6 +513,12 @@ export const ArtifactRoutes = Layer.unwrap(
       HttpRouter.route('POST', '/uploads', request => answeringFaults(createUpload(request))),
       HttpRouter.route('POST', '/uploads/:id/commit', request =>
         answeringFaults(commitUpload(request)),
+      ),
+      HttpRouter.route('POST', '/uploads/:id/parts', request =>
+        answeringFaults(signParts(request)),
+      ),
+      HttpRouter.route('POST', '/uploads/:id/abort', request =>
+        answeringFaults(abortUpload(request)),
       ),
       HttpRouter.route('GET', '/artifacts', request => answeringFaults(list(request))),
       HttpRouter.route('DELETE', '/artifacts/*', request => answeringFaults(remove(request))),

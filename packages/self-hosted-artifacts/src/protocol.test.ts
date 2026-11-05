@@ -1,6 +1,50 @@
-import { expect, it } from 'vitest';
-import { ARTIFACT_ID, attachmentOf, isFileName, newArtifactId } from './protocol.ts';
+import { describe, expect, it } from 'vitest';
+import {
+  ARTIFACT_ID,
+  attachmentOf,
+  isFileName,
+  MULTIPART_FROM_BYTES,
+  newArtifactId,
+  partCountOf,
+  partLengthOf,
+  partSizeOf,
+} from './protocol.ts';
 import { unescapeXml } from './s3-bucket.ts';
+
+describe('parts', () => {
+  const MIB = 1024 ** 2;
+  const GIB = 1024 ** 3;
+
+  it('starts at 1 GiB', () => {
+    expect(MULTIPART_FROM_BYTES).toBe(GIB);
+  });
+
+  it.each([
+    [GIB, 16 * MIB, 64, 16 * MIB],
+    [GIB + 1, 16 * MIB, 65, 1],
+    [5 * GIB, 16 * MIB, 320, 16 * MIB],
+    [160_000 * MIB, 16 * MIB, 10_000, 16 * MIB],
+    [160_000 * MIB + 1, 17 * MIB, 9412, 13 * MIB + 1],
+    [5 * 1024 * GIB, 525 * MIB, 9987, 230 * MIB],
+  ])(
+    'cuts %i bytes into parts of %i, %i of them, the last of %i',
+    (size, partSize, count, last) => {
+      expect(partSizeOf(size)).toBe(partSize);
+      expect(partCountOf(size)).toBe(count);
+      expect(partLengthOf(size, 1)).toBe(partSize);
+      expect(partLengthOf(size, count)).toBe(last);
+      expect(partSize * (count - 1) + last).toBe(size);
+    },
+  );
+
+  it('never needs more than S3 takes, or a part it refuses', () => {
+    for (const size of [GIB, 10 * GIB, 500 * GIB, 5 * 1024 * GIB, 5 * 1024 * GIB - 1]) {
+      expect(partCountOf(size)).toBeLessThanOrEqual(10_000);
+      expect(partSizeOf(size)).toBeGreaterThanOrEqual(5 * MIB);
+      expect(partSizeOf(size)).toBeLessThanOrEqual(5 * GIB);
+    }
+  });
+});
 
 it('makes IDs a command line reads as a value, in the shape every target holds them to', () => {
   // Without the rule, 1,000 of them holding no leading `-` would be a one in ten million chance.
