@@ -27,6 +27,7 @@ export const ArtifactMetaSchema = Schema.Struct({
   size: Schema.Finite,
   digest: Schema.String,
   expiresAt: Schema.String.check(
+    // biome-ignore lint/plugin/no-date: Runs on a Worker, where Temporal is absent: checks that the wire string parses as an instant.
     Schema.makeFilter(text => !Number.isNaN(Date.parse(text)), { message: 'an instant' }),
   ),
 });

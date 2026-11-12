@@ -86,6 +86,7 @@ const repositoryKeyOf = (name: string) => `repositories/${sha256Hex(name.toLower
 export const dataKeyOf = ({ id, name }: { id: string; name: string }) => `artifacts/${id}/${name}`;
 
 export const isExpired = ({ expiresAt }: ArtifactFile, nowMs: number) =>
+  // biome-ignore lint/plugin/no-date: Runs on a Worker, where Temporal is absent: expiresAt is the string on the wire.
   Date.parse(expiresAt) <= nowMs;
 
 export const scopeHeaderOf = ({ repositoryId, runId, runAttempt }: RunScope) =>

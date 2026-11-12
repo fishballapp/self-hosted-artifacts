@@ -53,6 +53,7 @@ const SWEEP_BUDGET = Duration.seconds(3);
 const SCOPE = /^[0-9]{1,32}\/[0-9]{1,32}\/[0-9]{1,32}$/u;
 
 const expiryAfter = ({ retentionDays, nowMs }: { retentionDays: number; nowMs: number }) =>
+  // biome-ignore lint/plugin/no-date: Runs on a Worker, where Temporal is absent: the expiry is written as the ISO string on the wire.
   new Date(
     nowMs +
       Math.min(retentionDays === 0 ? DEFAULT_RETENTION_DAYS : retentionDays, MAX_RETENTION_DAYS) *

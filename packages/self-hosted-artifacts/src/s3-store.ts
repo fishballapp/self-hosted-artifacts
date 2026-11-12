@@ -61,6 +61,7 @@ const orFault = <A>(self: Effect.Effect<A, ClientError | UnavailableError>) =>
   );
 
 const expiryAfter = ({ retentionDays, nowMs }: { retentionDays: number; nowMs: number }) =>
+  // biome-ignore lint/plugin/no-date: Runs on a Worker, where Temporal is absent: the expiry is the ISO string the store contract holds.
   new Date(nowMs + retentionDays * MS_PER_DAY).toISOString();
 
 export const s3StoreLayer = ({ bucket, region, endpoint }: S3StoreConfig) =>

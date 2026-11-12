@@ -13,6 +13,7 @@ const PARALLEL_DELETES = 5;
 // A file unpacked here has the time it was unpacked, which would make the same merge a different zip
 // each time. The earliest time a zip can hold, so a retried merge comes out the same and the target
 // recognises it.
+// biome-ignore lint/plugin/no-date: The action loads on Node 24, which has no Temporal, and zip's entry mtime takes a Date.
 const MERGED_FILES_MODIFIED_AT = new Date(1980, 0, 1);
 
 /** The same in the action's inputs and the command's flags, as actions/upload-artifact/merge has them. */

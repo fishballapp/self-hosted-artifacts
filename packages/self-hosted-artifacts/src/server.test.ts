@@ -882,6 +882,7 @@ describe('an upload, step by step', () => {
 
   describe('abandoned', () => {
     const age = async (entry: string) => {
+      // biome-ignore lint/plugin/no-date: node:fs utimes takes the mtime as a Date, so the Temporal instant converts here.
       const modifiedAt = new Date(
         Temporal.Now.instant().subtract({ minutes: Duration.toMinutes(UPLOAD_TIMEOUT) + 2 })
           .epochMilliseconds,
@@ -1576,6 +1577,7 @@ describe('the temp sweep', () => {
     await mkdir(join(storeDir, 'tmp'), { recursive: true });
     await mkdir(join(storeDir, 'tmp', id));
     await writeFile(join(storeDir, 'tmp', id, 'data'), 'partial');
+    // biome-ignore lint/plugin/no-date: node:fs utimes takes the mtime as a Date, so the Temporal instant converts here.
     const modifiedAt = new Date(Temporal.Now.instant().subtract(age).epochMilliseconds);
     await utimes(join(storeDir, 'tmp', id), modifiedAt, modifiedAt);
   };
@@ -1843,6 +1845,7 @@ describe('the sweep', () => {
   const makeOldTemp = async (entry: string) => {
     await mkdir(join(storeDir, 'tmp'), { recursive: true });
     await writeFile(join(storeDir, 'tmp', entry), 'partial');
+    // biome-ignore lint/plugin/no-date: node:fs utimes takes the mtime as a Date, so the Temporal instant converts here.
     const modifiedAt = new Date(
       Temporal.Now.instant().subtract({ minutes: Duration.toMinutes(UPLOAD_TIMEOUT) + 2 })
         .epochMilliseconds,

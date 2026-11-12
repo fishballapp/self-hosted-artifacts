@@ -36,6 +36,7 @@ const hmac = (key: string | Buffer, data: string) =>
 const scopeOf = (date: string, region: string) => `${date}/${region}/s3/aws4_request`;
 
 /** `x-amz-date`'s format: `20130524T000000Z`. */
+// biome-ignore lint/plugin/no-date: Runs on a Worker, where Temporal is absent: the SigV4 date stamp is formatted from epoch ms.
 const amzDateOf = (nowMs: number) => new Date(nowMs).toISOString().replace(/[:-]|\.\d{3}/gu, '');
 
 const normaliseHeaders = (headers: Readonly<Record<string, string>>) =>
