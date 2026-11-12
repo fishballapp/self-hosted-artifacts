@@ -7,7 +7,7 @@ import { presignS3Request, signS3Request } from './s3-sigv4.ts';
 const EXAMPLE = {
   host: 'examplebucket.s3.amazonaws.com',
   region: 'us-east-1',
-  nowMs: Date.UTC(2013, 4, 24),
+  nowMs: Temporal.Instant.from('2013-05-24T00:00:00Z').epochMilliseconds,
   credentials: {
     accessKeyId: 'AKIAIOSFODNN7EXAMPLE',
     secretAccessKey: Redacted.make('wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'),

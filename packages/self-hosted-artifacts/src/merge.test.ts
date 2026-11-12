@@ -410,7 +410,9 @@ describe.each(TARGET_KINDS)('merging, against %s', kind => {
     });
 
     const daysUntil = (expiresAt: string | undefined) =>
-      (Date.parse(expiresAt ?? '') - Date.now()) / 86_400_000;
+      Temporal.Instant.from(expiresAt ?? '')
+        .since(Temporal.Now.instant())
+        .total('days');
 
     it("keeps for the target's default without it, and for the days asked with it", async () => {
       expectSucceeded(await runAction({ INPUT_NAME: 'by-default' }));

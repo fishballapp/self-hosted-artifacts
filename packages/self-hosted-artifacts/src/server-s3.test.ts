@@ -351,7 +351,9 @@ describe('a server in front of a bucket', () => {
 
     it("expires when the retention says, by the server's cap", async () => {
       const artifact = await stored('the build', { more: '&retention-days=1000' });
-      const days = (Date.parse(artifact.expiresAt) - Date.now()) / (24 * 60 * 60 * 1000);
+      const days = Temporal.Instant.from(artifact.expiresAt)
+        .since(Temporal.Now.instant())
+        .total('days');
       expect(Math.ceil(days)).toBe(30);
     });
   });

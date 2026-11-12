@@ -126,7 +126,15 @@ const millisOfAmzDate = (amzDate: string) => {
   const parts = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/u.exec(amzDate);
   if (parts === null) return undefined;
   const [, year, month, day, hour, minute, second] = parts.map(Number);
-  return Date.UTC(year ?? 0, (month ?? 1) - 1, day, hour, minute, second);
+  return Temporal.ZonedDateTime.from({
+    timeZone: 'UTC',
+    year: year ?? 0,
+    month: month ?? 1,
+    day: day ?? 1,
+    hour: hour ?? 0,
+    minute: minute ?? 0,
+    second: second ?? 0,
+  }).epochMilliseconds;
 };
 
 /**

@@ -192,7 +192,10 @@ export class DiskStore extends Context.Service<
           );
 
         const isExpired = ({ expiresAt }: ArtifactMeta) =>
-          Effect.map(Clock.currentTimeMillis, now => now >= Date.parse(expiresAt));
+          Effect.map(
+            Clock.currentTimeMillis,
+            now => now >= Temporal.Instant.from(expiresAt).epochMilliseconds,
+          );
 
         const removeDirectory = (target: string) =>
           fs.remove(target, { recursive: true, force: true }).pipe(Effect.orDie);
