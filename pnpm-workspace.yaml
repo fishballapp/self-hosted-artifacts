@@ -21,7 +21,7 @@ catalog:
   "@types/yazl": ^3.3.1
   effect: 4.0.0
   fflate: ^0.8.3
-  miniflare: 5.20260911.1-alpha
+  miniflare: 5.20261104.0-beta
   minimatch: ^10.2.6
   repojj: ^2026.7.29
   tsdown: ^0.23.0
